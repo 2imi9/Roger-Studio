@@ -1,0 +1,33 @@
+# Custom vLLM image with Gemma 4 NVFP4 support for RTX 5090 (Blackwell sm_120).
+#
+# Why a custom image:
+#   - vllm/vllm-openai:latest ships a Transformers too old to know about
+#     `gemma4` architecture (fatal: "model type gemma4 but Transformers does
+#     not recognize this architecture").
+#   - vllm/vllm-openai:nightly has gemma4 in Transformers but (a) is missing a
+#     `pandas` dependency imported by vllm.benchmarks at startup and (b) is NOT
+#     compiled for sm_120 — you will hit "no cutlass_scaled_mm kernel" / FlashMLA
+#     unsupported errors on RTX 5090.
+#   - The NVIDIA DGX Spark community ships eugr/vllm-node-tf5 which works,
+#     but it's ARM64 only (for GB10). We need x86_64 for RTX 5090.
+#
+# The `cu130-nightly` tag is the Blackwell-targeted build:
+#   - ships kernels compiled for SM 12.0 (confirmed in vllm #37242)
+#   - bundles PyTorch 2.9.0+cu128/cu130 which supports sm_120
+#   - contains NVFP4 kernels from vLLM >=0.13.0 (see vllm #31085)
+#
+# This Dockerfile layers the missing deps + upgraded Transformers on top.
+
+FROM vllm/vllm-openai:cu130-nightly
+
+# 1) Missing runtime dep in nightly
+RUN pip install --no-cache-dir pandas
+
+# 2) Transformers with Gemma 4 support (ships April 2026, v5.5.0+)
+RUN pip install --no-cache-dir --upgrade "transformers>=5.5.0"
+
+# 3) NVIDIA ModelOpt for NVFP4 quantization kernels
+RUN pip install --no-cache-dir "nvidia-modelopt[torch]>=0.42.0" || \
+    echo "modelopt install optional; vllm may ship kernels already"
+
+# Inherit entrypoint + workdir from base image (`vllm serve` via Python module).

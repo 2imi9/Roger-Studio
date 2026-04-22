@@ -1,0 +1,12 @@
+{"type":"FeatureCollection","features":[
+{"type":"Feature","properties":{"name":"Sinkhole A-12","karst_type":"sinkhole","county":"Lehigh","carbonate_bedrock":true,"groundwater_trend":"falling","depth_m":4.2},"geometry":{"type":"Point","coordinates":[-75.49,40.62]}},
+{"type":"Feature","properties":{"name":"Sinkhole A-15","karst_type":"sinkhole","county":"Lehigh","carbonate_bedrock":true,"groundwater_trend":"falling","depth_m":2.8},"geometry":{"type":"Point","coordinates":[-75.51,40.61]}},
+{"type":"Feature","properties":{"name":"Depression B-03","karst_type":"surface_depression","county":"Lancaster","carbonate_bedrock":true,"groundwater_trend":"stable","depth_m":1.5},"geometry":{"type":"Point","coordinates":[-76.30,40.04]}},
+{"type":"Feature","properties":{"name":"Cave Entrance C-01","karst_type":"cave_entrance","county":"Cumberland","carbonate_bedrock":true,"groundwater_trend":"rising","depth_m":12.0},"geometry":{"type":"Point","coordinates":[-77.19,40.20]}},
+{"type":"Feature","properties":{"name":"Depression B-07","karst_type":"surface_depression","county":"Lancaster","carbonate_bedrock":true,"groundwater_trend":"falling","depth_m":0.9},"geometry":{"type":"Point","coordinates":[-76.28,40.06]}},
+{"type":"Feature","properties":{"name":"Sinkhole A-22","karst_type":"sinkhole","county":"Lehigh","carbonate_bedrock":true,"groundwater_trend":"falling","depth_m":6.1},"geometry":{"type":"Point","coordinates":[-75.47,40.59]}},
+{"type":"Feature","properties":{"name":"Mine D-01","karst_type":"surface_mine","county":"Cumberland","carbonate_bedrock":true,"groundwater_trend":"stable","depth_m":25.0},"geometry":{"type":"Polygon","coordinates":[[[-77.21,40.19],[-77.20,40.19],[-77.20,40.195],[-77.21,40.195],[-77.21,40.19]]]}},
+{"type":"Feature","properties":{"name":"Lehigh Carbonate Zone","karst_type":"bedrock_boundary","county":"Lehigh","carbonate_bedrock":true},"geometry":{"type":"Polygon","coordinates":[[[-75.55,40.55],[-75.40,40.55],[-75.40,40.65],[-75.55,40.65],[-75.55,40.55]]]}},
+{"type":"Feature","properties":{"name":"Stable Control S-01","karst_type":"stable","county":"Lehigh","carbonate_bedrock":false,"groundwater_trend":"stable"},"geometry":{"type":"Point","coordinates":[-75.60,40.58]}},
+{"type":"Feature","properties":{"name":"Stable Control S-02","karst_type":"stable","county":"Lancaster","carbonate_bedrock":false,"groundwater_trend":"stable"},"geometry":{"type":"Point","coordinates":[-76.35,40.00]}}
+]}

@@ -1,0 +1,292 @@
+@import "tailwindcss";
+@import url("https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&family=Fraunces:ital,opsz,wght,SOFT,WONK@0,9..144,900,100,1;1,9..144,700,50,1&family=IBM+Plex+Mono:wght@400;500;600&family=Silkscreen:wght@400;700&display=swap");
+
+/* ─────────────────────────────────────────────────────────────────
+   Roger Studio — design tokens (Stage 1 adoption from Claude Design v0.7)
+   Token names match what existing components reference (bg-geo-*,
+   text-geo-*, border-geo-*) so swapping values doesn't break any
+   class. Net visual change: consistently warm-neutral palette in
+   place of the previous warm-bg + cool-gray-borders mix.
+   ───────────────────────────────────────────────────────────────── */
+@theme {
+  /* Surfaces — all warm-neutral, no pure white */
+  --color-geo-bg: #f6f3ee;            /* base — very pale warm beige */
+  --color-geo-surface: #fbf9f5;       /* elevated cards (was #ffffff) */
+  --color-geo-elevated: #ede8df;      /* deepest surface — hover, code (was cool #f3f4f6) */
+  --color-geo-border: #dcd5c8;        /* hairline divider (was cool #e5e7eb) */
+  --color-geo-border-soft: #e7e1d4;   /* softer inner-split divider */
+  --color-geo-border-subtle: #e7e1d4; /* legacy alias for the same — keeps old classes working */
+
+  /* Type — warm near-black, no pure black */
+  --color-geo-text: #2a2620;          /* primary — warm near-black (was cool #111827) */
+  --color-geo-text-body: #2a2620;     /* body alias used by existing components */
+  --color-geo-muted: #6b6559;         /* secondary (was cool #6b7280) */
+  --color-geo-dim: #9b9588;           /* tertiary / placeholder (was cool #9ca3af) */
+
+  /* Accent — mid steel blue, full ramp for state coverage */
+  --color-geo-accent: #3a6690;        /* primary accent (was lighter #4a7ba7) */
+  --color-geo-accent-2: #5b8bb5;      /* lighter end of gradient */
+  --color-geo-accent-deep: #2d5278;   /* pressed state */
+  --color-geo-accent-dim: #2d5278;    /* legacy alias for accent-deep */
+  --color-geo-accent-soft: #e2ebf3;   /* pale wash for chips */
+  --color-geo-accent-ink: #2a4a6b;    /* text on accent-soft chips */
+
+  /* Status — every kind has a soft pair so badges can sit on tinted pills */
+  --color-geo-success: #4f7a4a;       /* muted green */
+  --color-geo-success-soft: #e2ecdf;
+  --color-geo-warn: #a67a2b;          /* amber for "demo / heuristic" */
+  --color-geo-warn-soft: #f2e8d1;
+  --color-geo-danger: #9b4a3e;        /* muted red */
+  --color-geo-danger-soft: #f2dfd9;
+
+  /* Land-cover tag palette — replaces the hash-fallback in colorForTag().
+     LabelPanel still owns the map of tag-name → color but can now
+     reference these tokens for consistency. */
+  --color-geo-tag-forest: #4f7a4a;
+  --color-geo-tag-water: #3a6690;
+  --color-geo-tag-urban: #8a6a4a;
+  --color-geo-tag-cropland: #a67a2b;
+  --color-geo-tag-grassland: #8a9a54;
+  --color-geo-tag-bare: #9c8a6a;
+  --color-geo-tag-snow: #b8b5ac;
+  --color-geo-tag-wetland: #5a7a7a;
+
+  /* Legacy terrain color used by the analysis tab — kept */
+  --color-geo-terrain: #a89f8f;
+
+  /* ─── Gradients ────────────────────────────────────────────────
+     Existing classes (bg-gradient-sidebar etc.) use --gradient-*
+     vars; new patterns can reach for the geo-* names. */
+  --gradient-sidebar: linear-gradient(180deg, #fbf9f5 0%, #f6f3ee 50%, #ede8df 100%);
+  --gradient-header: radial-gradient(120% 80% at 92% 4%, rgba(58,102,144,0.14), transparent 55%),
+                     radial-gradient(140% 100% at 6% 104%, rgba(166,108,74,0.11), transparent 60%),
+                     linear-gradient(180deg, #fbf9f5 0%, #f6f3ee 100%);
+  --gradient-panel: linear-gradient(145deg, #fbf9f5 0%, #f6f3ee 100%);
+  --gradient-primary: linear-gradient(180deg, #5b8bb5 0%, #3a6690 100%);
+  --gradient-accent-soft: linear-gradient(135deg, #e2ebf3 0%, #c8d8e8 100%);
+  --gradient-terrain: linear-gradient(180deg, #f0ece3 0%, #e4dccb 50%, #d4c8ae 100%);
+
+  /* New named accent gradients for the steel-blue button family */
+  --gradient-geo-accent: linear-gradient(180deg, #5b8bb5 0%, #3a6690 100%);
+  --gradient-geo-accent-hover: linear-gradient(180deg, #6a98c0 0%, #447499 100%);
+  --gradient-geo-accent-pressed: linear-gradient(180deg, #3a6690 0%, #2d5278 100%);
+
+  /* ─── Semantic radii ──────────────────────────────────────────
+     Use rounded-chip / rounded-panel / rounded-button / rounded-pill
+     in new components so future readers don't have to remember
+     "is this 4 or 6 px?" */
+  --radius-chip: 4px;
+  --radius-panel: 8px;
+  --radius-button: 12px;
+  --radius-pill: 9999px;
+
+  /* ─── Shadows ─────────────────────────────────────────────────
+     Used sparingly. The button shadow has a 1px solid bottom edge
+     baked in so primary CTAs feel physically pressable. */
+  --shadow-geo-button: 0 1px 0 rgba(45,82,120,0.25), 0 1px 2px rgba(45,82,120,0.18);
+  --shadow-geo-button-hover: 0 3px 0 rgba(45,82,120,0.20), 0 4px 10px rgba(45,82,120,0.18);
+  --shadow-geo-panel: 0 1px 2px rgba(42,38,32,0.04);
+  --shadow-geo-float: 0 4px 16px rgba(42,38,32,0.10), 0 1px 2px rgba(42,38,32,0.06);
+  --shadow-geo-focus-ring: 0 0 0 3px #e2ebf3, 0 0 0 4px #3a6690;
+
+  /* ─── Type scale ──────────────────────────────────────────────
+     Dense pro-tool sizes. Body sits at 12-13 px, not 16. */
+  --text-badge: 10px;       /* status pills */
+  --text-micro: 11px;       /* captions, counts */
+  --text-body-dense: 12px;  /* dense body */
+  --text-body-cozy: 13px;   /* comfortable body */
+
+  /* Fonts */
+  --font-mono: "JetBrains Mono", Menlo, Consolas, monospace;
+  --font-sans: "Inter", "Helvetica Neue", system-ui, sans-serif;
+}
+
+html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; }
+
+/* Global 10% scale-up applied to the app root only, NOT to body. CSS
+   ``zoom`` scales every descendant (fonts, icons, map canvas) 1.1x
+   while keeping pointer coordinates correctly mapped, so MapLibre
+   hit-testing and terra-draw polygon drags still work without
+   rewriting anything. Keeping it off `body` is important: the
+   GuidedTour overlay portals to `document.body`, so a zoomed body
+   would double-apply the scale to the tour's spotlight and misalign
+   them. Supported in Chromium, WebKit, and Firefox 126+.
+   Sizing: #root's layout box is (1 / 1.1) of the viewport so that
+   after ``zoom: 1.1`` it visually fills exactly 100% of the viewport.
+   Without this the zoomed content overflowed by 10% and either
+   clipped or introduced scrollbars on html/body. ``overflow: hidden``
+   on html/body is a safety net so even if a child computes a few
+   rounding pixels wider than expected, no scrollbar appears. */
+#root {
+  /* Sized against the viewport directly rather than 100% of body, since
+     ``100%`` inside a zoomed container can double-count (parent's
+     nominal size × zoom). ``vw`` / ``vh`` always refer to raw viewport
+     pixels, so dividing by 1.1 and applying zoom 1.1 lands on exactly
+     100vw / 100vh visually. */
+  width: calc(100vw / 1.1);
+  height: calc(100vh / 1.1);
+  zoom: 1.1;
+}
+* { box-sizing: border-box; }
+
+body {
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.6;
+  color: var(--color-geo-text-body);
+  background: var(--color-geo-bg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  letter-spacing: -0.01em;
+}
+
+/* Heading hierarchy — wrapped in @layer base so Tailwind utilities can override */
+@layer base {
+  h1, h2, h3, h4 {
+    font-weight: 600;
+    color: var(--color-geo-text);
+    letter-spacing: -0.02em;
+  }
+  h1 { font-size: 24px; line-height: 1.3; }
+  h2 { font-size: 20px; line-height: 1.4; }
+  h3 { font-size: 18px; line-height: 1.4; }
+  h4 { font-size: 16px; line-height: 1.5; }
+
+  p { margin-bottom: 1em; }
+}
+
+/* Code */
+code, pre, .font-mono {
+  font-family: var(--font-mono);
+  font-size: 14px;
+}
+code:not(pre code) {
+  background: var(--color-geo-elevated);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 14px;
+  color: var(--color-geo-text);
+}
+
+/* Gradient utilities — kept identical class names so existing
+   `bg-gradient-sidebar` etc. still work, just with warmer values. */
+.bg-gradient-sidebar { background: var(--gradient-sidebar); }
+.bg-gradient-header { background: var(--gradient-header); }
+.bg-gradient-panel { background: var(--gradient-panel); }
+.bg-gradient-primary { background: var(--gradient-primary); }
+.bg-gradient-accent-soft { background: var(--gradient-accent-soft); }
+.bg-gradient-terrain { background: var(--gradient-terrain); }
+
+/* New steel-blue accent gradient utilities for primary CTAs */
+.bg-gradient-geo-accent { background: var(--gradient-geo-accent); }
+.bg-gradient-geo-accent-hover { background: var(--gradient-geo-accent-hover); }
+.bg-gradient-geo-accent-pressed { background: var(--gradient-geo-accent-pressed); }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--color-geo-border);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--color-geo-muted); }
+
+/* MapLibre popup styling */
+.maplibregl-popup-content {
+  background: var(--color-geo-surface) !important;
+  color: var(--color-geo-text-body) !important;
+  border: 1px solid var(--color-geo-border) !important;
+  border-radius: 8px !important;
+  padding: 8px 14px !important;
+  font-family: var(--font-sans) !important;
+  font-size: 13px !important;
+  box-shadow: 0 4px 20px rgba(0,0,0,0.08) !important;
+}
+.maplibregl-popup-tip { border-top-color: var(--color-geo-surface) !important; }
+
+input[type="date"], select { color-scheme: light; }
+
+/* Subtle shadow utilities for containers — kept for legacy components */
+.shadow-soft { box-shadow: 0 1px 3px 0 rgba(0,0,0,0.04), 0 1px 2px -1px rgba(0,0,0,0.04); }
+.shadow-card { box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05), 0 2px 4px -2px rgba(0,0,0,0.04); }
+
+/* Pulsing dot keyframe — used by the new StatusBadge "loading" / "live" states */
+@keyframes geo-pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(58,102,144,0.45); }
+  70%  { box-shadow: 0 0 0 6px rgba(58,102,144,0); }
+  100% { box-shadow: 0 0 0 0 rgba(58,102,144,0); }
+}
+
+/* ─────────────────────────────────────────────────────────────────
+   Roger Studio wordmark — Style 06 (from Claude Design wordmark
+   explorations). Originally designed for dark UI; adapted here to
+   the warm cream sidebar by remapping cream→geo-text and the
+   dust-green tag color → geo-muted. The "Studio" italic and the
+   tag dot stay accent blue so the brand color carries through.
+   ───────────────────────────────────────────────────────────────── */
+.roger-wordmark {
+  font-family: "Fraunces", "Times New Roman", serif;
+  font-weight: 900;
+  font-variation-settings: "wght" 900, "SOFT" 100, "WONK" 1, "opsz" 140;
+  line-height: 0.9;
+  letter-spacing: -0.04em;
+  color: var(--color-geo-text);
+  margin: 0;
+}
+.roger-wordmark .studio {
+  /* italic removed per UX feedback — keep accent-blue color only */
+  color: var(--color-geo-accent);
+}
+
+/* Subtitle paired with the wordmark — pixel-art typeface (Silkscreen) for
+   a vintage-cartridge / 8-bit feel, painted with a deep-forest → forest →
+   sage gradient. Darker, bolder revision: heavier weight via text-shadow
+   stroke (Silkscreen tops out at 700 in fontfile), darker green ramp
+   (#11331F → #2F6B3F → #4F7A4A) for more contrast on the cream sidebar. */
+.roger-subtitle {
+  font-family: "Silkscreen", "Press Start 2P", "Courier New", monospace;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  line-height: 1;
+  background: linear-gradient(
+    90deg,
+    #11331f 0%,
+    #2f6b3f 50%,
+    #4f7a4a 100%
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+  margin: 8px 0 0;
+  white-space: nowrap;
+  /* Pixel-perfect rendering — disable subpixel AA so edges stay crisp */
+  -webkit-font-smoothing: none;
+  -moz-osx-font-smoothing: grayscale;
+  /* NOTE: no -webkit-text-stroke here — it paints a solid outline over
+     the gradient fill and made the text look monochrome/outlined.
+     Silkscreen 700 @ 11 px is already visually chunky; the gradient
+     carries the visual weight. If we want MORE bold later, the right
+     move is to swap fonts (Press Start 2P is heavier per glyph) or bump
+     the size, not to add a stroke. */
+}
+.roger-tag {
+  font-family: "IBM Plex Mono", "JetBrains Mono", monospace;
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: 0.28em;
+  text-transform: uppercase;
+  color: var(--color-geo-muted);
+  display: flex;
+  gap: 14px;
+  align-items: center;
+}
+.roger-tag .dot {
+  width: 6px;
+  height: 6px;
+  background: var(--color-geo-accent);
+  border-radius: 50%;
+  flex-shrink: 0;
+}

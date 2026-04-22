@@ -1,0 +1,87 @@
+[project]
+name = "geoenv-studio-backend"
+version = "0.1.0"
+description = "GeoEnv Studio — micro-environment 3D visualization backend"
+requires-python = ">=3.11"
+# The audit caught that every dep was floor-only (`>=`), so a `pip install`
+# six months from now could resolve to breaking-change majors without
+# warning. Upper bounds added below; the cap is placed at the NEXT major
+# that's realistic to break us, not at the next release, so we still pick
+# up patch/minor bumps automatically. "Why" on each cap is inline.
+dependencies = [
+    # FastAPI is pre-1.0 but stable; 1.0 will be a semver reset and a
+    # coordinated migration, so cap below it.
+    "fastapi>=0.115.0,<1.0",
+    "uvicorn[standard]>=0.34.0",
+    # Pydantic 2→3 will be another hard break (1→2 was) — pin below 3.
+    "pydantic>=2.0,<3.0",
+    "httpx>=0.28.0",
+    "shapely>=2.0",
+    "python-multipart>=0.0.18",
+    "aiofiles>=24.0",
+    # Anthropic SDK minor bumps have added new client surface but also
+    # renamed message helpers; cap below 1.0 to keep migrations deliberate.
+    "anthropic>=0.87.0,<1.0",
+    # olmoearth-pretrain is still pre-1.0 in April 2026 (0.1.x series).
+    # Pre-1.0 convention: minor bumps may break. Cap at 1.0 so a forthcoming
+    # stable release is an explicit upgrade, not an accidental one.
+    "olmoearth-pretrain>=0.1.0,<1.0",
+    # torch has shipped API breaks at minor boundaries historically — cap
+    # below 3.0 but stay wide enough to cover current CUDA / Blackwell
+    # support (user base includes RTX 5090 owners running fresh wheels).
+    "torch>=2.4,<3.0",
+    # huggingface-hub crossed 1.0 in early 2026; 1.x is compatible with
+    # our cache-scan / snapshot_download usage. Cap below 2.0 so the next
+    # major-rev is an explicit upgrade.
+    "huggingface-hub>=0.26.0,<2.0",
+    # rasterio 2.0 is an expected GDAL-major rewrite — cap below it.
+    "rasterio>=1.4.0,<2.0",
+    # pystac-client is pre-1.0 and has reshuffled search APIs at minors;
+    # 1.0 is the expected rewrite cap.
+    "pystac-client>=0.8.0,<1.0",
+    # numpy 2.0 was absorbed; 3.0 is the next expected hard break.
+    "numpy>=1.26,<3.0",
+    "pillow>=10.0",
+]
+
+[project.optional-dependencies]
+geo = [
+    "geopandas>=1.0.0",
+    "xarray>=2024.0",
+    "netCDF4>=1.7.0",
+    "zarr>=2.18.0",
+    "pyarrow>=17.0",
+    "fiona>=1.10.0",
+    "laspy[lazrs]>=2.5.0",
+    "pyproj>=3.7.0",
+]
+env = [
+    "cdsapi>=0.7.0",
+    "cfgrib>=0.9.0",
+    "scipy>=1.14.0",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24.0",
+    "httpx>=0.28.0",
+]
+
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "network: hits Planetary Computer or Hugging Face (needs internet, ~5–60s per test)",
+]
+filterwarnings = [
+    # Inference-only mode warning from olmoearth_pretrain when olmo-core
+    # isn't installed — expected in production use.
+    "ignore:olmo-core not installed.*:UserWarning",
+    # Helios -> olmoearth_pretrain import shim.
+    "ignore:The 'helios' package has been renamed.*:FutureWarning",
+    # Windows symlink warnings from huggingface_hub.
+    "ignore:.*cache-system uses symlinks by default.*:UserWarning",
+]

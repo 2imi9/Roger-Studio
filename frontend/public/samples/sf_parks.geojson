@@ -1,0 +1,9 @@
+{"type":"FeatureCollection","features":[
+{"type":"Feature","properties":{"name":"Golden Gate Park","area_ha":412,"type":"Regional Park"},"geometry":{"type":"Polygon","coordinates":[[[-122.511,37.769],[-122.453,37.769],[-122.453,37.774],[-122.511,37.774],[-122.511,37.769]]]}},
+{"type":"Feature","properties":{"name":"Presidio","area_ha":600,"type":"National Park"},"geometry":{"type":"Polygon","coordinates":[[[-122.472,37.788],[-122.445,37.788],[-122.445,37.802],[-122.472,37.802],[-122.472,37.788]]]}},
+{"type":"Feature","properties":{"name":"McLaren Park","area_ha":126,"type":"City Park"},"geometry":{"type":"Polygon","coordinates":[[[-122.420,37.718],[-122.410,37.718],[-122.410,37.725],[-122.420,37.725],[-122.420,37.718]]]}},
+{"type":"Feature","properties":{"name":"Lake Merced","area_ha":260,"type":"Lake/Park"},"geometry":{"type":"Polygon","coordinates":[[[-122.497,37.727],[-122.483,37.727],[-122.483,37.740],[-122.497,37.740],[-122.497,37.727]]]}},
+{"type":"Feature","properties":{"name":"Twin Peaks","area_ha":25,"type":"Natural Area"},"geometry":{"type":"Point","coordinates":[-122.4477,37.7544]}},
+{"type":"Feature","properties":{"name":"Crissy Field","area_ha":40,"type":"Waterfront"},"geometry":{"type":"Polygon","coordinates":[[[-122.468,37.803],[-122.452,37.803],[-122.452,37.806],[-122.468,37.806],[-122.468,37.803]]]}},
+{"type":"Feature","properties":{"name":"Embarcadero","area_ha":15,"type":"Waterfront"},"geometry":{"type":"LineString","coordinates":[[-122.393,37.795],[-122.389,37.790],[-122.388,37.785],[-122.390,37.780]]}}
+]}

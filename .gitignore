@@ -1,0 +1,45 @@
+# Secrets — never commit
+.env
+.env.local
+.env.*.local
+backend/.env
+backend/.env.local
+frontend/.env
+frontend/.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node / Vite
+node_modules/
+frontend/dist/
+frontend/.vite/
+*.log
+
+# Databases
+*.db
+*.sqlite
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Uploads / runtime data
+backend/uploads/
+backend/data/
+
+# Private planning notes — kept on disk locally but never pushed.
+# Follow the PRIVATE-* naming convention for anything you want to
+# exclude from the public repo.
+docs/PRIVATE-*.md
+PRIVATE-*.md
+.private/
