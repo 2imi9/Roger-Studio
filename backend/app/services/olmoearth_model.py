@@ -90,9 +90,71 @@ _BASE_MODEL_IDS: dict[str, ModelID] = {
 # concurrent /infer calls don't each spawn their own load. ``model`` is either
 # a plain ``torch.nn.Module`` (base encoder) or an ``FTModel`` (fine-tuned),
 # and the service layer dispatches by type.
+#
+# LRU-bounded by ``OE_MODEL_CACHE_MAX_ENTRIES`` (default 1, laptop-safe) to
+# stop the unbounded VRAM growth observed when a user clicks Nano → Tiny →
+# Base → Large in succession: each load ~tripled VRAM until OOM. ``OrderedDict``
+# preserves insert order; on hit we ``move_to_end`` to mark "most recently
+# used", and on insert we pop oldest entries until we're at cap.
+import collections  # noqa: E402  (placed near _cache for locality)
 _LoadedModel = torch.nn.Module | FTModel
-_cache: dict[str, tuple[_LoadedModel, torch.device]] = {}
+_cache: collections.OrderedDict[str, tuple[_LoadedModel, torch.device]] = (
+    collections.OrderedDict()
+)
 _cache_lock = threading.Lock()
+
+
+def _max_cache_entries() -> int:
+    """Max number of encoder models held in the LRU cache.
+
+    Default 1 because each base encoder is 50 MB – 3 GB on disk and ~3×
+    that resident on GPU once activated; a laptop with a 24 GB GPU can
+    hold one Large + working memory but not two. Operators on Azure VMs
+    with 80 GB+ GPUs can bump via ``OE_MODEL_CACHE_MAX_ENTRIES``.
+    Values < 1 are clamped to 1 — no cache at all is a footgun (cold
+    load ~30 s, repeat for every chunked job).
+    """
+    import os as _os
+    env = _os.environ.get("OE_MODEL_CACHE_MAX_ENTRIES")
+    if env is None:
+        return 1
+    try:
+        value = int(env)
+    except ValueError:
+        logger.warning(
+            "OE_MODEL_CACHE_MAX_ENTRIES=%r not parseable as int — "
+            "falling back to 1", env,
+        )
+        return 1
+    return max(1, value)
+
+
+def _evict_oldest_locked() -> None:
+    """Pop the oldest cache entry. Caller must hold ``_cache_lock``.
+
+    Drops the model reference (Python GC frees the host-side tensors)
+    and calls ``torch.cuda.empty_cache()`` to release any cached CUDA
+    blocks that were holding onto VRAM. Safe even mid-inference: empty
+    cache only reclaims blocks the allocator wasn't using; in-flight
+    forwards keep their tensors alive via separate references.
+    """
+    if not _cache:
+        return
+    repo_id, (model, device) = _cache.popitem(last=False)
+    logger.info("evicting LRU model %s (device=%s)", repo_id, device)
+    # Move to CPU first to release VRAM more aggressively. If the model
+    # doesn't have .to() (shouldn't happen, but defensive), skip.
+    try:
+        if hasattr(model, "to"):
+            model.to("cpu")
+    except Exception as e:
+        logger.warning("eviction: model.to('cpu') failed for %s: %s", repo_id, e)
+    del model
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception as e:  # pragma: no cover — defensive only
+            logger.warning("eviction: torch.cuda.empty_cache() failed: %s", e)
 
 _normalizer = Normalizer(Strategy.COMPUTED)
 
@@ -224,6 +286,9 @@ def load_encoder(
     with _cache_lock:
         hit = _cache.get(repo_id)
         if hit is not None:
+            # Mark as most-recently-used. Keeps the just-touched entry
+            # safe from eviction on the next insert.
+            _cache.move_to_end(repo_id)
             return hit
 
         logger.info("loading OlmoEarth model %s to %s", repo_id, target_device)
@@ -239,6 +304,11 @@ def load_encoder(
             model = _load_from_repo_id(repo_id)
             model.eval()
             model.to(target_device)
+        # LRU eviction BEFORE insert so we never exceed the cap. The new
+        # entry slots in at the most-recently-used end automatically.
+        max_entries = _max_cache_entries()
+        while len(_cache) >= max_entries:
+            _evict_oldest_locked()
         _cache[repo_id] = (model, target_device)
         return model, target_device
 
@@ -316,10 +386,30 @@ class FTInferenceResult:
     decoder_key: str
 
 
+def _normalize_timestamps(
+    timestamp_dmy: tuple[int, int, int] | list[tuple[int, int, int]],
+    n_periods: int,
+) -> list[tuple[int, int, int]]:
+    """Accept a single (d, m, y) tuple OR a length-T list; return length-T list.
+
+    Single-tuple inputs are replicated across T (matches the legacy
+    single-scene inference path's behavior). Length-T lists are returned
+    unchanged after a length check.
+    """
+    if isinstance(timestamp_dmy, tuple):
+        return [timestamp_dmy] * n_periods
+    if len(timestamp_dmy) != n_periods:
+        raise ValueError(
+            f"timestamp_dmy list length {len(timestamp_dmy)} does not "
+            f"match T={n_periods} from the input image"
+        )
+    return list(timestamp_dmy)
+
+
 def run_s2_inference(
     model: torch.nn.Module,
     image_bhwtc: np.ndarray,
-    timestamp_dmy: tuple[int, int, int],
+    timestamp_dmy: tuple[int, int, int] | list[tuple[int, int, int]],
     patch_size: int = 4,
     device: torch.device | None = None,
     normalize: bool = True,
@@ -328,13 +418,16 @@ def run_s2_inference(
 
     Args:
         model: an OlmoEarth model returned by :func:`load_encoder`.
-        image_bhwtc: Sentinel-2 image in ``(B=1, H, W, T=1, C=12)`` layout in
+        image_bhwtc: Sentinel-2 image in ``(B=1, H, W, T, C=12)`` layout in
             the band order from ``Modality.SENTINEL2_L2A.band_order``
             (B02, B03, B04, B08, B05, B06, B07, B8A, B11, B12, B01, B09).
-            Raw DN reflectance; pass ``normalize=False`` if it's already
-            been pushed through ``Normalizer``.
-        timestamp_dmy: ``(day_of_month 1-31, month 0-11, year)`` — the
-            Inference-Quickstart convention.
+            ``T`` may be 1 (legacy single-scene path) or N (temporal stack
+            from :func:`fetch_s2_temporal_stack`). Raw DN reflectance; pass
+            ``normalize=False`` if it's already been pushed through
+            ``Normalizer``.
+        timestamp_dmy: either a single ``(day 1-31, month 0-11, year)`` tuple
+            (replicated across T) or a length-T list — one tuple per period
+            mosaic. Per the Inference-Quickstart convention.
         patch_size: 1-8 per the official quickstart; smaller is higher-res
             but more GPU time. 4 matches the quickstart default.
         device: override device; defaults to the one the model was loaded on.
@@ -344,17 +437,21 @@ def run_s2_inference(
     Returns an :class:`InferenceResult` holding both the raw per-patch
     embedding tensor and a 2D scalar raster ready for colormap rendering.
     """
-    if image_bhwtc.ndim != 5 or image_bhwtc.shape[0] != 1 or image_bhwtc.shape[3] != 1:
+    if image_bhwtc.ndim != 5 or image_bhwtc.shape[0] != 1:
         raise ValueError(
-            f"expected BHWTC with B=1 T=1, got shape {image_bhwtc.shape}"
+            f"expected BHWTC with B=1, got shape {image_bhwtc.shape}"
         )
-    _, h, w, _, c = image_bhwtc.shape
+    _, h, w, t_dim, c = image_bhwtc.shape
     if c != 12:
         raise ValueError(f"Sentinel-2 L2A needs 12 bands, got C={c}")
+    if t_dim < 1:
+        raise ValueError(f"Sentinel-2 input needs T>=1, got T={t_dim}")
     if h % patch_size != 0 or w % patch_size != 0:
         raise ValueError(
             f"image H={h} W={w} must be divisible by patch_size={patch_size}"
         )
+
+    timestamps_list = _normalize_timestamps(timestamp_dmy, t_dim)
 
     target_device = device
     if target_device is None:
@@ -372,13 +469,13 @@ def run_s2_inference(
     img_t = torch.as_tensor(img, dtype=torch.float32, device=target_device)
 
     mask = torch.full(
-        (1, h, w, 1, 3),
+        (1, h, w, t_dim, 3),
         float(MaskValue.ONLINE_ENCODER.value),
         dtype=torch.float32,
         device=target_device,
     )
     ts = torch.tensor(
-        [[[int(timestamp_dmy[0]), int(timestamp_dmy[1]), int(timestamp_dmy[2])]]],
+        [[[int(d), int(m), int(y)] for d, m, y in timestamps_list]],
         dtype=torch.long,
         device=target_device,
     )
@@ -407,7 +504,7 @@ def run_s2_inference(
 def run_ft_inference(
     model: FTModel,
     image_bhwtc: np.ndarray,
-    timestamp_dmy: tuple[int, int, int],
+    timestamp_dmy: tuple[int, int, int] | list[tuple[int, int, int]],
     patch_size: int = 4,
     device: torch.device | None = None,
     normalize: bool = True,
@@ -416,19 +513,26 @@ def run_ft_inference(
 
     Same S2 preprocessing as :func:`run_s2_inference` — normalize, build a
     :class:`MaskedOlmoEarthSample`, run the full encoder → head chain — but
-    the output layout depends on the head's task type.
+    the output layout depends on the head's task type. ``T`` may be 1 (legacy
+    single-scene fallback) or N (PER_PERIOD_MOSAIC temporal stack, which is
+    what every FT head was actually trained on — see FT_TASK_METADATA
+    ``input_spec``).
     """
-    if image_bhwtc.ndim != 5 or image_bhwtc.shape[0] != 1 or image_bhwtc.shape[3] != 1:
+    if image_bhwtc.ndim != 5 or image_bhwtc.shape[0] != 1:
         raise ValueError(
-            f"expected BHWTC with B=1 T=1, got shape {image_bhwtc.shape}"
+            f"expected BHWTC with B=1, got shape {image_bhwtc.shape}"
         )
-    _, h, w, _, c = image_bhwtc.shape
+    _, h, w, t_dim, c = image_bhwtc.shape
     if c != 12:
         raise ValueError(f"Sentinel-2 L2A needs 12 bands, got C={c}")
+    if t_dim < 1:
+        raise ValueError(f"Sentinel-2 input needs T>=1, got T={t_dim}")
     if h % patch_size != 0 or w % patch_size != 0:
         raise ValueError(
             f"image H={h} W={w} must be divisible by patch_size={patch_size}"
         )
+
+    timestamps_list = _normalize_timestamps(timestamp_dmy, t_dim)
 
     target_device = device or model.device
     img = image_bhwtc
@@ -443,13 +547,13 @@ def run_ft_inference(
     img_t = torch.as_tensor(img, dtype=torch.float32, device=target_device)
 
     mask = torch.full(
-        (1, h, w, 1, 3),
+        (1, h, w, t_dim, 3),
         float(MaskValue.ONLINE_ENCODER.value),
         dtype=torch.float32,
         device=target_device,
     )
     ts = torch.tensor(
-        [[[int(timestamp_dmy[0]), int(timestamp_dmy[1]), int(timestamp_dmy[2])]]],
+        [[[int(d), int(m), int(y)] for d, m, y in timestamps_list]],
         dtype=torch.long,
         device=target_device,
     )
@@ -571,7 +675,7 @@ def run_ft_inference(
 def run_ft_tiled_inference(
     model: FTModel,
     image_bhwtc: np.ndarray,
-    timestamp_dmy: tuple[int, int, int],
+    timestamp_dmy: tuple[int, int, int] | list[tuple[int, int, int]],
     window_size: int = 32,
     patch_size: int | None = None,
     device: torch.device | None = None,
@@ -602,13 +706,15 @@ def run_ft_tiled_inference(
     bottom / right edges — the output tensor is trimmed to ``(n_rows *
     window_size, n_cols * window_size)`` in input pixels.
     """
-    if image_bhwtc.ndim != 5 or image_bhwtc.shape[0] != 1 or image_bhwtc.shape[3] != 1:
+    if image_bhwtc.ndim != 5 or image_bhwtc.shape[0] != 1:
         raise ValueError(
-            f"expected BHWTC with B=1 T=1, got shape {image_bhwtc.shape}"
+            f"expected BHWTC with B=1, got shape {image_bhwtc.shape}"
         )
-    _, H, W, _, C = image_bhwtc.shape
+    _, H, W, T_dim, C = image_bhwtc.shape
     if C != 12:
         raise ValueError(f"Sentinel-2 L2A needs 12 bands, got C={C}")
+    if T_dim < 1:
+        raise ValueError(f"Sentinel-2 input needs T>=1, got T={T_dim}")
 
     md = model.metadata or {}
     effective_patch = patch_size or md.get("patch_size") or 4
@@ -731,6 +837,108 @@ def _pca_to_scalar(embedding_hwd: np.ndarray) -> np.ndarray:
     if hi - lo < 1e-9:
         return np.zeros((h, w), dtype=np.float32)
     return ((pc1 - lo) / (hi - lo)).reshape(h, w).astype(np.float32)
+
+
+def cosine_similarity_map(
+    embedding_hwd: np.ndarray, query_vec: np.ndarray,
+) -> np.ndarray:
+    """Compute per-patch cosine similarity against a query vector.
+
+    The Ai2 OlmoEarth tutorial uses this as the "find more like this"
+    workflow — pick a patch, compute its cosine similarity against every
+    other patch, render the result as a heatmap. Works globally (no
+    labels required).
+
+    Args:
+        embedding_hwd: ``(H, W, D)`` float32 embedding from the chunked
+            export pipeline. Nodata patches (all-zero vectors) get a
+            similarity of 0 so the tile renderer draws them at the dark
+            end of the colormap rather than propagating NaN.
+        query_vec: ``(D,)`` query vector — typically ``embedding_hwd``
+            at the clicked pixel, or the mean over a small window for
+            noise robustness.
+
+    Returns:
+        ``(H, W)`` float32 in ``[0, 1]``. The raw cosine range is
+        ``[-1, 1]`` but we rescale to ``[0, 1]`` for direct colormap
+        rendering (0 = most dissimilar, 1 = identical to query).
+    """
+    h, w, d = embedding_hwd.shape
+    if query_vec.shape != (d,):
+        raise ValueError(
+            f"query_vec shape {query_vec.shape} doesn't match embedding "
+            f"last dim {d}"
+        )
+
+    flat = embedding_hwd.reshape(h * w, d)
+    # Nodata: pixels where every D dim is exactly 0 (untouched chunk).
+    nodata_flat = ~np.any(flat != 0, axis=-1)
+
+    # Normalize both sides. Epsilon prevents div-by-zero on all-zero
+    # rows without biasing the valid rows meaningfully.
+    flat_norm = flat / (np.linalg.norm(flat, axis=-1, keepdims=True) + 1e-9)
+    q_norm = query_vec / (np.linalg.norm(query_vec) + 1e-9)
+
+    cos_sim = flat_norm @ q_norm                  # (H*W,) in [-1, 1]
+    # Rescale [-1, 1] → [0, 1]. Anchors at 0.5 = perpendicular, which
+    # is semantically "unrelated" and reads as mid-colormap.
+    sim01 = ((cos_sim + 1.0) / 2.0).astype(np.float32)
+    # Force nodata pixels to 0 so they render at the dark end rather
+    # than leaking a spurious "somewhat similar" value from the zero
+    # vector's dot product with the query.
+    sim01[nodata_flat] = 0.0
+    return sim01.reshape(h, w)
+
+
+def pca_to_rgb(embedding_hwd: np.ndarray) -> np.ndarray:
+    """Project a ``(H, W, D)`` embedding onto its top-3 principal components
+    and map to uint8 RGB.
+
+    The Ai2 OlmoEarth tutorial shows this pattern verbatim — PCA to 3
+    dimensions gives "the same structure the encoder sees, rendered as
+    colors". Similar embeddings → similar colors, so agricultural parcels,
+    urban cores, and water bodies each pick up their own hue with zero
+    labels. Works globally — no FT head region lock.
+
+    Pixels where every ``D`` dimension is exactly zero are treated as
+    ``nodata`` and emit ``(0, 0, 0)`` — matches the convention used by
+    ``_run_chunked_embedding_export`` for unwritten chunks.
+
+    Returns a ``(H, W, 3)`` ``uint8`` array suitable for direct RGB tile
+    rendering via the ``rgb_raster`` path in
+    ``olmoearth_inference._render_pytorch_tile``.
+    """
+    h, w, d = embedding_hwd.shape
+    flat = embedding_hwd.reshape(h * w, d)
+    # Nodata mask — untouched chunks sit at exact zero across all D dims.
+    nodata_flat = ~np.any(flat != 0, axis=-1)
+
+    rgb = np.zeros((h * w, 3), dtype=np.uint8)
+    valid = ~nodata_flat
+    if not valid.any():
+        return rgb.reshape(h, w, 3)
+
+    flat_valid = flat[valid]
+    centered = flat_valid - flat_valid.mean(axis=0, keepdims=True)
+    # Top-3 components via SVD. ``full_matrices=False`` keeps the matrix
+    # small (N × 3 instead of N × D) — cheap for typical N = H×W ≤ 16 k.
+    _, _, vh = np.linalg.svd(centered, full_matrices=False)
+    k = min(3, vh.shape[0])
+    pcs = centered @ vh[:k].T                                # (N_valid, k)
+    if k < 3:
+        # Tiny embedding dim — pad missing components with zeros.
+        pad = np.zeros((pcs.shape[0], 3 - k), dtype=pcs.dtype)
+        pcs = np.concatenate([pcs, pad], axis=-1)
+
+    # Per-component min/max rescale to [0, 255]. Each channel spans its own
+    # range so the image uses the full dynamic range even when PC variance
+    # decays quickly (common for low-D embeddings).
+    lo = pcs.min(axis=0, keepdims=True)
+    hi = pcs.max(axis=0, keepdims=True)
+    denom = np.maximum(hi - lo, 1e-9)
+    normed = (pcs - lo) / denom                              # (N_valid, 3)
+    rgb[valid] = (np.clip(normed, 0.0, 1.0) * 255).astype(np.uint8)
+    return rgb.reshape(h, w, 3)
 
 
 def model_summary(repo_id: str) -> dict[str, Any]:

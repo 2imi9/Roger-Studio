@@ -42,6 +42,10 @@ dependencies = [
     # numpy 2.0 was absorbed; 3.0 is the next expected hard break.
     "numpy>=1.26,<3.0",
     "pillow>=10.0",
+    # System health precheck for chunked inference — ``psutil.virtual_memory``
+    # is how ``olmoearth_inference`` refuses to launch a job when free RAM
+    # is below the safety threshold (prevents OOM-induced force-shutdowns).
+    "psutil>=5.9.0,<8.0",
 ]
 
 [project.optional-dependencies]

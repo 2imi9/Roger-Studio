@@ -25,26 +25,249 @@ References:
 """
 from __future__ import annotations
 
-import logging
-import time
-from dataclasses import dataclass
-from typing import Any
+# ---------------------------------------------------------------------------
+# GDAL / CURL tuning for Planetary Computer COG reads. MUST be set BEFORE
+# ``import rasterio`` — rasterio binds to the GDAL C library which reads
+# several of these env vars (notably GDAL_HTTP_TIMEOUT and friends) at
+# import time, not per-request. The previous revision set these AFTER
+# the rasterio import and the timeouts never actually fired; the
+# symptom was "every chunk stuck at 300 s with no progress" even though
+# the config dict literally contained GDAL_HTTP_TIMEOUT=30.
+#
+# The settings themselves:
+#   * HTTP/2 + 10 MB chunks matches Microsoft's COG layout for ~2× fetch
+#   * Hard per-request timeout (30 s total, 10 s TCP connect, drop if
+#     throughput < 1 KB/s for 15 s) — these are the ones that cannot be
+#     applied post-hoc and caused the stuck-forever bug
+#   * VSI cache (64 MB) + GDAL block cache (512 MB) absorb re-reads across
+#     overlapping chunk windows on the same scene
+#
+# Later code ALSO wraps reads in ``rasterio.Env(**_GDAL_DEFAULTS)`` as
+# belt-and-suspenders in case a fresh rasterio install caches some
+# knobs differently across versions.
+import os  # noqa: E402
 
-import asyncio
+_GDAL_DEFAULTS = {
+    "GDAL_HTTP_MULTIPLEX": "YES",                       # HTTP/2 multiplex
+    "GDAL_HTTP_VERSION": "2",                            # force HTTP/2
+    "VSI_CURL_USE_HEAD": "NO",                           # skip the wasted HEAD
+    "CPL_VSIL_CURL_ALLOWED_EXTENSIONS": ".tif,.jp2,.TIF,.JP2",
+    "GDAL_CACHEMAX": "512",                              # MB of in-RAM cache
+    "CPL_VSIL_CURL_CHUNK_SIZE": "10485760",              # 10 MB read chunks
+    "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",         # don't list dirs
+    "GDAL_HTTP_TIMEOUT": "30",                           # total request timeout (s)
+    "GDAL_HTTP_CONNECTTIMEOUT": "10",                    # TCP connect timeout (s)
+    "GDAL_HTTP_LOW_SPEED_TIME": "15",                    # abort if throughput < below
+    "GDAL_HTTP_LOW_SPEED_LIMIT": "1000",                 # ...1 KB/s for 15 s
+    "CPL_VSIL_CURL_USE_S3_SIGNING_V4": "NO",             # harmless for PC; avoid probes
+    "CPL_VSIL_CURL_NON_CACHED": "NO",                    # re-use curl handles across reads
+    "VSI_CACHE": "TRUE",
+    "VSI_CACHE_SIZE": "67108864",                        # 64 MB per-process VSI cache
+    "GDAL_INGESTED_BYTES_AT_OPEN": "32768",              # read more on open to skip subsequent HEADs
+    # --- Retry flaky HTTP reads. Diagnosed live: ad-hoc ``curl`` against
+    # the same PC endpoint sometimes succeeds (HTTP 200 in 1 s) and
+    # sometimes fails with "Connection was reset" — intermittent TLS
+    # handshake drops somewhere between the residential ISP and Azure.
+    # Without retries, a single reset kills an entire band read. Five
+    # attempts with exponential backoff recovers from the typical
+    # 2-3-second blip windows.
+    "GDAL_HTTP_MAX_RETRY": "5",                          # retry up to 5x on transient errors
+    "GDAL_HTTP_RETRY_DELAY": "1",                        # 1 s base, exponential
+    "CPL_VSIL_CURL_MAX_RETRY": "5",                      # same for VSI layer
+    "CPL_VSIL_CURL_RETRY_DELAY": "1",
+}
+for _k, _v in _GDAL_DEFAULTS.items():
+    os.environ.setdefault(_k, _v)
 
-import httpx
-import numpy as np
-import rasterio
-from rasterio.enums import Resampling
-from rasterio.transform import from_bounds
-from rasterio.vrt import WarpedVRT
-from rasterio.warp import transform_bounds
 
-from olmoearth_pretrain.data.constants import Modality
+def _typed_gdal_options() -> dict[str, Any]:
+    """``rasterio.Env(**kwargs)`` passes options to GDAL's C layer via
+    ``set_gdal_config`` which enforces Python-native types: integers as
+    ``int``, booleans as ``bool``, strings as ``str``. Passing a numeric
+    string (``"512"``) raises ``TypeError: an integer is required`` and
+    — because ``_read_one_band_window`` catches Exception broadly to
+    survive stuck sockets — would silently fail EVERY band read with
+    zero-filled output. Convert digit-only strings to int before handing
+    to rasterio.
+    """
+    typed: dict[str, Any] = {}
+    for k, v in _GDAL_DEFAULTS.items():
+        if isinstance(v, str) and v.lstrip("-").isdigit():
+            typed[k] = int(v)
+        else:
+            typed[k] = v
+    return typed
 
-from app.models.schemas import BBox
+
+_RASTERIO_ENV_KWARGS = _typed_gdal_options()
+
+# Now safe to import rasterio — env vars are already in place.
+import hashlib  # noqa: E402
+import logging  # noqa: E402
+import math  # noqa: E402
+import time  # noqa: E402
+from dataclasses import dataclass  # noqa: E402
+from pathlib import Path  # noqa: E402
+from typing import Any  # noqa: E402
+
+import asyncio  # noqa: E402
+
+import httpx  # noqa: E402
+import numpy as np  # noqa: E402
+import rasterio  # noqa: E402
+from rasterio.enums import Resampling  # noqa: E402
+from rasterio.transform import from_bounds  # noqa: E402
+from rasterio.vrt import WarpedVRT  # noqa: E402
+from rasterio.warp import transform_bounds  # noqa: E402
+from rasterio.windows import from_bounds as window_from_bounds  # noqa: E402
+
+from olmoearth_pretrain.data.constants import Modality  # noqa: E402
+
+from app.models.schemas import BBox  # noqa: E402
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Global band-read concurrency cap.
+#
+# Period-parallel + chunk-parallel multiplies: 4 chunks × 12 bands × 6 periods
+# = 288 potential concurrent rasterio.open calls to Planetary Computer.
+# PC rate-limits aggressively at that fan-out — observed symptom was all
+# chunks timing out at ~180 s because individual band reads were stuck in
+# throttle queues on PC's side.
+#
+# 24 is empirically a safe ceiling for residential IPs: enough parallelism
+# to saturate typical home bandwidth (~100 Mbps ÷ ~4 MB per read ≈ 25
+# concurrent reads keep the pipe full) without tripping per-IP rate limits.
+# Can be tuned via env var for power users on fatter pipes.
+_BAND_READ_CONCURRENCY = int(os.environ.get("S2_BAND_READ_CONCURRENCY", "24"))
+_band_read_sem: asyncio.Semaphore | None = None
+
+
+def _get_band_read_sem() -> asyncio.Semaphore:
+    """Lazily build the semaphore so it binds to the running event loop.
+
+    Creating a semaphore at import time can bind it to an event loop
+    that's different from the FastAPI worker's, causing subtle "Task got
+    Future attached to a different loop" errors. Deferring until first
+    use on the hot path sidesteps that."""
+    global _band_read_sem
+    if _band_read_sem is None:
+        _band_read_sem = asyncio.Semaphore(_BAND_READ_CONCURRENCY)
+    return _band_read_sem
+
+
+# ---------------------------------------------------------------------------
+# Local on-disk scene cache.
+#
+# First run over a bbox pays the full PC fetch cost (~60 s for a medium AOI
+# over home internet). Every subsequent inference over the SAME bbox (any
+# FT head, any date range that hits the same scenes) reads from SSD and
+# skips PC entirely — the encoder + head then run in ~1 s on GPU.
+#
+# Cache key: sha256 of (scene_id, chunk_bbox with 6 decimal places, target
+# gsd, band name). S2 scenes on PC are immutable once published, so a cache
+# keyed on scene_id is valid forever (modulo cache-format version).
+#
+# Disk format: numpy .npy per (scene, band, window). One file ~1–5 MB for a
+# typical 5 km chunk at 10 m/pixel. A region-wide cache for a 22 km AOI
+# across 6 periods and 12 bands is ~700 MB — trivial on any modern SSD.
+#
+# To disable caching (e.g. to force re-fetch for debugging): set env var
+# ``S2_CACHE_DISABLED=1`` OR delete the cache directory.
+_S2_CACHE_DIR = Path(os.environ.get("S2_CACHE_DIR", "data/s2_cache"))
+_S2_CACHE_VERSION = "v1"        # bump when cache format changes
+_S2_CACHE_DISABLED = os.environ.get("S2_CACHE_DISABLED", "").lower() in ("1", "true", "yes")
+
+# ---------------------------------------------------------------------------
+# Sequential-read safety mode.
+#
+# When set via ``S2_SEQUENTIAL=1`` in the env, band reads inside a period
+# run one-at-a-time via a plain ``for`` loop instead of ``asyncio.gather``.
+# Slower but memory-bounded regardless of AOI size / chunk count. Matches
+# the Ai2 OlmoEarth tutorial notebook's pattern, which extracts
+# 1,460 windows sequentially without ever risking OOM.
+#
+# When to enable:
+#   * Residential / shared machine where other apps (Chrome, Docker,
+#     LLM containers) already use most of the RAM
+#   * Anywhere that a hard-crash costs more than the time lost to serial IO
+#   * Debugging / CI runs where determinism matters more than speed
+#
+# Worst-case memory footprint of one serial read: one GDAL block (~16 MB
+# for PC's S2 L2A 10 m bands) + one per-band numpy array at chunk
+# resolution (~1 MB for a 500×500 chunk). Hard ceiling: tens of MB per
+# band regardless of concurrency.
+_S2_SEQUENTIAL = os.environ.get("S2_SEQUENTIAL", "").lower() in ("1", "true", "yes")
+if _S2_SEQUENTIAL:
+    logger.info(
+        "S2_SEQUENTIAL=1 — band reads will run one-at-a-time "
+        "(safer, slower, OOM-proof).",
+    )
+
+
+def _s2_cache_key(
+    scene_id: str, bbox: BBox, band: str, target_gsd_m: float
+) -> Path:
+    """Stable on-disk path for one (scene, bbox, band, gsd) tuple."""
+    key = (
+        f"{_S2_CACHE_VERSION}|{scene_id}|"
+        f"{bbox.west:.6f}|{bbox.south:.6f}|{bbox.east:.6f}|{bbox.north:.6f}|"
+        f"{target_gsd_m}|{band}"
+    )
+    h = hashlib.sha256(key.encode()).hexdigest()[:16]
+    # Shard by first 2 chars to avoid 10k+ files in a single dir — some
+    # filesystems (Windows NTFS especially) degrade past a few thousand.
+    return _S2_CACHE_DIR / h[:2] / f"{h}.npy"
+
+
+def _s2_cache_get(
+    scene_id: str, bbox: BBox, band: str, target_gsd_m: float
+) -> np.ndarray | None:
+    """Read a cached band array. Returns None on miss or corruption."""
+    if _S2_CACHE_DISABLED:
+        return None
+    p = _s2_cache_key(scene_id, bbox, band, target_gsd_m)
+    if not p.exists():
+        return None
+    try:
+        arr = np.load(p)
+        return arr
+    except Exception as e:
+        # Corrupt file (truncated write from a prior crash, disk error).
+        # Drop it so the next put rewrites cleanly.
+        logger.warning("s2_cache: corrupt %s (%s) — removing", p, e)
+        try:
+            p.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return None
+
+
+def _s2_cache_put(
+    scene_id: str, bbox: BBox, band: str, target_gsd_m: float, arr: np.ndarray
+) -> None:
+    """Write a band array to cache atomically (tmp + rename).
+
+    Writes via an explicit file handle to bypass numpy's "helpful" behavior
+    of appending ``.npy`` when called with a string / Path — that quirk
+    silently broke the atomic-rename path (save to ``X.tmp.npy`` but look
+    for ``X.tmp`` when renaming).
+    """
+    if _S2_CACHE_DISABLED:
+        return
+    p = _s2_cache_key(scene_id, bbox, band, target_gsd_m)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.parent / f"{p.name}.tmp"
+        with open(tmp, "wb") as f:
+            np.save(f, arr.astype(np.float32, copy=False))
+        # ``replace`` is atomic on POSIX + Windows — prevents a half-written
+        # file being left behind if the process dies mid-save.
+        tmp.replace(p)
+    except Exception as e:
+        logger.warning("s2_cache: failed to write %s: %s", p, e)
 
 PC_STAC_API = "https://planetarycomputer.microsoft.com/api/stac/v1"
 PC_SAS_API = "https://planetarycomputer.microsoft.com/api/sas/v1"
@@ -194,6 +417,13 @@ def image_to_bhwtc(image_hwc: np.ndarray) -> np.ndarray:
     return image_hwc[np.newaxis, :, :, np.newaxis, :].astype(np.float32)
 
 
+def stack_to_bhwtc(stack_hwtc: np.ndarray) -> np.ndarray:
+    """Reshape a ``(H, W, T, 12)`` temporal stack to ``(1, H, W, T, 12)`` BHWTC."""
+    if stack_hwtc.ndim != 4 or stack_hwtc.shape[-1] != 12:
+        raise ValueError(f"expected (H, W, T, 12) got {stack_hwtc.shape}")
+    return stack_hwtc[np.newaxis, ...].astype(np.float32)
+
+
 def timestamp_from_iso(iso_str: str) -> tuple[int, int, int]:
     """Convert an ISO datetime like ``"2024-08-22T10:12:03Z"`` to OlmoEarth's
     ``(day 1-31, month 0-11, year)`` tuple."""
@@ -201,6 +431,655 @@ def timestamp_from_iso(iso_str: str) -> tuple[int, int, int]:
     date_part = iso_str.split("T", 1)[0]
     y, m, d = date_part.split("-")
     return (int(d), int(m) - 1, int(y))
+
+
+@dataclass(frozen=True)
+class SentinelTemporalStack:
+    """Result of a successful multi-period S2 fetch — what FT heads trained on
+    PER_PERIOD_MOSAIC layers (Ecosystem / AWF / Mangrove) actually need.
+
+    Layout mirrors :class:`SentinelScene` but with an explicit time axis:
+
+      ``stack``       — ``(H, W, T, 12)`` float32, raw DN reflectance, in
+                        OlmoEarth's S2 band order. Periods that returned no
+                        usable scene are zero-filled and marked in
+                        ``period_skipped``.
+      ``transform``   — common 10 m/pixel affine in ``crs`` for every period
+                        (we choose the first non-empty period's CRS and align
+                        every other period to its grid via WarpedVRT).
+      ``timestamps``  — ``T``-long list of (day, month-0-indexed, year) tuples;
+                        one per period mosaic, taken from the chosen scene's
+                        acquisition date. Periods with no scene fall back to
+                        the period midpoint so the encoder never sees a zero
+                        timestamp.
+      ``scene_ids``   — ``T``-long list, ``None`` for skipped periods.
+      ``period_skipped`` — bool list of length T; True where the period had
+                        no scene matching the cloud / coverage criteria.
+    """
+
+    stack: np.ndarray                                 # (H, W, T, 12) float32
+    transform: rasterio.Affine
+    crs: Any
+    timestamps: list[tuple[int, int, int]]            # length T
+    scene_ids: list[str | None]                       # length T
+    scene_datetimes: list[str | None]                 # length T (ISO-8601)
+    cloud_covers: list[float | None]                  # length T
+    period_skipped: list[bool]                        # length T
+    bbox_wgs84: tuple[float, float, float, float]
+
+
+async def fetch_s2_temporal_stack(
+    bbox: BBox,
+    anchor_date: str,
+    n_periods: int,
+    period_days: int,
+    time_offset_days: int = 0,
+    max_size_px: int = 256,
+    max_cloud_cover: float = 40.0,
+) -> SentinelTemporalStack:
+    """Fetch ``n_periods`` Sentinel-2 mosaics ending at ``anchor_date``.
+
+    Each period is a ``period_days``-wide window; we pick the single least-
+    cloudy scene per window via STAC, then read all 12 bands aligned to a
+    common 10 m/pixel grid.
+
+    Period layout (walking backward from the anchor; matches what
+    PER_PERIOD_MOSAIC layers in olmoearth_projects expect at inference):
+
+        period[T-1]: [anchor + offset - period_days,
+                      anchor + offset]
+        period[T-2]: [anchor + offset - 2 * period_days,
+                      anchor + offset - period_days]
+        ...
+        period[0]:   [anchor + offset - T * period_days,
+                      anchor + offset - (T - 1) * period_days]
+
+    ``time_offset_days`` lets callers shift the entire window — the rslearn
+    training configs declare it relative to the label date; at inference we
+    treat the user's anchor as the label proxy.
+
+    Periods that return no scene are kept as zero slots with
+    ``period_skipped[t] = True`` so the temporal axis stays length T (the
+    encoder's positional / temporal encoding assumes a contiguous T axis;
+    silently dropping a period would shift every later mosaic by 30 days
+    relative to training). Caller may decide to fall back to single-scene
+    fetch if too many periods skip.
+
+    Raises:
+        SentinelFetchError: if every period skipped or all bands failed.
+    """
+    if n_periods < 1:
+        raise ValueError(f"n_periods must be >=1, got {n_periods}")
+    if period_days < 1:
+        raise ValueError(f"period_days must be >=1, got {period_days}")
+
+    from datetime import datetime, timedelta  # noqa: PLC0415
+
+    # Parse anchor_date — accept ISO date or "start/end" range (use end).
+    anchor_str = anchor_date.split("/")[-1].strip().split("T", 1)[0]
+    try:
+        anchor = datetime.fromisoformat(anchor_str)
+    except ValueError as e:
+        raise ValueError(
+            f"anchor_date {anchor_date!r} not parseable as ISO date "
+            f"(expected YYYY-MM-DD or YYYY-MM-DD/YYYY-MM-DD)"
+        ) from e
+    window_end = anchor + timedelta(days=time_offset_days)
+
+    # Build T contiguous period windows ending at window_end (oldest first).
+    period_ranges: list[tuple[datetime, datetime]] = []
+    for t in range(n_periods):
+        idx_from_end = n_periods - 1 - t  # 0 = most recent
+        end_t = window_end - timedelta(days=idx_from_end * period_days)
+        start_t = end_t - timedelta(days=period_days)
+        period_ranges.append((start_t, end_t))
+
+    # Parallel STAC searches — each call is a single HTTP POST that PC
+    # handles well at this concurrency (n_periods <= 12 in practice). Band
+    # READS are still sequential because 12 × n_periods concurrent rasterio
+    # reads exhaust PC's SAS token rate limits + local file handles. If
+    # fetch time becomes the bottleneck again, parallelizing *within-period*
+    # band reads (with a bounded semaphore) is the next lever.
+    async def _safe_search(dt_range: str) -> dict[str, Any] | None:
+        try:
+            return await _search_least_cloudy(bbox, dt_range, max_cloud_cover)
+        except SentinelFetchError as e:
+            logger.info("temporal_stack: period %s empty (%s)", dt_range, e)
+            return None
+
+    period_dt_ranges = [
+        f"{start_t.date().isoformat()}/{end_t.date().isoformat()}"
+        for start_t, end_t in period_ranges
+    ]
+    period_scenes: list[dict[str, Any] | None] = list(
+        await asyncio.gather(*[_safe_search(dtr) for dtr in period_dt_ranges])
+    )
+
+    # Need at least one period to anchor the grid (CRS + transform).
+    anchor_period = next(
+        ((idx, s) for idx, s in enumerate(period_scenes) if s is not None),
+        None,
+    )
+    if anchor_period is None:
+        raise SentinelFetchError(
+            f"no Sentinel-2 scenes found in any of {n_periods} periods "
+            f"({period_ranges[0][0].date()} → {period_ranges[-1][1].date()}, "
+            f"{period_days}d each, cloud<{max_cloud_cover})"
+        )
+
+    # Resolve the anchor scene's CRS + a destination grid that matches
+    # fetch_s2_composite (so the rest of the pipeline — sampling, CRS-aware
+    # tile rendering — stays unchanged).
+    _anchor_idx, anchor_scene = anchor_period
+    anchor_token = await _get_sas_token(anchor_scene["collection"])
+    anchor_assets = anchor_scene["assets"]
+    want_bands = list(Modality.SENTINEL2_L2A.band_order)
+    missing = [b for b in want_bands if b not in anchor_assets]
+    if missing:
+        raise SentinelFetchError(f"anchor scene missing bands: {missing}")
+
+    first_href = _sign(anchor_assets[want_bands[0]]["href"], anchor_token)
+    with rasterio.open(first_href) as src0:
+        scene_crs = src0.crs
+
+    west, south, east, north = transform_bounds(
+        "EPSG:4326", scene_crs, bbox.west, bbox.south, bbox.east, bbox.north
+    )
+    width_m = abs(east - west)
+    height_m = abs(north - south)
+    native_gsd_m = 10.0
+    longest_m = max(width_m, height_m)
+    candidate_gsd = longest_m / float(max_size_px)
+    gsd_m = max(native_gsd_m, candidate_gsd)
+    out_width = max(1, int(round(width_m / gsd_m)))
+    out_height = max(1, int(round(height_m / gsd_m)))
+    dst_transform = from_bounds(west, south, east, north, out_width, out_height)
+
+    stack = np.zeros((out_height, out_width, n_periods, 12), dtype=np.float32)
+    timestamps: list[tuple[int, int, int]] = []
+    scene_ids: list[str | None] = []
+    scene_datetimes: list[str | None] = []
+    cloud_covers: list[float | None] = []
+    period_skipped: list[bool] = []
+
+    for t, scene in enumerate(period_scenes):
+        start_t, end_t = period_ranges[t]
+        if scene is None:
+            # Period midpoint — keeps the temporal encoding sensible even
+            # though the band slice is zero.
+            mid = start_t + (end_t - start_t) / 2
+            timestamps.append((mid.day, mid.month - 1, mid.year))
+            scene_ids.append(None)
+            scene_datetimes.append(None)
+            cloud_covers.append(None)
+            period_skipped.append(True)
+            continue
+
+        token = await _get_sas_token(scene["collection"])
+        assets = scene["assets"]
+        period_missing = [b for b in want_bands if b not in assets]
+        if period_missing:
+            logger.warning(
+                "temporal_stack: period %d missing bands %s — skipping",
+                t, period_missing,
+            )
+            mid = start_t + (end_t - start_t) / 2
+            timestamps.append((mid.day, mid.month - 1, mid.year))
+            scene_ids.append(None)
+            scene_datetimes.append(None)
+            cloud_covers.append(None)
+            period_skipped.append(True)
+            continue
+
+        period_failed = False
+        for band_idx, band_name in enumerate(want_bands):
+            href = _sign(assets[band_name]["href"], token)
+            try:
+                with rasterio.open(href) as src:
+                    with WarpedVRT(
+                        src,
+                        crs=scene_crs,
+                        transform=dst_transform,
+                        width=out_width,
+                        height=out_height,
+                        resampling=Resampling.bilinear,
+                    ) as vrt:
+                        stack[:, :, t, band_idx] = vrt.read(1).astype(np.float32)
+            except (rasterio.RasterioIOError, rasterio.errors.RasterioError) as e:
+                logger.warning(
+                    "temporal_stack: period %d band %s failed (%s) — skipping period",
+                    t, band_name, e,
+                )
+                period_failed = True
+                break
+
+        if period_failed:
+            # Zero out anything we may have partially written so the
+            # encoder doesn't see a spectrally-mismatched mosaic.
+            stack[:, :, t, :] = 0.0
+            mid = start_t + (end_t - start_t) / 2
+            timestamps.append((mid.day, mid.month - 1, mid.year))
+            scene_ids.append(None)
+            scene_datetimes.append(None)
+            cloud_covers.append(None)
+            period_skipped.append(True)
+            continue
+
+        ts = timestamp_from_iso(scene["datetime"])
+        timestamps.append(ts)
+        scene_ids.append(scene["id"])
+        scene_datetimes.append(scene["datetime"])
+        cloud_covers.append(scene.get("cloud_cover"))
+        period_skipped.append(False)
+
+    if all(period_skipped):
+        raise SentinelFetchError(
+            f"all {n_periods} periods skipped after band-read attempts "
+            f"({period_ranges[0][0].date()} → {period_ranges[-1][1].date()})"
+        )
+
+    return SentinelTemporalStack(
+        stack=stack,
+        transform=dst_transform,
+        crs=scene_crs,
+        timestamps=timestamps,
+        scene_ids=scene_ids,
+        scene_datetimes=scene_datetimes,
+        cloud_covers=cloud_covers,
+        period_skipped=period_skipped,
+        bbox_wgs84=(bbox.west, bbox.south, bbox.east, bbox.north),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Chunked native-resolution fetch — split AOI, share STAC searches, parallel
+# band reads, return one chunk's BHWTC stack ready for inference.
+# ---------------------------------------------------------------------------
+
+
+def plan_chunks(bbox: BBox, chunk_size_m: int = 5000) -> list[BBox]:
+    """Tile a WGS-84 bbox into a row-major grid of <= ``chunk_size_m`` sub-bboxes.
+
+    Edge chunks may be smaller than the target. Lat/lon → meters via the
+    AOI-center cosine factor; good enough for chunks well under 1°.
+    """
+    mid_lat = (bbox.north + bbox.south) / 2.0
+    m_per_deg_lon = 111_000.0 * math.cos(math.radians(mid_lat))
+    m_per_deg_lat = 111_000.0
+    chunk_deg_lon = chunk_size_m / m_per_deg_lon
+    chunk_deg_lat = chunk_size_m / m_per_deg_lat
+
+    n_cols = max(1, math.ceil((bbox.east - bbox.west) / chunk_deg_lon))
+    n_rows = max(1, math.ceil((bbox.north - bbox.south) / chunk_deg_lat))
+    actual_lon = (bbox.east - bbox.west) / n_cols
+    actual_lat = (bbox.north - bbox.south) / n_rows
+
+    chunks: list[BBox] = []
+    for r in range(n_rows):
+        for c in range(n_cols):
+            chunks.append(BBox(
+                west=bbox.west + c * actual_lon,
+                south=bbox.south + r * actual_lat,
+                east=bbox.west + (c + 1) * actual_lon,
+                north=bbox.south + (r + 1) * actual_lat,
+            ))
+    return chunks
+
+
+@dataclass(frozen=True)
+class AoiPeriodScene:
+    """One STAC search result valid for every chunk in a given period.
+
+    Reused across chunks to avoid redundant STAC searches — a single S2
+    scene is ~110 km wide and typically covers every chunk in a small AOI.
+    """
+    scene: dict[str, Any] | None      # None when the period had no usable scene
+    period_start_iso: str
+    period_end_iso: str
+
+
+async def fetch_aoi_period_scenes(
+    bbox: BBox,
+    anchor_date: str,
+    n_periods: int,
+    period_days: int,
+    time_offset_days: int = 0,
+    max_cloud_cover: float = 40.0,
+) -> list[AoiPeriodScene]:
+    """One STAC search per period over the WHOLE AOI bbox.
+
+    Periods are walked backward from ``anchor_date + time_offset_days`` in
+    ``period_days`` chunks. The returned list has length ``n_periods``,
+    aligned with the temporal order the encoder expects.
+    """
+    if n_periods < 1:
+        raise ValueError(f"n_periods must be >=1, got {n_periods}")
+    if period_days < 1:
+        raise ValueError(f"period_days must be >=1, got {period_days}")
+
+    from datetime import datetime, timedelta  # noqa: PLC0415
+
+    anchor_str = anchor_date.split("/")[-1].strip().split("T", 1)[0]
+    try:
+        anchor = datetime.fromisoformat(anchor_str)
+    except ValueError as e:
+        raise ValueError(
+            f"anchor_date {anchor_date!r} not parseable as ISO date"
+        ) from e
+    window_end = anchor + timedelta(days=time_offset_days)
+
+    period_ranges: list[tuple[datetime, datetime]] = []
+    for t in range(n_periods):
+        idx_from_end = n_periods - 1 - t
+        end_t = window_end - timedelta(days=idx_from_end * period_days)
+        start_t = end_t - timedelta(days=period_days)
+        period_ranges.append((start_t, end_t))
+
+    async def _safe_search(dt_range: str) -> dict[str, Any] | None:
+        try:
+            return await _search_least_cloudy(bbox, dt_range, max_cloud_cover)
+        except SentinelFetchError as e:
+            logger.info("aoi_period_scenes: period %s empty (%s)", dt_range, e)
+            return None
+
+    period_dt_ranges = [
+        f"{s.date().isoformat()}/{e.date().isoformat()}"
+        for s, e in period_ranges
+    ]
+    scenes = list(await asyncio.gather(*[_safe_search(dtr) for dtr in period_dt_ranges]))
+    return [
+        AoiPeriodScene(
+            scene=scene,
+            period_start_iso=s.date().isoformat(),
+            period_end_iso=e.date().isoformat(),
+        )
+        for scene, (s, e) in zip(scenes, period_ranges)
+    ]
+
+
+def _read_one_band_window(
+    href: str, scene_crs: Any, dst_transform: Any, out_h: int, out_w: int
+) -> tuple[bool, np.ndarray]:
+    """Blocking rasterio read of ONE band, aligned to (dst_transform, scene_crs).
+
+    Wraps the ``rasterio.open`` call in ``rasterio.Env(**_GDAL_DEFAULTS)``
+    so the GDAL/CURL timeouts + HTTP/2 knobs apply even if the env-var
+    setting at module import didn't propagate (rasterio versions differ
+    in how strictly they snapshot GDAL config). Without this wrapper the
+    chunks sat on dead PC sockets for ~300 s each — observed repeatedly.
+
+    Returns ``(ok, data)``. On failure, ``ok=False`` and ``data`` is a zero
+    array — the caller decides whether to skip the period or proceed.
+    Designed to run inside ``asyncio.to_thread`` so multiple bands fetch in
+    parallel without the GIL (rasterio releases it during IO).
+    """
+    # Roll-back from the over-engineered "hang-proof" version: the extra
+    # ``rasterio.Env`` wrapper, global band semaphore, and broad Exception
+    # catch were added to handle a diagnosed "flaky ISP" symptom, but
+    # ended up strangling a pipeline that worked fine earlier in the
+    # session on the same network. The env vars set at module top
+    # (before rasterio import) are enough — GDAL reads them at first
+    # use. Keep the simple RasterioIOError path and let anything weirder
+    # propagate so we actually SEE new bugs instead of masking them.
+    try:
+        with rasterio.open(href) as src:
+            with WarpedVRT(
+                src,
+                crs=scene_crs,
+                transform=dst_transform,
+                width=out_w,
+                height=out_h,
+                resampling=Resampling.bilinear,
+            ) as vrt:
+                return True, vrt.read(1).astype(np.float32)
+    except (rasterio.RasterioIOError, rasterio.errors.RasterioError) as e:
+        short = href.rsplit("/", 1)[-1].split("?")[0][:50]
+        logger.warning("band read failed [%s]: %s", short, e)
+        return False, np.zeros((out_h, out_w), dtype=np.float32)
+
+
+async def fetch_s2_chunk_stack(
+    chunk_bbox: BBox,
+    period_scenes: list[AoiPeriodScene],
+    target_gsd_m: float = 10.0,
+    pinned_crs: Any | None = None,
+) -> SentinelTemporalStack:
+    """Read one chunk's worth of every period from pre-fetched scene metadata.
+
+    Optimized for the chunked-AOI orchestrator:
+      * STAC searches were ALREADY done at AOI scope by ``fetch_aoi_period_scenes``
+      * Each band is a windowed read of just this chunk's extent
+      * All 12 bands of a period fetch in parallel via ``asyncio.gather`` +
+        ``asyncio.to_thread`` (rasterio releases the GIL during IO, so the
+        thread pool is the right tool here)
+      * ``pinned_crs`` lets the orchestrator force every chunk onto the same
+        UTM zone for clean stitching at AOI edges that straddle a zone
+
+    Output shape mirrors :class:`SentinelTemporalStack` so this is a drop-in
+    for the existing inference path. When all periods skip, raises
+    ``SentinelFetchError`` so the caller can mark the chunk as nodata.
+    """
+    n_periods = len(period_scenes)
+    if n_periods == 0:
+        raise ValueError("period_scenes must be non-empty")
+
+    want_bands = list(Modality.SENTINEL2_L2A.band_order)
+
+    # Pick the anchor scene + CRS. Use ``pinned_crs`` when supplied; otherwise
+    # take the first non-empty period's native CRS (matches the legacy
+    # fetch_s2_temporal_stack contract).
+    anchor_period_idx: int | None = None
+    for idx, ps in enumerate(period_scenes):
+        if ps.scene is not None and all(b in ps.scene["assets"] for b in want_bands):
+            anchor_period_idx = idx
+            break
+    if anchor_period_idx is None:
+        raise SentinelFetchError(
+            f"chunk {chunk_bbox.model_dump()}: no period had a usable scene "
+            f"with all 12 S2 bands"
+        )
+    anchor_ps = period_scenes[anchor_period_idx]
+    assert anchor_ps.scene is not None
+    anchor_token = await _get_sas_token(anchor_ps.scene["collection"])
+    anchor_first_href = _sign(anchor_ps.scene["assets"][want_bands[0]]["href"], anchor_token)
+    if pinned_crs is None:
+        with rasterio.open(anchor_first_href) as src0:
+            scene_crs = src0.crs
+    else:
+        scene_crs = pinned_crs
+
+    # Compute the chunk's destination grid at the requested GSD in scene_crs.
+    west, south, east, north = transform_bounds(
+        "EPSG:4326", scene_crs,
+        chunk_bbox.west, chunk_bbox.south, chunk_bbox.east, chunk_bbox.north,
+    )
+    width_m = abs(east - west)
+    height_m = abs(north - south)
+    out_w = max(1, int(round(width_m / target_gsd_m)))
+    out_h = max(1, int(round(height_m / target_gsd_m)))
+    dst_transform = from_bounds(west, south, east, north, out_w, out_h)
+
+    stack = np.zeros((out_h, out_w, n_periods, 12), dtype=np.float32)
+    from datetime import datetime  # noqa: PLC0415
+
+    def _skip_record(ps: AoiPeriodScene) -> dict[str, Any]:
+        ps_start = datetime.fromisoformat(ps.period_start_iso)
+        ps_end = datetime.fromisoformat(ps.period_end_iso)
+        mid = ps_start + (ps_end - ps_start) / 2
+        return {
+            "ts": (mid.day, mid.month - 1, mid.year),
+            "scene_id": None,
+            "scene_datetime": None,
+            "cloud_cover": None,
+            "skipped": True,
+            "bands": None,
+        }
+
+    async def _fetch_one_period(ps: AoiPeriodScene) -> dict[str, Any]:
+        scene = ps.scene
+        if scene is None or any(b not in scene.get("assets", {}) for b in want_bands):
+            return _skip_record(ps)
+
+        # Check the local cache FIRST per-band. Each hit skips a full
+        # rasterio.open + WarpedVRT + HTTP round-trip to PC — typically
+        # 1–3 seconds saved per band. A fully cached period pays zero
+        # network cost.
+        cached_bands: dict[int, np.ndarray] = {}
+        need_fetch: list[tuple[int, str]] = []
+        for band_idx, band_name in enumerate(want_bands):
+            hit = _s2_cache_get(scene["id"], chunk_bbox, band_name, target_gsd_m)
+            if hit is not None and hit.shape == (out_h, out_w):
+                cached_bands[band_idx] = hit
+            else:
+                need_fetch.append((band_idx, band_name))
+
+        if need_fetch:
+            token = await _get_sas_token(scene["collection"])
+            signed_hrefs = [_sign(scene["assets"][bn]["href"], token) for _, bn in need_fetch]
+
+            if _S2_SEQUENTIAL:
+                # Safety mode — one read at a time. Matches the Ai2
+                # tutorial notebook's pattern. Memory footprint per band
+                # is bounded by one GDAL block + one numpy array (~tens
+                # of MB) regardless of chunk/period count. Slower but
+                # OOM-proof.
+                results: list[tuple[bool, np.ndarray]] = []
+                for href in signed_hrefs:
+                    results.append(
+                        await asyncio.to_thread(
+                            _read_one_band_window,
+                            href, scene_crs, dst_transform, out_h, out_w,
+                        )
+                    )
+            else:
+                # Parallel reads only for cache misses. Chunk-level sem
+                # (4) + period-parallel (6) already caps concurrency at
+                # ~4×6×12 = 288 reads, which PC tolerates in practice.
+                results = await asyncio.gather(*[
+                    asyncio.to_thread(
+                        _read_one_band_window, href, scene_crs, dst_transform, out_h, out_w,
+                    )
+                    for href in signed_hrefs
+                ])
+            if any(not ok for ok, _ in results):
+                return _skip_record(ps)
+            for (band_idx, band_name), (_, arr) in zip(need_fetch, results):
+                cached_bands[band_idx] = arr
+                _s2_cache_put(scene["id"], chunk_bbox, band_name, target_gsd_m, arr)
+
+        if len(cached_bands) != len(want_bands):
+            # Defensive — should be impossible with the checks above.
+            logger.warning(
+                "s2_cache: period missing bands after fetch (%d/%d) — skipping",
+                len(cached_bands), len(want_bands),
+            )
+            return _skip_record(ps)
+
+        if cached_bands and not need_fetch:
+            logger.info(
+                "s2_cache: scene %s fully cached (%d bands, 0 network)",
+                scene["id"], len(want_bands),
+            )
+        elif cached_bands and need_fetch:
+            logger.info(
+                "s2_cache: scene %s partial (%d cached, %d fetched)",
+                scene["id"], len(cached_bands) - len(need_fetch), len(need_fetch),
+            )
+
+        band_arrays = [cached_bands[i] for i in range(len(want_bands))]
+        return {
+            "ts": timestamp_from_iso(scene["datetime"]),
+            "scene_id": scene["id"],
+            "scene_datetime": scene["datetime"],
+            "cloud_cover": scene.get("cloud_cover"),
+            "skipped": False,
+            "bands": band_arrays,
+        }
+
+    # ALL periods in parallel × 12 bands per period = up to 72 concurrent
+    # rasterio reads per chunk. Combined with the chunk-level semaphore
+    # (4 chunks max), the worst-case fan-out is 4 × 72 = 288 connections —
+    # high but PC tolerates it because each individual read is small.
+    # Without this period-level parallelism, a 1-chunk small AOI was paying
+    # the latency of 6 sequential network round-trips even though the
+    # actual bytes-per-period are tiny.
+    period_results = await asyncio.gather(*[
+        _fetch_one_period(ps) for ps in period_scenes
+    ])
+
+    timestamps: list[tuple[int, int, int]] = []
+    scene_ids: list[str | None] = []
+    scene_datetimes: list[str | None] = []
+    cloud_covers: list[float | None] = []
+    period_skipped: list[bool] = []
+
+    for t, rec in enumerate(period_results):
+        timestamps.append(rec["ts"])
+        scene_ids.append(rec["scene_id"])
+        scene_datetimes.append(rec["scene_datetime"])
+        cloud_covers.append(rec["cloud_cover"])
+        period_skipped.append(rec["skipped"])
+        if not rec["skipped"]:
+            for band_idx, arr in enumerate(rec["bands"]):
+                stack[:, :, t, band_idx] = arr
+
+    if all(period_skipped):
+        raise SentinelFetchError(
+            f"chunk {chunk_bbox.model_dump()}: all {n_periods} periods skipped"
+        )
+
+    return SentinelTemporalStack(
+        stack=stack,
+        transform=dst_transform,
+        crs=scene_crs,
+        timestamps=timestamps,
+        scene_ids=scene_ids,
+        scene_datetimes=scene_datetimes,
+        cloud_covers=cloud_covers,
+        period_skipped=period_skipped,
+        bbox_wgs84=(chunk_bbox.west, chunk_bbox.south, chunk_bbox.east, chunk_bbox.north),
+    )
+
+
+async def resolve_aoi_grid(
+    bbox: BBox,
+    period_scenes: list[AoiPeriodScene],
+    target_gsd_m: float = 10.0,
+) -> tuple[Any, Any, int, int]:
+    """Pick a single CRS for every chunk + build the global pixel grid.
+
+    Reads the first non-empty period's anchor band to get the native UTM CRS,
+    then projects the AOI bbox into it and computes a clean global affine at
+    ``target_gsd_m``. The chunked orchestrator pins every chunk to this CRS
+    so per-chunk outputs paste cleanly into the global raster without
+    reprojection seams.
+
+    Returns ``(crs, global_transform, global_h, global_w)``.
+    """
+    want_bands = list(Modality.SENTINEL2_L2A.band_order)
+    first_ps = next(
+        (ps for ps in period_scenes
+         if ps.scene is not None
+         and all(b in ps.scene.get("assets", {}) for b in want_bands)),
+        None,
+    )
+    if first_ps is None:
+        raise SentinelFetchError(
+            f"resolve_aoi_grid: no period had a usable scene with all 12 S2 bands"
+        )
+    assert first_ps.scene is not None
+    token = await _get_sas_token(first_ps.scene["collection"])
+    first_href = _sign(first_ps.scene["assets"][want_bands[0]]["href"], token)
+    with rasterio.open(first_href) as src0:
+        pinned_crs = src0.crs
+
+    g_west, g_south, g_east, g_north = transform_bounds(
+        "EPSG:4326", pinned_crs, bbox.west, bbox.south, bbox.east, bbox.north
+    )
+    global_w = max(1, int(round(abs(g_east - g_west) / target_gsd_m)))
+    global_h = max(1, int(round(abs(g_north - g_south) / target_gsd_m)))
+    global_transform = from_bounds(g_west, g_south, g_east, g_north, global_w, global_h)
+    return pinned_crs, global_transform, global_h, global_w
 
 
 # ---------------------------------------------------------------------------

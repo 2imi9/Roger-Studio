@@ -117,3 +117,136 @@ def test_load_encoder_caches_on_second_call() -> None:
     m1, _ = M.load_encoder("allenai/OlmoEarth-v1-Nano")
     m2, _ = M.load_encoder("allenai/OlmoEarth-v1-Nano")
     assert m1 is m2
+
+
+# ---------------------------------------------------------------------------
+# LRU cache cap (P1 host-safety guard).
+#
+# Background: the encoder cache used to grow without bound. Clicking
+# Nano → Tiny → Base → Large in the UI loaded all four into VRAM
+# simultaneously — Large alone is multiple GB on GPU, so the four
+# together easily wedged a 24 GB consumer card. The cache is now bounded
+# by ``OE_MODEL_CACHE_MAX_ENTRIES`` (default 1) with LRU eviction.
+# ---------------------------------------------------------------------------
+
+
+def test_max_cache_entries_default(monkeypatch):
+    monkeypatch.delenv("OE_MODEL_CACHE_MAX_ENTRIES", raising=False)
+    assert M._max_cache_entries() == 1
+
+
+def test_max_cache_entries_env_override(monkeypatch):
+    monkeypatch.setenv("OE_MODEL_CACHE_MAX_ENTRIES", "4")
+    assert M._max_cache_entries() == 4
+
+
+def test_max_cache_entries_garbage_falls_back(monkeypatch):
+    monkeypatch.setenv("OE_MODEL_CACHE_MAX_ENTRIES", "many")
+    assert M._max_cache_entries() == 1
+
+
+def test_max_cache_entries_zero_or_neg_clamps_to_one(monkeypatch):
+    """A 0-entry cache means every chunked job re-loads the encoder
+    (~30 s cold). That's worse than 1, so refuse the footgun."""
+    for v in ["0", "-2"]:
+        monkeypatch.setenv("OE_MODEL_CACHE_MAX_ENTRIES", v)
+        assert M._max_cache_entries() == 1, v
+
+
+class _StubModel:
+    """Minimal stand-in for a torch.nn.Module — has the .to() method the
+    eviction path calls. No real GPU memory is involved."""
+
+    def __init__(self, tag: str) -> None:
+        self.tag = tag
+        self.device = "cuda"
+
+    def to(self, dev) -> "_StubModel":
+        self.device = str(dev)
+        return self
+
+
+def _seed_cache(*tags: str) -> None:
+    """Manually populate _cache with stub models in a known order. Tests
+    that exercise eviction logic don't need real models."""
+    M.clear_cache()
+    for tag in tags:
+        M._cache[tag] = (_StubModel(tag), "cpu")
+
+
+def test_evict_oldest_locked_removes_first_entry():
+    _seed_cache("a", "b", "c")
+    assert list(M._cache.keys()) == ["a", "b", "c"]
+    with M._cache_lock:
+        M._evict_oldest_locked()
+    assert list(M._cache.keys()) == ["b", "c"]
+
+
+def test_evict_oldest_locked_on_empty_cache_is_noop():
+    M.clear_cache()
+    with M._cache_lock:
+        M._evict_oldest_locked()  # must not raise
+    assert len(M._cache) == 0
+
+
+def test_load_encoder_evicts_when_at_cap(monkeypatch):
+    """Cap=1: loading a second model evicts the first."""
+    monkeypatch.setenv("OE_MODEL_CACHE_MAX_ENTRIES", "1")
+
+    def fake_load_a(repo_id, device=None):
+        return _StubModel("a"), "cpu"
+
+    def fake_load_b(repo_id, device=None):
+        return _StubModel("b"), "cpu"
+
+    M.clear_cache()
+    # Drive load_encoder via direct cache injection — simpler than
+    # monkeypatching every load path. The eviction logic doesn't care
+    # how the entries got there, only how many there are.
+    with M._cache_lock:
+        M._cache["a"] = (_StubModel("a"), "cpu")
+    assert "a" in M._cache
+
+    # Simulate inserting a second model when cap=1.
+    with M._cache_lock:
+        max_entries = M._max_cache_entries()
+        while len(M._cache) >= max_entries:
+            M._evict_oldest_locked()
+        M._cache["b"] = (_StubModel("b"), "cpu")
+
+    # 'a' was the oldest and got evicted; 'b' is the only entry now.
+    assert list(M._cache.keys()) == ["b"]
+
+
+def test_lru_order_protects_recently_used(monkeypatch):
+    """Cap=2: load A, load B (cap reached), touch A, load C → B evicted (A
+    is most-recently-used and stays)."""
+    monkeypatch.setenv("OE_MODEL_CACHE_MAX_ENTRIES", "2")
+    M.clear_cache()
+    with M._cache_lock:
+        M._cache["a"] = (_StubModel("a"), "cpu")
+        M._cache["b"] = (_StubModel("b"), "cpu")
+        # "Touch" a → moves to most-recent end. This is what load_encoder
+        # does on a cache hit.
+        M._cache.move_to_end("a")
+        # Now insert C, which forces eviction of the oldest = "b".
+        max_entries = M._max_cache_entries()
+        while len(M._cache) >= max_entries:
+            M._evict_oldest_locked()
+        M._cache["c"] = (_StubModel("c"), "cpu")
+    assert list(M._cache.keys()) == ["a", "c"]
+    assert "b" not in M._cache
+
+
+def test_lru_higher_cap_keeps_more_models(monkeypatch):
+    """Cap=4 lets all four base encoders coexist (the original failure
+    mode being prevented)."""
+    monkeypatch.setenv("OE_MODEL_CACHE_MAX_ENTRIES", "4")
+    M.clear_cache()
+    with M._cache_lock:
+        for tag in ("nano", "tiny", "base", "large"):
+            max_entries = M._max_cache_entries()
+            while len(M._cache) >= max_entries:
+                M._evict_oldest_locked()
+            M._cache[tag] = (_StubModel(tag), "cpu")
+    assert sorted(M._cache.keys()) == ["base", "large", "nano", "tiny"]

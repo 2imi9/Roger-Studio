@@ -103,6 +103,27 @@ def _ecosystem_class_names_and_colors() -> tuple[list[str], list[str]]:
 _ECOSYSTEM_NAMES, _ECOSYSTEM_COLORS = _ecosystem_class_names_and_colors()
 
 
+# ``input_spec`` keys (read by olmoearth_inference._run_real_inference and
+# sentinel2_fetch.fetch_s2_temporal_stack) describe what the FT head was
+# trained on. Sourced one-for-one from the ``model.yaml`` + ``dataset.json``
+# pairs at https://github.com/allenai/olmoearth_projects/tree/main/olmoearth_run_data
+# Each layer name like ``sentinel2.5`` is one PER_PERIOD_MOSAIC chunk:
+#   * ``n_periods``        = len(layers)        — how many T slots to stack
+#   * ``period_days``      = query_config.period_duration
+#   * ``total_days``       = data_source.duration
+#   * ``time_offset_days`` = data_source.time_offset (relative to label date;
+#       at inference we anchor on the user's date_range end)
+#   * ``s1_required``      = True if the head's training inputs include
+#       sentinel1 (LFMC); the temporal-stack fetcher refuses to take this
+#       path until the S1 fetcher exists, so we keep the head on the legacy
+#       single-scene fallback and surface a known-broken warning.
+#   * ``pre_post_split``   = True for ForestLossDriver — needs two non-
+#       contiguous windows (pre at -300d, post at +7d) and rslearn's
+#       SimpleTimeSeries(groups=[[0],[1]]) wrapper. Same fallback as above.
+#   * ``predict_window_px`` / ``predict_overlap`` = the head's recommended
+#       sliding-window inference parameters; not yet auto-applied (see
+#       olmoearth_inference.start_inference's ``sliding_window`` kwarg) but
+#       captured so we can flip the default per-head later.
 FT_TASK_METADATA: dict[str, dict[str, Any]] = {
     "allenai/OlmoEarth-v1-FT-Mangrove-Base": {
         "task_family": "mangrove extent",
@@ -118,6 +139,16 @@ FT_TASK_METADATA: dict[str, dict[str, Any]] = {
         "class_names": ["nodata", "mangrove", "water", "other"],
         "class_colors": ["#6b7280", "#94eb63", "#63d8eb", "#eba963"],
         "class_names_tentative": False,
+        "input_spec": {
+            "n_periods": 12,
+            "period_days": 30,
+            "total_days": 366,
+            "time_offset_days": -180,
+            "s1_required": False,
+            "pre_post_split": False,
+            "predict_window_px": 2,
+            "predict_overlap": None,
+        },
     },
     "allenai/OlmoEarth-v1-FT-LFMC-Base": {
         "task_family": "live fuel moisture",
@@ -138,6 +169,20 @@ FT_TASK_METADATA: dict[str, dict[str, Any]] = {
         "class_names_tentative": False,
         "units": "% live fuel moisture",
         "value_range": [30.0, 200.0],      # matches lfmc/olmoearth_run.yaml
+        "input_spec": {
+            # LFMC is the only multi-modal head — needs S1 (VV/VH in dB)
+            # alongside S2. Until the S1 fetch path lands the dispatcher
+            # leaves this on the legacy single-scene S2-only fallback and
+            # logs a known-broken warning.
+            "n_periods": 12,
+            "period_days": 14,
+            "total_days": 168,
+            "time_offset_days": -168,
+            "s1_required": True,
+            "pre_post_split": False,
+            "predict_window_px": 32,
+            "predict_overlap": 0.125,
+        },
     },
     "allenai/OlmoEarth-v1-FT-AWF-Base": {
         "task_family": "southern-Kenya LULC",
@@ -157,6 +202,19 @@ FT_TASK_METADATA: dict[str, dict[str, Any]] = {
             "#66cdaa", "#228b22", "#ff8c00", "#b22222", "#6b7280",
         ],
         "class_names_tentative": False,
+        "input_spec": {
+            # AWF dataset.json declares no ``duration`` / ``time_offset`` —
+            # rslearn defaults to a 12-period × 30 d window centered on the
+            # label, so we mirror that with a 360 d span and zero offset.
+            "n_periods": 12,
+            "period_days": 30,
+            "total_days": 360,
+            "time_offset_days": 0,
+            "s1_required": False,
+            "pre_post_split": False,
+            "predict_window_px": 16,
+            "predict_overlap": 0.25,
+        },
     },
     "allenai/OlmoEarth-v1-FT-ForestLossDriver-Base": {
         "task_family": "forest-loss driver",
@@ -180,6 +238,24 @@ FT_TASK_METADATA: dict[str, dict[str, Any]] = {
             "#ff8c00", "#ff0000", "#f5f5dc", "#00ffff", "#ffffff",
         ],
         "class_names_tentative": False,
+        "input_spec": {
+            # ForestLossDriver is structurally different — 4 ``pre`` scenes
+            # at -300 d + 4 ``post`` scenes at +7 d, both with the
+            # ``CONTAINS`` (atomic-scene, not mosaic) space_mode, fed
+            # through rslearn's SimpleTimeSeries(groups=[[0],[1]]) wrapper
+            # so the decoder receives concatenated pre/post features
+            # (in_channels=1536 = 2 × 768). We capture the spec for
+            # documentation but the dispatcher routes it back to the
+            # legacy single-scene path until the pre/post fetch lands.
+            "n_periods": 8,
+            "period_days": 0,            # CONTAINS, not mosaic
+            "total_days": 180,           # per group; 360 d total spread
+            "time_offset_days": -300,    # pre group; post is +7 d
+            "s1_required": False,
+            "pre_post_split": True,
+            "predict_window_px": 64,
+            "predict_overlap": None,
+        },
     },
     "allenai/OlmoEarth-v1-FT-EcosystemTypeMapping-Base": {
         "task_family": "IUCN ecosystem type (level 3)",
@@ -192,6 +268,20 @@ FT_TASK_METADATA: dict[str, dict[str, Any]] = {
         "class_names": _ECOSYSTEM_NAMES,
         "class_colors": _ECOSYSTEM_COLORS,
         "class_names_tentative": False,
+        "input_spec": {
+            # Trained ONLY on ``groups: ["north_africa"]`` — an AOI outside
+            # north Africa is OOD by definition. The classes themselves
+            # are global (IUCN level 3) so the labels still render, but
+            # users running this on, e.g. Bay Area should be warned.
+            "n_periods": 6,
+            "period_days": 30,
+            "total_days": 270,
+            "time_offset_days": -90,
+            "s1_required": False,
+            "pre_post_split": False,
+            "predict_window_px": 32,
+            "predict_overlap": None,
+        },
     },
 }
 

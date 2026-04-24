@@ -28,11 +28,13 @@ Design notes:
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import io
 import json
 import logging
 import math
+import os
 import time
 from typing import Any
 
@@ -42,10 +44,27 @@ from rasterio.crs import CRS
 
 from app.models.schemas import BBox
 from app.services import olmoearth_ft, olmoearth_model
+from app.services.system_health import (
+    AOISizeExceededError,
+    CircuitBreakerTrippedError,
+    ClientDisconnectedError,
+    check_aoi_size_or_raise,
+    check_memory_or_raise,
+    chunk_ram_ok,
+    circuit_breaker_fail_rate_threshold,
+    circuit_breaker_min_total_fails,
+    circuit_breaker_threshold,
+    should_trip_fractional,
+)
 from app.services.sentinel2_fetch import (
     SentinelFetchError,
+    fetch_aoi_period_scenes,
+    fetch_s2_chunk_stack,
     fetch_s2_composite,
     image_to_bhwtc,
+    plan_chunks,
+    resolve_aoi_grid,
+    stack_to_bhwtc,
     timestamp_from_iso,
 )
 
@@ -56,6 +75,101 @@ logger = logging.getLogger(__name__)
 # real work happens up-front (real path) or per tile (stub fallback).
 _jobs: dict[str, dict[str, Any]] = {}
 _jobs_lock = asyncio.Lock()
+
+
+# Global concurrency cap on chunked inference jobs (AOI inference + embedding
+# export). This is the host-safety knob: chunk_sem(4) inside each orchestrator
+# caps fan-out *within* a single request, but two simultaneous PCA requests
+# would still pin 8 chunks × ~1.5 GB peak ≈ 12 GB at once. Five overlapping
+# requests took a real laptop to 35 GB resident + 100% CPU for 37 hours and
+# wedged the desktop — exactly the failure mode this guard prevents. Default
+# is 1 (laptop-safe, all chunked work serializes); operators on Azure VMs
+# with dedicated RAM can set ``OE_MAX_CONCURRENT_JOBS=2`` (or higher) to
+# pipeline jobs.
+_GLOBAL_JOB_SEM: asyncio.Semaphore | None = None
+
+
+def _max_concurrent_jobs() -> int:
+    env = os.environ.get("OE_MAX_CONCURRENT_JOBS")
+    if env is None:
+        return 1
+    try:
+        value = int(env)
+    except ValueError:
+        logger.warning(
+            "OE_MAX_CONCURRENT_JOBS=%r not parseable as int — falling back to 1",
+            env,
+        )
+        return 1
+    return max(1, value)
+
+
+def _global_job_sem() -> asyncio.Semaphore:
+    """Lazy-init the module-level semaphore so it binds to the running event
+    loop (asyncio.Semaphore created at module import time before a loop
+    exists is fine in 3.10+, but tests that swap loops between cases need a
+    fresh instance — see ``_reset_global_job_sem_for_tests``).
+    """
+    global _GLOBAL_JOB_SEM
+    if _GLOBAL_JOB_SEM is None:
+        _GLOBAL_JOB_SEM = asyncio.Semaphore(_max_concurrent_jobs())
+    return _GLOBAL_JOB_SEM
+
+
+def _reset_global_job_sem_for_tests() -> None:
+    """Drop the cached global semaphore. Tests call this between cases when
+    they monkeypatch ``OE_MAX_CONCURRENT_JOBS`` so the next call picks up
+    the new value."""
+    global _GLOBAL_JOB_SEM
+    _GLOBAL_JOB_SEM = None
+
+
+def _with_global_job_lock(fn):
+    """Wrap a chunked-inference coroutine so only N can run at once across
+    the whole process. N is set by ``OE_MAX_CONCURRENT_JOBS`` (default 1)."""
+
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        async with _global_job_sem():
+            return await fn(*args, **kwargs)
+
+    return wrapper
+
+
+# Poll cadence for the disconnect watcher. 5 s is a balance: tight enough
+# that an abandoned 25-min PCA dies within a fraction of a chunk's wall
+# time, loose enough that the awaitable is essentially free in steady-state.
+_DISCONNECT_POLL_INTERVAL_S = 5.0
+
+
+async def _watch_for_disconnect(
+    disconnect_check,
+    target_task: asyncio.Task,
+) -> None:
+    """Cancel ``target_task`` as soon as the HTTP client goes away.
+
+    ``disconnect_check`` is the FastAPI ``request.is_disconnected`` coroutine
+    function — but we accept any ``Callable[[], Awaitable[bool]]`` so the
+    orchestrator stays HTTP-agnostic and unit-testable. Loops until either
+    the target finishes naturally (returns) or disconnect_check returns True
+    (cancels target, then returns). Auto-cancelled by the orchestrator's
+    ``finally`` once gather wakes.
+    """
+    while not target_task.done():
+        try:
+            disconnected = await disconnect_check()
+        except Exception as e:
+            # A broken disconnect_check shouldn't be able to wedge the job.
+            # Log once and stop polling — gather still drives to completion.
+            logger.warning("disconnect_check raised %s — disabling poll", e)
+            return
+        if disconnected:
+            logger.warning(
+                "client disconnected — cancelling in-flight chunked work"
+            )
+            target_task.cancel()
+            return
+        await asyncio.sleep(_DISCONNECT_POLL_INTERVAL_S)
 
 # Patch size used in both the forward pass and the coarseness of the output
 # prediction raster. 4 matches the Inference-Quickstart default; smaller would
@@ -174,6 +288,28 @@ _COLORMAP_LEGEND: dict[str, dict[str, Any]] = {
         "low_label": "low magnitude",
         "high_label": "high magnitude",
     },
+    # Similarity heatmap for the ``embedding-tools/similarity`` endpoint.
+    # Scalar raster carries cosine similarity rescaled to [0, 1]:
+    #   0.0 = anti-correlated, 0.5 = unrelated, 1.0 = identical to query.
+    # Gradient picks up rapidly past 0.75 so users can visually spot the
+    # "genuinely similar" cluster; purple dominates the mid-band
+    # (unrelated) so it reads as "nothing to see here" at a glance.
+    "similarity": {
+        "label": "Cosine similarity to query (0=opposite, 0.5=unrelated, 1=identical)",
+        "stops": [
+            ("#0f172a", 0.0),    # near-black for dissimilar / nodata
+            ("#312e81", 0.5),    # indigo for unrelated
+            ("#f59e0b", 0.75),   # amber where similarity starts to matter
+            ("#fef3c7", 1.0),    # light yellow for near-identical
+        ],
+        "note": (
+            "Each pixel's dot product with the query embedding, rescaled "
+            "to [0, 1]. Bright = more like your query. Works globally — "
+            "no labels required."
+        ),
+        "low_label": "dissimilar",
+        "high_label": "similar",
+    },
 }
 
 
@@ -185,6 +321,7 @@ async def start_inference(
     sliding_window: bool = False,
     window_size: int = 32,
     _auto_retry_depth: int = 0,
+    disconnect_check=None,
 ) -> dict[str, Any]:
     """Register a job, run real OlmoEarth forward, cache the prediction raster.
 
@@ -327,6 +464,1383 @@ async def start_inference(
         return _build_response(_jobs[job_id])
 
 
+@_with_global_job_lock
+async def _run_chunked_aoi_inference(
+    bbox: BBox,
+    model: olmoearth_ft.FTModel,
+    device: Any,
+    input_spec: dict[str, Any],
+    effective_patch: int,
+    date_range: str,
+    chunk_size_m: int = 5000,
+    target_gsd_m: float = 10.0,
+    disconnect_check=None,
+) -> dict[str, Any]:
+    """Native-resolution chunked inference for FT heads with ``input_spec``.
+
+    The OlmoEarth viewer's quality advantage comes from running at full 10 m/
+    pixel with tiled forward passes that match training distribution. We do
+    the same here:
+
+      1. Tile the AOI into ``chunk_size_m`` × ``chunk_size_m`` sub-bboxes
+      2. Fire ONE STAC search per period over the WHOLE AOI (not per chunk;
+         a single S2 scene is ~110 km wide and covers all chunks anyway)
+      3. Pin every chunk to the AOI-wide UTM CRS so per-chunk outputs paste
+         cleanly into a global raster without reprojection seams
+      4. Per chunk: parallel-read all 12 bands × n_periods, run FT inference,
+         upsample to native pixel resolution, paste into global raster
+      5. Return the same response shape as the legacy FT branch so the
+         caller doesn't need to know which path produced the result
+
+    Latency estimate for the user's typical 20 km AOI at chunk_size_m=5000:
+      * ~6 STAC searches (parallel) → ~2 s
+      * 12 chunks × 12-band parallel reads × 6 periods → ~30–60 s total
+      * 12 forward passes on GPU → ~5–10 s
+      * Total: ~50–80 s, comfortably under the HTTP timeout
+    """
+    # Safety precheck FIRST — refuse to launch if free RAM is already
+    # below the threshold. This turns a host-level force-shutdown (the
+    # observed symptom when RAM spilled into swap) into a clean raised
+    # exception that the router converts to HTTP 503. Cheap: one syscall.
+    check_memory_or_raise()
+
+    n_periods = int(input_spec["n_periods"])
+    period_days = int(input_spec.get("period_days") or 30)
+    time_offset_days = int(input_spec.get("time_offset_days") or 0)
+
+    chunks = plan_chunks(bbox, chunk_size_m=chunk_size_m)
+    # AOI size guardrail — refuse oversized AOIs BEFORE firing any STAC
+    # or rasterio IO. Approximate AOI area in km² via the same
+    # lat-corrected cosine trig ``plan_chunks`` uses internally so the
+    # error message shows a number that matches the chunks count.
+    _mid_lat = (bbox.north + bbox.south) / 2.0
+    _m_per_deg_lon = 111_000.0 * math.cos(math.radians(_mid_lat))
+    _aoi_area_km2 = (
+        abs(bbox.east - bbox.west) * _m_per_deg_lon
+        * abs(bbox.north - bbox.south) * 111_000.0
+    ) / 1e6
+    check_aoi_size_or_raise(
+        chunks=len(chunks),
+        chunk_size_m=chunk_size_m,
+        aoi_area_km2=_aoi_area_km2,
+    )
+    logger.info(
+        "chunked inference for %s: %d chunks (%d m each), n_periods=%d",
+        model.repo_id, len(chunks), chunk_size_m, n_periods,
+    )
+
+    period_scenes = await fetch_aoi_period_scenes(
+        bbox=bbox,
+        anchor_date=date_range,
+        n_periods=n_periods,
+        period_days=period_days,
+        time_offset_days=time_offset_days,
+        max_cloud_cover=40.0,
+    )
+    if all(ps.scene is None for ps in period_scenes):
+        raise SentinelFetchError(
+            f"chunked inference: AOI-wide search returned 0 usable scenes "
+            f"across {n_periods} periods"
+        )
+
+    pinned_crs, global_transform, global_h, global_w = await resolve_aoi_grid(
+        bbox, period_scenes, target_gsd_m=target_gsd_m,
+    )
+
+    # Native-pixel-res output rasters. int32 for class indices matches
+    # downstream expectations (raster_class_histogram + GeoTIFF export).
+    global_class_raster = np.zeros((global_h, global_w), dtype=np.int32)
+    global_scalar_raster = np.zeros((global_h, global_w), dtype=np.float32)
+
+    # Chunk-level parallelism: cap at 4 concurrent fetches so 4 × 12 = 48
+    # simultaneous PC connections, well under typical per-IP limits. GPU
+    # forwards are serialized inside PyTorch's CUDA stream regardless of
+    # how many we kick off, so concurrency here is a fetch-bound win, not
+    # a compute-bound one. Net effect for a 12-chunk job: fetches overlap
+    # 4-wide so total fetch wall time ≈ ceil(12/4) × per-chunk-fetch ≈
+    # 3 × 15 s instead of 12 × 15 s.
+    chunk_sem = asyncio.Semaphore(4)
+    # Hard timeout per chunk, measured FROM THE MOMENT the chunk actually
+    # acquires a sem slot — NOT from when asyncio.gather() kicked it off.
+    # The previous version wrapped ``asyncio.wait_for(_process_chunk)``
+    # around the coroutine INCLUDING its ``async with chunk_sem`` wait,
+    # so a 25-chunk job produced the visible "all 25 timed out at t=180s"
+    # pattern even when chunks 1–4 were legitimately working: chunks 5–25
+    # sat in the sem queue for 180 s and then got cancelled before ever
+    # trying to do network work. The fix is ``wait_for`` INSIDE the
+    # semaphore in ``_process_chunk_bounded`` below. Bumping to 300 s too
+    # — cached + small AOI is ~5 s, cold + large AOI can hit 120+.
+    _CHUNK_TIMEOUT_S = 300.0
+    # Sentinel value carried in result tuples for failed chunks. Stitching
+    # below filters them out so a single-chunk failure doesn't poison the
+    # whole AOI raster.
+    _CHUNK_FAIL = object()
+
+    # Circuit breaker: abort the job once the network is clearly not
+    # recoverable. Two independent trip rules, each tunable via env:
+    #   (a) consecutive — N chunks in a row fail (catches bursty drops)
+    #   (b) fractional  — M+ total failures AND failure_rate > P
+    #                     (catches the slow-burn 50 % flake rate where
+    #                     every other chunk succeeds so the consecutive
+    #                     counter keeps resetting but half the work is
+    #                     wasted)
+    _BREAKER_THRESHOLD = circuit_breaker_threshold()
+    _BREAKER_MIN_TOTAL = circuit_breaker_min_total_fails()
+    _BREAKER_RATE = circuit_breaker_fail_rate_threshold()
+    breaker_state = {
+        "consecutive_fails": 0,
+        "tripped": False,
+        "successes": 0,
+        "failures": 0,
+    }
+
+    def _record_chunk_outcome(success: bool) -> None:
+        """Update breaker state after a chunk completes. Call this from
+        BOTH the inner _process_chunk (success/fail returns) AND the
+        outer _process_chunk_bounded (timeout). One call per chunk."""
+        if success:
+            breaker_state["successes"] += 1
+            breaker_state["consecutive_fails"] = 0
+            return
+        breaker_state["failures"] += 1
+        breaker_state["consecutive_fails"] += 1
+        if breaker_state["tripped"]:
+            return
+        # Rule (a): consecutive trip.
+        if (
+            _BREAKER_THRESHOLD > 0
+            and breaker_state["consecutive_fails"] >= _BREAKER_THRESHOLD
+        ):
+            breaker_state["tripped"] = True
+            logger.warning(
+                "circuit breaker TRIPPED (consecutive) — %d chunks failed "
+                "in a row, aborting remaining work",
+                _BREAKER_THRESHOLD,
+            )
+            return
+        # Rule (b): fractional-rate trip.
+        if should_trip_fractional(
+            failures=breaker_state["failures"],
+            successes=breaker_state["successes"],
+            min_total_fails=_BREAKER_MIN_TOTAL,
+            rate_threshold=_BREAKER_RATE,
+        ):
+            total = breaker_state["successes"] + breaker_state["failures"]
+            breaker_state["tripped"] = True
+            logger.warning(
+                "circuit breaker TRIPPED (fractional) — %d failures out "
+                "of %d chunks (%.0f%% fail rate > %.0f%% threshold)",
+                breaker_state["failures"], total,
+                100 * breaker_state["failures"] / total,
+                100 * _BREAKER_RATE,
+            )
+
+    chunk_t0 = time.time()
+    chunks_done_counter = {"n": 0}  # mutable shared counter for log lines
+
+    async def _process_chunk(ch_idx: int, chunk_bbox: BBox) -> Any:
+        """Do one chunk's fetch + inference + paste. No semaphore here —
+        semaphore + timeout are layered in ``_process_chunk_bounded``."""
+        t_chunk_start = time.time()
+        try:
+            stack_result = await fetch_s2_chunk_stack(
+                chunk_bbox=chunk_bbox,
+                period_scenes=period_scenes,
+                target_gsd_m=target_gsd_m,
+                pinned_crs=pinned_crs,
+            )
+        except SentinelFetchError as e:
+            chunks_done_counter["n"] += 1
+            elapsed = time.time() - chunk_t0
+            logger.warning(
+                "chunk %d/%d skipped (fetch, %.1fs): %s [done=%d/%d, elapsed=%.0fs]",
+                ch_idx + 1, len(chunks), time.time() - t_chunk_start, e,
+                chunks_done_counter["n"], len(chunks), elapsed,
+            )
+            return _CHUNK_FAIL
+        t_after_fetch = time.time()
+
+        ch, cw, _, _ = stack_result.stack.shape
+        ch4 = (ch // effective_patch) * effective_patch
+        cw4 = (cw // effective_patch) * effective_patch
+        if ch4 == 0 or cw4 == 0:
+            logger.warning(
+                "chunk %d/%d too small for patch=%d (shape=%s)",
+                ch_idx + 1, len(chunks), effective_patch, stack_result.stack.shape,
+            )
+            return _CHUNK_FAIL
+
+        chunk_image = stack_to_bhwtc(stack_result.stack[:ch4, :cw4, :, :])
+        try:
+            # Forward releases GIL during CUDA dispatch; multiple chunks
+            # may queue here concurrently but PyTorch serializes on the
+            # GPU stream — concurrency above is fetch-bound, not compute.
+            chunk_result = await asyncio.to_thread(
+                olmoearth_model.run_ft_inference,
+                model,
+                chunk_image,
+                stack_result.timestamps,
+                effective_patch,
+                device,
+            )
+        except Exception as e:
+            logger.warning("chunk %d/%d inference failed: %s", ch_idx + 1, len(chunks), e)
+            return _CHUNK_FAIL
+
+        chunk_scalar_hi = np.repeat(
+            np.repeat(chunk_result.scalar, effective_patch, axis=0),
+            effective_patch, axis=1,
+        )
+        chunk_class_hi: np.ndarray | None = None
+        if chunk_result.class_raster is not None:
+            chunk_class_hi = np.repeat(
+                np.repeat(chunk_result.class_raster, effective_patch, axis=0),
+                effective_patch, axis=1,
+            )
+
+        chunk_west = stack_result.transform.c
+        chunk_north = stack_result.transform.f
+        col_offset = int(round((chunk_west - global_transform.c) / target_gsd_m))
+        row_offset = int(round((global_transform.f - chunk_north) / target_gsd_m))
+
+        if row_offset < 0 or col_offset < 0:
+            logger.warning(
+                "chunk %d/%d negative offset (row=%d col=%d) — skipping",
+                ch_idx + 1, len(chunks), row_offset, col_offset,
+            )
+            return _CHUNK_FAIL
+        h_to_paste = min(ch4, global_h - row_offset)
+        w_to_paste = min(cw4, global_w - col_offset)
+        if h_to_paste <= 0 or w_to_paste <= 0:
+            logger.warning(
+                "chunk %d/%d zero-sized paste window — skipping",
+                ch_idx + 1, len(chunks),
+            )
+            return _CHUNK_FAIL
+
+        chunks_done_counter["n"] += 1
+        elapsed = time.time() - chunk_t0
+        t_total = time.time() - t_chunk_start
+        t_fetch = t_after_fetch - t_chunk_start
+        t_fwd = t_total - t_fetch
+        done = chunks_done_counter["n"]
+        # ETA = (avg time per completed chunk) × remaining chunks.
+        avg_per = max(0.5, elapsed / max(1, done))
+        remaining = len(chunks) - done
+        eta_s = (remaining * avg_per) / 4  # 4 = chunk_sem capacity
+        logger.info(
+            "chunk %d/%d done in %.1fs (fetch=%.1fs, fwd=%.1fs) "
+            "[done=%d/%d, elapsed=%.0fs, eta=%.0fs]",
+            ch_idx + 1, len(chunks), t_total, t_fetch, t_fwd,
+            done, len(chunks), elapsed, eta_s,
+        )
+        return {
+            "scalar_hi": chunk_scalar_hi,
+            "class_hi": chunk_class_hi,
+            "row_offset": row_offset,
+            "col_offset": col_offset,
+            "h_to_paste": h_to_paste,
+            "w_to_paste": w_to_paste,
+            "result": chunk_result,
+        }
+
+    async def _process_chunk_bounded(ch_idx: int, chunk_bbox: BBox) -> Any:
+        """Acquire a chunk_sem slot, then apply the timeout ONLY to actual
+        work. Previously the timeout wrapped semaphore acquisition too,
+        which made chunks 5–25 of a big gather fire their 180s timer
+        while waiting for a slot and never actually running — "all chunks
+        timed out at elapsed=180s" in the observed bug.
+
+        Also short-circuits when the circuit breaker has tripped: once
+        N consecutive chunks have failed, queued chunks return
+        _CHUNK_FAIL immediately instead of waiting their turn to try
+        the same dead network. This is what turns a 35-min grind into a
+        15-min bail.
+        """
+        if breaker_state["tripped"]:
+            # Don't even bother acquiring the sem — the breaker already
+            # decided this job is doomed. Don't call _record_chunk_outcome
+            # either; we're not consuming a "real" retry slot.
+            return _CHUNK_FAIL
+        async with chunk_sem:
+            # Re-check inside the sem in case the breaker tripped while
+            # we were waiting for a slot.
+            if breaker_state["tripped"]:
+                return _CHUNK_FAIL
+            # Per-chunk RAM gate. The submit-time precheck is a one-shot
+            # at job entry; this catches the case where free RAM has fallen
+            # below the OS's swap-thrash floor while earlier chunks were
+            # running (e.g. user opened more browser tabs, another ML
+            # process grew). Failing fast here is much cheaper than
+            # letting the next fetch + forward push the host into paging.
+            ram_ok, ram_status = await asyncio.to_thread(chunk_ram_ok)
+            if not ram_ok:
+                chunks_done_counter["n"] += 1
+                logger.warning(
+                    "chunk %d/%d skipped — per-chunk RAM gate failed (%s)",
+                    ch_idx + 1, len(chunks), ram_status.describe(),
+                )
+                _record_chunk_outcome(success=False)
+                return _CHUNK_FAIL
+            try:
+                result = await asyncio.wait_for(
+                    _process_chunk(ch_idx, chunk_bbox), timeout=_CHUNK_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                chunks_done_counter["n"] += 1
+                elapsed = time.time() - chunk_t0
+                logger.warning(
+                    "chunk %d/%d TIMED OUT after %.0fs (network stuck?) "
+                    "[done=%d/%d, elapsed=%.0fs]",
+                    ch_idx + 1, len(chunks), _CHUNK_TIMEOUT_S,
+                    chunks_done_counter["n"], len(chunks), elapsed,
+                )
+                _record_chunk_outcome(success=False)
+                return _CHUNK_FAIL
+            else:
+                _record_chunk_outcome(success=result is not _CHUNK_FAIL)
+                return result
+
+    async def _heartbeat() -> None:
+        """Emit a log line every 30 s so stuck-vs-slow is obvious from
+        stdout. Auto-cancelled once gather() returns."""
+        while True:
+            await asyncio.sleep(30.0)
+            done = chunks_done_counter["n"]
+            elapsed = time.time() - chunk_t0
+            remaining = len(chunks) - done
+            # Estimate remaining wall time based on observed per-chunk rate.
+            if done > 0:
+                avg_per = elapsed / done
+                eta_s = (remaining * avg_per) / 4  # chunk_sem capacity
+                logger.info(
+                    "heartbeat: %d/%d chunks done, %.0fs elapsed, ~%.0fs remaining",
+                    done, len(chunks), elapsed, eta_s,
+                )
+            else:
+                logger.info(
+                    "heartbeat: 0/%d chunks done, %.0fs elapsed "
+                    "(still on first batch — slow network?)",
+                    len(chunks), elapsed,
+                )
+
+    # Fan out all chunks; semaphore caps actual concurrency. asyncio.gather
+    # collects results in input order so stitching below is deterministic.
+    # Wrapping gather in a task lets the disconnect watcher cancel it when
+    # the HTTP client closes the connection — see _watch_for_disconnect.
+    heartbeat_task = asyncio.create_task(_heartbeat())
+
+    async def _gather_chunks():
+        return await asyncio.gather(
+            *[_process_chunk_bounded(i, c) for i, c in enumerate(chunks)]
+        )
+
+    gather_task = asyncio.create_task(_gather_chunks())
+    disconnect_task = (
+        asyncio.create_task(_watch_for_disconnect(disconnect_check, gather_task))
+        if disconnect_check is not None else None
+    )
+    try:
+        try:
+            chunk_records = await gather_task
+        except asyncio.CancelledError:
+            # If the watcher cancelled us, surface as ClientDisconnectedError
+            # so the route can return 499 instead of an opaque 500.
+            if (
+                disconnect_task is not None
+                and disconnect_task.done()
+                and not disconnect_task.cancelled()
+            ):
+                raise ClientDisconnectedError(
+                    "client closed connection during chunked inference; "
+                    f"in-flight chunks cancelled "
+                    f"(processed={breaker_state['successes']}, "
+                    f"failed={breaker_state['failures']}, total={len(chunks)})"
+                )
+            raise
+    finally:
+        heartbeat_task.cancel()
+        if disconnect_task is not None:
+            disconnect_task.cancel()
+        for _t in (heartbeat_task, disconnect_task):
+            if _t is None:
+                continue
+            try:
+                await _t
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    # Circuit breaker fired — raise BEFORE stitching so the caller (router)
+    # can surface a clear "retry later" 503 with stats. Scene-cache writes
+    # from the chunks that DID succeed are already on disk, so a retry
+    # resumes much faster than starting from scratch.
+    if breaker_state["tripped"]:
+        raise CircuitBreakerTrippedError(
+            processed=breaker_state["successes"],
+            failed=breaker_state["failures"],
+            total=len(chunks),
+            threshold=_BREAKER_THRESHOLD,
+        )
+
+    # Stitch: serialize the numpy paste step. Chunks are non-overlapping by
+    # construction (plan_chunks) so concurrent paste would be safe in
+    # principle, but doing it sequentially after gather keeps the diff
+    # local and readable.
+    last_chunk_result = None
+    chunks_processed = 0
+    chunks_failed = 0
+    for record in chunk_records:
+        if record is _CHUNK_FAIL:
+            chunks_failed += 1
+            continue
+        global_scalar_raster[
+            record["row_offset"]:record["row_offset"] + record["h_to_paste"],
+            record["col_offset"]:record["col_offset"] + record["w_to_paste"],
+        ] = record["scalar_hi"][:record["h_to_paste"], :record["w_to_paste"]]
+        if record["class_hi"] is not None:
+            global_class_raster[
+                record["row_offset"]:record["row_offset"] + record["h_to_paste"],
+                record["col_offset"]:record["col_offset"] + record["w_to_paste"],
+            ] = record["class_hi"][:record["h_to_paste"], :record["w_to_paste"]]
+        last_chunk_result = record["result"]
+        chunks_processed += 1
+
+    if chunks_processed == 0:
+        raise SentinelFetchError(
+            f"all {len(chunks)} chunks failed during chunked inference"
+        )
+    assert last_chunk_result is not None  # implied by chunks_processed > 0
+
+    final_class_raster = global_class_raster if (
+        last_chunk_result.class_raster is not None
+    ) else None
+    colormap = last_chunk_result.colormap
+    legend = _build_ft_legend(last_chunk_result)
+
+    present_class_ids: list[int] | None = None
+    if final_class_raster is not None:
+        uniq = np.unique(final_class_raster).astype(int)
+        uniq = uniq[(uniq >= 0) & (uniq < last_chunk_result.num_classes)]
+        present_class_ids = uniq.tolist()[:256]
+
+    # Surface the most recent non-skipped period's scene metadata in the
+    # response — matches the legacy temporal-stack contract.
+    recent_period_idx = next(
+        (i for i in range(n_periods - 1, -1, -1)
+         if period_scenes[i].scene is not None),
+        n_periods - 1,
+    )
+    recent_scene = period_scenes[recent_period_idx].scene or {}
+
+    return {
+        "raster_transform": global_transform,
+        "raster_crs": pinned_crs,
+        "raster_height": int(global_h),
+        "raster_width": int(global_w),
+        "scene_id": recent_scene.get("id"),
+        "scene_datetime": recent_scene.get("datetime"),
+        "scene_cloud_cover": recent_scene.get("eo:cloud_cover")
+            or recent_scene.get("cloud_cover"),
+        "patch_size": effective_patch,
+        "sliding_window": False,
+        "window_size": None,
+        "temporal_stack": {
+            "n_periods": n_periods,
+            "periods_used": int(sum(1 for ps in period_scenes if ps.scene is not None)),
+            "periods_skipped": int(sum(1 for ps in period_scenes if ps.scene is None)),
+            "scene_ids": [
+                ps.scene.get("id") if ps.scene else None for ps in period_scenes
+            ],
+            "scene_datetimes": [
+                ps.scene.get("datetime") if ps.scene else None for ps in period_scenes
+            ],
+            "chunked": True,
+            "chunk_size_m": chunk_size_m,
+            "chunks_total": len(chunks),
+            "chunks_processed": chunks_processed,
+            "chunks_failed": chunks_failed,
+            "target_gsd_m": target_gsd_m,
+        },
+        "scalar_raster": global_scalar_raster,
+        "task_type": last_chunk_result.task_type,
+        "num_classes": last_chunk_result.num_classes,
+        "class_names": last_chunk_result.class_names,
+        "class_names_tentative": last_chunk_result.class_names_tentative,
+        "class_raster": final_class_raster,
+        "class_probs": (
+            last_chunk_result.class_probs.tolist()
+            if last_chunk_result.class_probs is not None else None
+        ),
+        "present_class_ids": present_class_ids,
+        "prediction_value": last_chunk_result.prediction_value,
+        "units": last_chunk_result.units,
+        "decoder_key": last_chunk_result.decoder_key,
+        "colormap_override": colormap,
+        "legend_override": legend,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Embedding export — matches the Ai2 OlmoEarth Studio "custom embedding
+# exports" feature. Runs the BASE encoder (Nano/Tiny/Base/Large) over the
+# chunked AOI pipeline, stitches per-patch embeddings into a single global
+# raster, quantizes float32 → int8 using olmoearth_pretrain's AlphaEarth-
+# compatible scheme, and writes a COG with one band per embedding
+# dimension.
+#
+# Output is a drop-in replacement for Studio's embeddings COG: same int8
+# layout, same nodata convention (-128), same quantize/dequantize
+# roundtrip via olmoearth_pretrain.evals.embedding_transforms.
+# ---------------------------------------------------------------------------
+
+
+@_with_global_job_lock
+async def _run_chunked_embedding_export(
+    bbox: BBox,
+    model: Any,                  # torch.nn.Module — Any to avoid module-level import
+    device: Any,
+    model_repo_id: str,
+    date_range: str,
+    n_periods: int = 12,
+    period_days: int = 30,
+    time_offset_days: int = 0,
+    chunk_size_m: int = 5000,
+    target_gsd_m: float = 10.0,
+    patch_size: int = 4,
+    modality: str = "sentinel2_l2a",
+    disconnect_check=None,
+    return_float: bool = False,
+) -> dict[str, Any]:
+    """Chunked embedding export. Mirrors _run_chunked_aoi_inference but:
+
+      * Runs the BASE encoder (no FT head) per chunk and keeps the full
+        per-patch embedding tensor instead of the PCA-reduced scalar.
+      * Stitches at **patch resolution** (global_h/patch × global_w/patch)
+        since the encoder collapses every ``patch_size`` input pixels to
+        one token.
+      * Default path: quantizes the final float32 tensor to int8 via the
+        AlphaEarth-compatible scheme from olmoearth_pretrain. Returns
+        ``{embedding_int8, transform, crs, ...}`` for COG serialization.
+      * ``return_float=True``: skip the quantize step and return
+        ``{embedding_float32, nodata_mask, transform, crs, ...}``. Used
+        by in-process embedding tools (PCA false-color, similarity
+        search, few-shot classify) that need full precision and don't
+        need to ship a COG to the client.
+    """
+    # Safety precheck FIRST — same rationale as _run_chunked_aoi_inference.
+    # Embedding export peaks at a similar memory footprint (chunked fetch
+    # + stitched global raster + int8 quantization buffer), so it gets
+    # the same guard.
+    check_memory_or_raise()
+
+    # Reuse the same AOI planning + scene search + grid-resolution
+    # machinery as the FT pipeline so cache hits, parallelism, timeouts,
+    # heartbeats all apply uniformly.
+    chunks = plan_chunks(bbox, chunk_size_m=chunk_size_m)
+    # AOI size guardrail — same rationale as _run_chunked_aoi_inference.
+    _mid_lat = (bbox.north + bbox.south) / 2.0
+    _m_per_deg_lon = 111_000.0 * math.cos(math.radians(_mid_lat))
+    _aoi_area_km2 = (
+        abs(bbox.east - bbox.west) * _m_per_deg_lon
+        * abs(bbox.north - bbox.south) * 111_000.0
+    ) / 1e6
+    check_aoi_size_or_raise(
+        chunks=len(chunks),
+        chunk_size_m=chunk_size_m,
+        aoi_area_km2=_aoi_area_km2,
+    )
+    logger.info(
+        "chunked embedding export for %s: %d chunks (%d m each), n_periods=%d, patch_size=%d",
+        model_repo_id, len(chunks), chunk_size_m, n_periods, patch_size,
+    )
+
+    period_scenes = await fetch_aoi_period_scenes(
+        bbox=bbox,
+        anchor_date=date_range,
+        n_periods=n_periods,
+        period_days=period_days,
+        time_offset_days=time_offset_days,
+        max_cloud_cover=40.0,
+    )
+    if all(ps.scene is None for ps in period_scenes):
+        raise SentinelFetchError(
+            f"embedding export: AOI-wide search returned 0 usable scenes "
+            f"across {n_periods} periods"
+        )
+
+    pinned_crs, global_transform, global_h, global_w = await resolve_aoi_grid(
+        bbox, period_scenes, target_gsd_m=target_gsd_m,
+    )
+
+    # Snap global dimensions to patch_size so every chunk's embedding
+    # tile fits into the patch-resolution global grid without off-by-one.
+    global_h = (global_h // patch_size) * patch_size
+    global_w = (global_w // patch_size) * patch_size
+    if global_h == 0 or global_w == 0:
+        raise ValueError(
+            f"embedding export: AOI too small for patch_size={patch_size} "
+            f"(global_h={global_h}, global_w={global_w})"
+        )
+    global_h_patch = global_h // patch_size
+    global_w_patch = global_w // patch_size
+
+    # Global embedding buffer at patch resolution. D is unknown until the
+    # first successful chunk returns — allocate lazily on first hit.
+    global_embedding: np.ndarray | None = None
+    embedding_dim: int | None = None
+
+    chunk_t0 = time.time()
+    chunks_done_counter = {"n": 0}
+    _CHUNK_TIMEOUT_S = 180.0
+    _CHUNK_FAIL = object()
+    chunk_sem = asyncio.Semaphore(4)
+
+    # Circuit breaker — mirrors _run_chunked_aoi_inference. Two trip rules:
+    # (a) consecutive fails (bursty drops) and (b) fractional fail rate
+    # (slow-burn 50 % flake networks).
+    _BREAKER_THRESHOLD = circuit_breaker_threshold()
+    _BREAKER_MIN_TOTAL = circuit_breaker_min_total_fails()
+    _BREAKER_RATE = circuit_breaker_fail_rate_threshold()
+    breaker_state = {
+        "consecutive_fails": 0,
+        "tripped": False,
+        "successes": 0,
+        "failures": 0,
+    }
+
+    def _record_chunk_outcome(success: bool) -> None:
+        if success:
+            breaker_state["successes"] += 1
+            breaker_state["consecutive_fails"] = 0
+            return
+        breaker_state["failures"] += 1
+        breaker_state["consecutive_fails"] += 1
+        if breaker_state["tripped"]:
+            return
+        if (
+            _BREAKER_THRESHOLD > 0
+            and breaker_state["consecutive_fails"] >= _BREAKER_THRESHOLD
+        ):
+            breaker_state["tripped"] = True
+            logger.warning(
+                "circuit breaker TRIPPED (embedding export, consecutive) — "
+                "%d chunks failed in a row, aborting remaining work",
+                _BREAKER_THRESHOLD,
+            )
+            return
+        if should_trip_fractional(
+            failures=breaker_state["failures"],
+            successes=breaker_state["successes"],
+            min_total_fails=_BREAKER_MIN_TOTAL,
+            rate_threshold=_BREAKER_RATE,
+        ):
+            total = breaker_state["successes"] + breaker_state["failures"]
+            breaker_state["tripped"] = True
+            logger.warning(
+                "circuit breaker TRIPPED (embedding export, fractional) — "
+                "%d failures out of %d chunks (%.0f%% > %.0f%% threshold)",
+                breaker_state["failures"], total,
+                100 * breaker_state["failures"] / total,
+                100 * _BREAKER_RATE,
+            )
+
+    async def _process_chunk(ch_idx: int, chunk_bbox: BBox) -> Any:
+        async with chunk_sem:
+            t_chunk_start = time.time()
+            try:
+                stack_result = await fetch_s2_chunk_stack(
+                    chunk_bbox=chunk_bbox,
+                    period_scenes=period_scenes,
+                    target_gsd_m=target_gsd_m,
+                    pinned_crs=pinned_crs,
+                )
+            except SentinelFetchError as e:
+                chunks_done_counter["n"] += 1
+                elapsed = time.time() - chunk_t0
+                logger.warning(
+                    "chunk %d/%d skipped (fetch, %.1fs): %s [done=%d/%d, elapsed=%.0fs]",
+                    ch_idx + 1, len(chunks), time.time() - t_chunk_start, e,
+                    chunks_done_counter["n"], len(chunks), elapsed,
+                )
+                return _CHUNK_FAIL
+
+            ch, cw, _, _ = stack_result.stack.shape
+            ch4 = (ch // patch_size) * patch_size
+            cw4 = (cw // patch_size) * patch_size
+            if ch4 == 0 or cw4 == 0:
+                chunks_done_counter["n"] += 1
+                return _CHUNK_FAIL
+
+            chunk_image = stack_to_bhwtc(stack_result.stack[:ch4, :cw4, :, :])
+            try:
+                # BASE encoder — returns the full per-patch embedding.
+                result = await asyncio.to_thread(
+                    olmoearth_model.run_s2_inference,
+                    model, chunk_image, stack_result.timestamps,
+                    patch_size, device,
+                )
+            except Exception as e:
+                chunks_done_counter["n"] += 1
+                logger.warning(
+                    "chunk %d/%d inference failed: %s", ch_idx + 1, len(chunks), e,
+                )
+                return _CHUNK_FAIL
+
+            # Paste offset in the global PATCH grid (not pixel grid).
+            chunk_west = stack_result.transform.c
+            chunk_north = stack_result.transform.f
+            px_col_offset = int(round((chunk_west - global_transform.c) / target_gsd_m))
+            px_row_offset = int(round((global_transform.f - chunk_north) / target_gsd_m))
+            patch_col_offset = px_col_offset // patch_size
+            patch_row_offset = px_row_offset // patch_size
+
+            emb_h, emb_w, emb_d = result.embedding.shape
+            h_to_paste = min(emb_h, global_h_patch - patch_row_offset)
+            w_to_paste = min(emb_w, global_w_patch - patch_col_offset)
+            if (
+                patch_row_offset < 0 or patch_col_offset < 0
+                or h_to_paste <= 0 or w_to_paste <= 0
+            ):
+                chunks_done_counter["n"] += 1
+                return _CHUNK_FAIL
+
+            chunks_done_counter["n"] += 1
+            elapsed = time.time() - chunk_t0
+            done = chunks_done_counter["n"]
+            t_total = time.time() - t_chunk_start
+            logger.info(
+                "chunk %d/%d done in %.1fs (emb=%s) [done=%d/%d, elapsed=%.0fs]",
+                ch_idx + 1, len(chunks), t_total, (emb_h, emb_w, emb_d),
+                done, len(chunks), elapsed,
+            )
+            return {
+                "embedding": result.embedding,       # (h, w, D) float32
+                "patch_row_offset": patch_row_offset,
+                "patch_col_offset": patch_col_offset,
+                "h_to_paste": h_to_paste,
+                "w_to_paste": w_to_paste,
+                "embedding_dim": emb_d,
+            }
+
+    async def _process_chunk_bounded(ch_idx: int, chunk_bbox: BBox) -> Any:
+        # Short-circuit once the breaker trips — same pattern as the AOI
+        # orchestrator. Queued chunks exit without trying.
+        if breaker_state["tripped"]:
+            return _CHUNK_FAIL
+        # Per-chunk RAM gate (mirrors the AOI orchestrator). Stops the next
+        # fetch + encoder forward when free RAM has dropped below the OS's
+        # swap-thrash floor since the submit-time precheck. Cheap psutil
+        # call wrapped in to_thread because it's a syscall and we don't
+        # want to block the event loop even briefly under contention.
+        ram_ok, ram_status = await asyncio.to_thread(chunk_ram_ok)
+        if not ram_ok:
+            chunks_done_counter["n"] += 1
+            logger.warning(
+                "chunk %d/%d skipped — per-chunk RAM gate failed (%s)",
+                ch_idx + 1, len(chunks), ram_status.describe(),
+            )
+            _record_chunk_outcome(success=False)
+            return _CHUNK_FAIL
+        try:
+            result = await asyncio.wait_for(
+                _process_chunk(ch_idx, chunk_bbox), timeout=_CHUNK_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            chunks_done_counter["n"] += 1
+            logger.warning(
+                "chunk %d/%d TIMED OUT after %.0fs (embedding export)",
+                ch_idx + 1, len(chunks), _CHUNK_TIMEOUT_S,
+            )
+            _record_chunk_outcome(success=False)
+            return _CHUNK_FAIL
+        _record_chunk_outcome(success=result is not _CHUNK_FAIL)
+        return result
+
+    async def _heartbeat() -> None:
+        while True:
+            await asyncio.sleep(30.0)
+            done = chunks_done_counter["n"]
+            elapsed = time.time() - chunk_t0
+            logger.info(
+                "heartbeat(embed): %d/%d chunks done, %.0fs elapsed",
+                done, len(chunks), elapsed,
+            )
+
+    heartbeat_task = asyncio.create_task(_heartbeat())
+
+    async def _gather_chunks():
+        return await asyncio.gather(
+            *[_process_chunk_bounded(i, c) for i, c in enumerate(chunks)]
+        )
+
+    gather_task = asyncio.create_task(_gather_chunks())
+    disconnect_task = (
+        asyncio.create_task(_watch_for_disconnect(disconnect_check, gather_task))
+        if disconnect_check is not None else None
+    )
+    try:
+        try:
+            chunk_records = await gather_task
+        except asyncio.CancelledError:
+            if (
+                disconnect_task is not None
+                and disconnect_task.done()
+                and not disconnect_task.cancelled()
+            ):
+                raise ClientDisconnectedError(
+                    "client closed connection during embedding export; "
+                    f"in-flight chunks cancelled "
+                    f"(processed={breaker_state['successes']}, "
+                    f"failed={breaker_state['failures']}, total={len(chunks)})"
+                )
+            raise
+    finally:
+        heartbeat_task.cancel()
+        if disconnect_task is not None:
+            disconnect_task.cancel()
+        for _t in (heartbeat_task, disconnect_task):
+            if _t is None:
+                continue
+            try:
+                await _t
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    # Breaker tripped — raise before stitching so the router surfaces a
+    # clean 503 instead of a misleading "all chunks failed" error.
+    if breaker_state["tripped"]:
+        raise CircuitBreakerTrippedError(
+            processed=breaker_state["successes"],
+            failed=breaker_state["failures"],
+            total=len(chunks),
+            threshold=_BREAKER_THRESHOLD,
+        )
+
+    # Stitch: allocate global buffer lazily on first successful chunk so
+    # we only pay memory for the actual embedding_dim (Nano=128, Tiny=192,
+    # Base=768, Large=1024).
+    chunks_processed = 0
+    chunks_failed = 0
+    for record in chunk_records:
+        if record is _CHUNK_FAIL:
+            chunks_failed += 1
+            continue
+        if global_embedding is None:
+            embedding_dim = record["embedding_dim"]
+            global_embedding = np.zeros(
+                (global_h_patch, global_w_patch, embedding_dim), dtype=np.float32,
+            )
+        r0 = record["patch_row_offset"]
+        c0 = record["patch_col_offset"]
+        h = record["h_to_paste"]
+        w = record["w_to_paste"]
+        global_embedding[r0:r0 + h, c0:c0 + w, :] = record["embedding"][:h, :w, :]
+        chunks_processed += 1
+
+    if chunks_processed == 0 or global_embedding is None:
+        raise SentinelFetchError(
+            f"embedding export: all {len(chunks)} chunks failed"
+        )
+
+    # Track the fill mask BEFORE quantization so downstream tools know
+    # which pixels have no data. A zero vector after int8 quantization is
+    # genuinely 0 (middle of int8 range), indistinguishable from the
+    # untouched-chunk sentinel; we keep it as a separate bool array.
+    nodata_mask = ~np.any(global_embedding != 0, axis=-1)
+
+    # Patch-resolution transform: pixel size = target_gsd_m * patch_size.
+    import rasterio as _rio_mod  # noqa: PLC0415
+    patch_transform = global_transform * _rio_mod.Affine.scale(patch_size, patch_size)
+
+    # Shared metadata returned regardless of quantization mode.
+    shared = {
+        "embedding_dim": int(embedding_dim),
+        "transform": patch_transform,
+        "crs": pinned_crs,
+        "patch_size": patch_size,
+        "target_gsd_m": target_gsd_m,
+        "chunks_processed": chunks_processed,
+        "chunks_failed": chunks_failed,
+        "chunks_total": len(chunks),
+        "n_periods": n_periods,
+        "period_days": period_days,
+        "modality": modality,
+        "model_repo_id": model_repo_id,
+        "scene_ids": [
+            ps.scene.get("id") if ps.scene else None for ps in period_scenes
+        ],
+        "scene_datetimes": [
+            ps.scene.get("datetime") if ps.scene else None for ps in period_scenes
+        ],
+    }
+
+    if return_float:
+        # Float32 path — downstream tools (PCA-RGB, similarity search,
+        # few-shot classify) need the full-precision embedding + nodata
+        # mask. The COG exporter is NOT used on this path.
+        logger.info(
+            "embedding computed (float32): %d/%d chunks ok, shape=%s, dim=%d, patch_gsd=%sm",
+            chunks_processed, len(chunks),
+            global_embedding.shape, embedding_dim, target_gsd_m * patch_size,
+        )
+        return {
+            **shared,
+            "embedding_float32": global_embedding,  # (H_patch, W_patch, D) float32
+            "nodata_mask": nodata_mask,              # (H_patch, W_patch) bool
+        }
+
+    # AlphaEarth-compatible int8 quantization (sqrt + scale to ±127, -128 = nodata)
+    # Reserve -128 for patches nobody filled (empty chunks, edges).
+    import torch as _torch  # noqa: PLC0415
+    from olmoearth_pretrain.evals.embedding_transforms import (  # noqa: PLC0415
+        quantize_embeddings,
+    )
+    emb_tensor = _torch.from_numpy(global_embedding)
+    quantized = quantize_embeddings(emb_tensor).numpy().astype(np.int8)
+    if nodata_mask.any():
+        # Broadcast (-128) across all bands for nodata pixels.
+        quantized[nodata_mask, :] = -128
+
+    logger.info(
+        "embedding export: %d/%d chunks ok, shape=%s, dim=%d, patch_gsd=%sm",
+        chunks_processed, len(chunks),
+        quantized.shape, embedding_dim, target_gsd_m * patch_size,
+    )
+
+    return {
+        **shared,
+        "embedding_int8": quantized,       # (H_patch, W_patch, D) int8
+    }
+
+
+async def run_embedding_tool_pca_rgb(
+    bbox: BBox,
+    model_repo_id: str,
+    date_range: str = "2024-04-01/2024-10-01",
+    n_periods: int = 12,
+    period_days: int = 30,
+    time_offset_days: int = 0,
+    chunk_size_m: int = 5000,
+    target_gsd_m: float = 10.0,
+    patch_size: int = 4,
+    disconnect_check=None,
+) -> dict[str, Any]:
+    """Compute embeddings for an AOI + render as a PCA false-color map layer.
+
+    End-to-end pipeline for the first embedding tool exposed in the UI:
+
+      1. Chunked fetch + base encoder forward (reuses
+         ``_run_chunked_embedding_export(return_float=True)``)
+      2. Project to top-3 principal components via
+         ``olmoearth_model.pca_to_rgb`` → ``(H, W, 3)`` uint8
+      3. Register as a pytorch tile job so the existing XYZ tile route +
+         ImageryLayer flow on the frontend Just Works.
+
+    Returns the same shape as ``start_inference`` (job_id + tile_url +
+    legend + metadata) so the frontend treats it identically to any
+    other map-producing inference call.
+    """
+    if model_repo_id not in {
+        "allenai/OlmoEarth-v1-Nano",
+        "allenai/OlmoEarth-v1-Tiny",
+        "allenai/OlmoEarth-v1-Base",
+        "allenai/OlmoEarth-v1-Large",
+    }:
+        raise ValueError(
+            f"PCA false-color is an embedding tool — only base encoders "
+            f"(Nano/Tiny/Base/Large) produce raw embeddings. Got {model_repo_id!r}."
+        )
+
+    # Spec mirrors start_inference's shape so job_id stays stable across
+    # the same AOI+model+date combo — reruns hit the _jobs dedupe path.
+    spec = {
+        "bbox": bbox.model_dump(),
+        "model_repo_id": model_repo_id,
+        "date_range": date_range,
+        "tool": "embedding_pca_rgb",
+        "n_periods": n_periods,
+        "period_days": period_days,
+        "target_gsd_m": target_gsd_m,
+        "patch_size": patch_size,
+    }
+    job_id = _make_job_id(spec)
+
+    async with _jobs_lock:
+        existing = _jobs.get(job_id)
+        if existing is not None and existing.get("status") == "ready" and existing.get("kind") == "pytorch":
+            return _build_response(existing)
+        if existing is not None and existing.get("status") == "running":
+            logger.warning(
+                "PCA-RGB %s already running — returning pending stub (dedup)", job_id,
+            )
+            return _build_response(existing)
+        _jobs[job_id] = {
+            "job_id": job_id,
+            "spec": spec,
+            "status": "running",
+            "kind": "pending",
+            "colormap": "pca_rgb",
+            "started_ts": time.time(),
+        }
+
+    # Load encoder lazily — cached across requests by olmoearth_model.
+    model, device = await asyncio.to_thread(olmoearth_model.load_encoder, model_repo_id)
+
+    try:
+        export_result = await _run_chunked_embedding_export(
+            bbox=bbox,
+            model=model,
+            device=device,
+            model_repo_id=model_repo_id,
+            date_range=date_range,
+            n_periods=n_periods,
+            period_days=period_days,
+            time_offset_days=time_offset_days,
+            chunk_size_m=chunk_size_m,
+            target_gsd_m=target_gsd_m,
+            patch_size=patch_size,
+            return_float=True,     # keep float32 for PCA
+            disconnect_check=disconnect_check,
+        )
+    except Exception as e:
+        async with _jobs_lock:
+            _jobs[job_id].update(
+                status="ready", kind="stub",
+                stub_reason=f"{type(e).__name__}: {e}"[:500],
+            )
+        raise
+
+    # Run PCA on CPU — SVD is cheap for typical N=H×W <= 16k. Spin into a
+    # thread so the event loop keeps breathing for other endpoints.
+    global_embedding = export_result["embedding_float32"]
+    rgb_raster = await asyncio.to_thread(olmoearth_model.pca_to_rgb, global_embedding)
+
+    # Register the job shape the tile renderer expects. rgb_raster triggers
+    # the new RGB path in _render_pytorch_tile (skips colormap).
+    # Surface a recent-scene marker for the UI "scene id" chip.
+    scene_ids = export_result.get("scene_ids") or []
+    scene_datetimes = export_result.get("scene_datetimes") or []
+    recent_scene_id = next((s for s in reversed(scene_ids) if s is not None), None)
+    recent_scene_dt = next((s for s in reversed(scene_datetimes) if s is not None), None)
+
+    async with _jobs_lock:
+        _jobs[job_id].update(
+            status="ready",
+            kind="pytorch",
+            task_type="embedding_pca_rgb",
+            rgb_raster=rgb_raster,
+            # scalar_raster kept for any downstream code that expects it —
+            # the tile renderer's RGB path takes precedence when rgb_raster
+            # is present.
+            scalar_raster=np.zeros(rgb_raster.shape[:2], dtype=np.float32),
+            raster_transform=export_result["transform"],
+            raster_crs=export_result["crs"],
+            raster_height=int(rgb_raster.shape[0]),
+            raster_width=int(rgb_raster.shape[1]),
+            scene_id=recent_scene_id,
+            scene_datetime=recent_scene_dt,
+            patch_size=export_result["patch_size"],
+            embedding_dim=export_result["embedding_dim"],
+            legend={
+                "kind": "rgb",
+                "label": "OlmoEarth embedding PCA false-color",
+                "note": (
+                    "Top-3 principal components of the per-patch embedding "
+                    "mapped to RGB. Similar embeddings get similar colors — "
+                    "works globally, no labels required."
+                ),
+            },
+            temporal_stack={
+                "n_periods": n_periods,
+                "chunks_total": export_result["chunks_total"],
+                "chunks_processed": export_result["chunks_processed"],
+                "chunks_failed": export_result["chunks_failed"],
+                "scene_ids": scene_ids,
+                "scene_datetimes": scene_datetimes,
+            },
+        )
+        return _build_response(_jobs[job_id])
+
+
+async def run_embedding_tool_similarity(
+    bbox: BBox,
+    model_repo_id: str,
+    query_lon: float | None = None,
+    query_lat: float | None = None,
+    window_px: int = 1,
+    date_range: str = "2024-04-01/2024-10-01",
+    n_periods: int = 12,
+    period_days: int = 30,
+    time_offset_days: int = 0,
+    chunk_size_m: int = 5000,
+    target_gsd_m: float = 10.0,
+    patch_size: int = 4,
+    disconnect_check=None,
+) -> dict[str, Any]:
+    """Compute embeddings + render cosine-similarity heatmap vs. a query point.
+
+    Second in-UI embedding tool. Same chunked pipeline as PCA false-color
+    — the difference is post-processing:
+
+      1. Chunked fetch + base encoder forward (``return_float=True``)
+      2. Resolve query lon/lat → global patch grid (row, col)
+      3. Extract query vector (mean over ``window_px`` × ``window_px``
+         window for noise robustness — single-pixel queries are spiky)
+      4. Cosine similarity for every patch → scalar raster in [0, 1]
+      5. Register as pytorch tile job with the "similarity" colormap
+
+    When ``query_lon`` / ``query_lat`` are ``None`` the AOI center is
+    used — gives users a one-click "what else looks like the middle of
+    this area" demo without needing a pixel-picking UI yet.
+    """
+    if model_repo_id not in {
+        "allenai/OlmoEarth-v1-Nano",
+        "allenai/OlmoEarth-v1-Tiny",
+        "allenai/OlmoEarth-v1-Base",
+        "allenai/OlmoEarth-v1-Large",
+    }:
+        raise ValueError(
+            f"Similarity search needs a base encoder. Got {model_repo_id!r}."
+        )
+
+    # Default query = AOI center. Works well as a smoke-test / first-
+    # click demo; dedicated pixel-picker UX can override these later.
+    if query_lon is None:
+        query_lon = (bbox.west + bbox.east) / 2.0
+    if query_lat is None:
+        query_lat = (bbox.south + bbox.north) / 2.0
+
+    spec = {
+        "bbox": bbox.model_dump(),
+        "model_repo_id": model_repo_id,
+        "date_range": date_range,
+        "tool": "embedding_similarity",
+        "query_lon": round(float(query_lon), 6),
+        "query_lat": round(float(query_lat), 6),
+        "window_px": window_px,
+        "n_periods": n_periods,
+        "period_days": period_days,
+        "target_gsd_m": target_gsd_m,
+        "patch_size": patch_size,
+    }
+    job_id = _make_job_id(spec)
+
+    async with _jobs_lock:
+        existing = _jobs.get(job_id)
+        if existing is not None and existing.get("status") == "ready" and existing.get("kind") == "pytorch":
+            return _build_response(existing)
+        if existing is not None and existing.get("status") == "running":
+            logger.warning(
+                "similarity %s already running — returning pending stub (dedup)", job_id,
+            )
+            return _build_response(existing)
+        _jobs[job_id] = {
+            "job_id": job_id,
+            "spec": spec,
+            "status": "running",
+            "kind": "pending",
+            "colormap": "similarity",
+            "started_ts": time.time(),
+        }
+
+    model, device = await asyncio.to_thread(olmoearth_model.load_encoder, model_repo_id)
+
+    try:
+        export_result = await _run_chunked_embedding_export(
+            bbox=bbox,
+            model=model,
+            device=device,
+            model_repo_id=model_repo_id,
+            date_range=date_range,
+            n_periods=n_periods,
+            period_days=period_days,
+            time_offset_days=time_offset_days,
+            chunk_size_m=chunk_size_m,
+            target_gsd_m=target_gsd_m,
+            patch_size=patch_size,
+            return_float=True,
+            disconnect_check=disconnect_check,
+        )
+    except Exception as e:
+        async with _jobs_lock:
+            _jobs[job_id].update(
+                status="ready", kind="stub",
+                stub_reason=f"{type(e).__name__}: {e}"[:500],
+            )
+        raise
+
+    global_embedding = export_result["embedding_float32"]  # (H_patch, W_patch, D)
+    patch_transform = export_result["transform"]
+    pinned_crs = export_result["crs"]
+    h_patch, w_patch, _ = global_embedding.shape
+
+    # Project the WGS-84 query into the patch grid's CRS, then map to
+    # (row, col) via the inverse affine.
+    from rasterio.warp import transform as _transform_coords  # noqa: PLC0415
+    xs, ys = _transform_coords(
+        CRS.from_string("EPSG:4326"), pinned_crs, [query_lon], [query_lat],
+    )
+    qx, qy = float(xs[0]), float(ys[0])
+    inv = ~patch_transform
+    col_f, row_f = inv * (qx, qy)
+    q_col = int(round(col_f))
+    q_row = int(round(row_f))
+    # Clamp to the grid + optionally average a small window for
+    # robustness. ``window_px=1`` (default) gives a single-pixel query
+    # which matches the Ai2 tutorial's basic flow.
+    q_col = max(0, min(w_patch - 1, q_col))
+    q_row = max(0, min(h_patch - 1, q_row))
+    hw = max(1, int(window_px)) // 2
+    r0 = max(0, q_row - hw)
+    r1 = min(h_patch, q_row + hw + 1)
+    c0 = max(0, q_col - hw)
+    c1 = min(w_patch, q_col + hw + 1)
+    query_vec = global_embedding[r0:r1, c0:c1].reshape(-1, global_embedding.shape[-1])
+    # Drop nodata rows (all-zero) before averaging so a query near the
+    # AOI edge doesn't get diluted by untouched patches.
+    valid_rows = np.any(query_vec != 0, axis=-1)
+    if not valid_rows.any():
+        # User clicked on nodata. Fall back to the global mean so the
+        # heatmap is still meaningful ("what's most average about this
+        # AOI") rather than raising.
+        flat = global_embedding.reshape(-1, global_embedding.shape[-1])
+        valid_flat = flat[np.any(flat != 0, axis=-1)]
+        if valid_flat.shape[0] == 0:
+            raise SentinelFetchError(
+                "similarity: no valid pixels in embedding — every chunk "
+                "returned nodata"
+            )
+        query_vec = valid_flat.mean(axis=0)
+    else:
+        query_vec = query_vec[valid_rows].mean(axis=0)
+
+    # Scalar raster in [0, 1].
+    sim_raster = await asyncio.to_thread(
+        olmoearth_model.cosine_similarity_map, global_embedding, query_vec,
+    )
+
+    scene_ids = export_result.get("scene_ids") or []
+    scene_datetimes = export_result.get("scene_datetimes") or []
+    recent_scene_id = next((s for s in reversed(scene_ids) if s is not None), None)
+    recent_scene_dt = next((s for s in reversed(scene_datetimes) if s is not None), None)
+
+    async with _jobs_lock:
+        _jobs[job_id].update(
+            status="ready",
+            kind="pytorch",
+            task_type="embedding_similarity",
+            scalar_raster=sim_raster,
+            raster_transform=patch_transform,
+            raster_crs=pinned_crs,
+            raster_height=int(h_patch),
+            raster_width=int(w_patch),
+            scene_id=recent_scene_id,
+            scene_datetime=recent_scene_dt,
+            patch_size=export_result["patch_size"],
+            embedding_dim=export_result["embedding_dim"],
+            # Carry the query location back to the UI so the legend can
+            # show "query: 28.68°N, 80.70°W".
+            similarity_query={
+                "lon": round(float(query_lon), 6),
+                "lat": round(float(query_lat), 6),
+                "patch_row": int(q_row),
+                "patch_col": int(q_col),
+                "window_px": int(window_px),
+            },
+            temporal_stack={
+                "n_periods": n_periods,
+                "chunks_total": export_result["chunks_total"],
+                "chunks_processed": export_result["chunks_processed"],
+                "chunks_failed": export_result["chunks_failed"],
+                "scene_ids": scene_ids,
+                "scene_datetimes": scene_datetimes,
+            },
+        )
+        return _build_response(_jobs[job_id])
+
+
+def build_embedding_cog_bytes(result: dict[str, Any]) -> tuple[bytes, str]:
+    """Serialize a stitched embedding raster as a multi-band int8 COG.
+
+    One band per embedding dimension. nodata = -128 (matches Ai2 Studio's
+    convention). Uses rasterio's COG driver when available (rasterio
+    >= 1.3) so the output passes ``rio cogeo validate``; falls back to a
+    tiled GTiff otherwise. LZW-compressed — embeddings are spatially
+    correlated so LZW hits ~2-3× compression on real data.
+
+    Returns ``(bytes, suggested_filename)``. Callers typically stream this
+    to a FastAPI ``Response`` with ``Content-Disposition: attachment``.
+    """
+    emb: np.ndarray = result["embedding_int8"]     # (H, W, D) int8
+    h, w, d = emb.shape
+    transform = result["transform"]
+    crs = result["crs"]
+    repo_tag = result["model_repo_id"].replace("/", "_")
+
+    # rasterio wants (band, H, W) — transpose from (H, W, D).
+    data = np.transpose(emb, (2, 0, 1))
+
+    import io as _io  # noqa: PLC0415
+    import rasterio as _rio  # noqa: PLC0415
+    from rasterio.io import MemoryFile  # noqa: PLC0415
+
+    def _write(driver: str, extra: dict[str, Any]) -> bytes:
+        with MemoryFile() as memfile:
+            profile: dict[str, Any] = {
+                "driver": driver,
+                "width": w,
+                "height": h,
+                "count": d,
+                "dtype": "int8",
+                "crs": crs,
+                "transform": transform,
+                "nodata": -128,
+                "compress": "lzw",
+                "predictor": 2,
+                **extra,
+            }
+            with memfile.open(**profile) as ds:
+                ds.write(data)
+                # Embed provenance so downstream consumers know what
+                # pipeline produced this file.
+                ds.update_tags(
+                    model_repo_id=str(result["model_repo_id"]),
+                    embedding_dim=str(result["embedding_dim"]),
+                    patch_size=str(result["patch_size"]),
+                    target_gsd_m=str(result["target_gsd_m"]),
+                    patch_gsd_m=str(result["target_gsd_m"] * result["patch_size"]),
+                    n_periods=str(result["n_periods"]),
+                    period_days=str(result["period_days"]),
+                    modality=result["modality"],
+                    chunks_processed=str(result["chunks_processed"]),
+                    chunks_failed=str(result["chunks_failed"]),
+                    chunks_total=str(result["chunks_total"]),
+                    quantization="olmoearth_pretrain.evals.embedding_transforms.quantize_embeddings",
+                    nodata_value="-128",
+                    roger_studio_version="0.2.0",
+                )
+                # Per-band descriptions so GIS tools show "dim_042" etc.
+                for i in range(d):
+                    ds.set_band_description(i + 1, f"dim_{i:03d}")
+            buf = _io.BytesIO()
+            buf.write(memfile.read())
+            return buf.getvalue()
+
+    try:
+        cog_bytes = _write("COG", {"BLOCKSIZE": 256})
+    except Exception as e:
+        # COG driver not available in some rasterio builds. Fall back to a
+        # regular tiled GTiff — users can post-process with `rio cogeo` if
+        # strict COG compliance matters.
+        logger.info("COG driver unavailable (%s) — writing tiled GTiff", e)
+        cog_bytes = _write("GTiff", {
+            "tiled": True, "blockxsize": 256, "blockysize": 256,
+        })
+
+    filename = f"{repo_tag}_embedding_{h}x{w}x{d}.tif"
+    return cog_bytes, filename
+
+
 async def _run_real_inference(
     bbox: BBox,
     model_repo_id: str,
@@ -337,31 +1851,83 @@ async def _run_real_inference(
 ) -> dict[str, Any]:
     """Fetch S2 composite + run forward pass (encoder or full FT model).
 
-    Returns payload to merge into the cached job. For base encoders, the
-    payload mirrors the original scalar-raster shape; for FT models the
-    payload also carries ``task_type``, ``class_raster``, ``class_names``,
-    etc. so the tile renderer + response builder can expose task-aware
-    output.
+    Two fetch paths, chosen by the FT head's declared ``input_spec``:
+
+      1. **Temporal stack** (most FT heads) — when the head was trained on
+         PER_PERIOD_MOSAIC layers (Ecosystem / AWF / Mangrove), we fetch
+         ``n_periods`` sequential 30-day mosaics ending at ``date_range``
+         and stack them along T. This matches the training distribution;
+         feeding the head a single scene produces the well-documented
+         "one class everywhere" collapse we see in the ecosystem output
+         over Tunisia.
+
+      2. **Legacy single scene** — for base encoders, unknown repos, and
+         FT heads with input_spec flags we can't satisfy yet (LFMC needs
+         S1; ForestLossDriver needs a pre/post pair with CONTAINS mode).
+         We log a known-broken warning for the latter so users aren't
+         surprised when output looks degenerate.
     """
+    # Load the model up-front so we can query its input_spec + patch_size.
+    model, device = await asyncio.to_thread(olmoearth_model.load_encoder, model_repo_id)
+
+    input_spec: dict[str, Any] = {}
+    if isinstance(model, olmoearth_ft.FTModel):
+        input_spec = dict((model.metadata or {}).get("input_spec") or {})
+        effective_patch = (model.metadata or {}).get("patch_size") or _PATCH_SIZE
+    else:
+        effective_patch = _PATCH_SIZE
+
+    use_temporal = bool(
+        input_spec
+        and input_spec.get("n_periods", 1) > 1
+        and not input_spec.get("s1_required")
+        and not input_spec.get("pre_post_split")
+    )
+
+    if input_spec and (input_spec.get("s1_required") or input_spec.get("pre_post_split")):
+        # Dispatcher knows this head is architecturally mismatched with the
+        # current S2-only single-scene fallback. Users see the warning
+        # surfaced via ``notes`` in the response; output will still render
+        # but predictions are unreliable until the multi-modal / pre-post
+        # fetch paths land.
+        logger.warning(
+            "inference %s requires %s — falling back to legacy S2-only "
+            "single-scene path; output will be off-distribution",
+            model_repo_id,
+            "sentinel1" if input_spec.get("s1_required") else "pre/post pair",
+        )
+
+    # Temporal-path FT heads route to the chunked native-resolution
+    # orchestrator — splits the AOI into ~5 km tiles, fetches each at full
+    # 10 m/pixel via parallel band reads, runs FT inference per chunk, and
+    # stitches into a global pixel raster. This matches the OlmoEarth
+    # viewer's pipeline; quality differences vs. the viewer now reduce to
+    # mosaic-compositing strategy (we still pick least-cloudy per period)
+    # rather than spatial resolution.
+    if use_temporal:
+        assert isinstance(model, olmoearth_ft.FTModel)  # implied by use_temporal
+        return await _run_chunked_aoi_inference(
+            bbox=bbox,
+            model=model,
+            device=device,
+            input_spec=input_spec,
+            effective_patch=effective_patch,
+            date_range=date_range,
+            disconnect_check=disconnect_check,
+        )
+
+    # Legacy single-scene path — base encoders + FT heads with input_spec
+    # flags we can't satisfy yet (LFMC needs S1; ForestLossDriver needs the
+    # pre/post pair). Behavior preserved exactly so nothing regresses.
+    crop_step = window_size if sliding_window else effective_patch
+
     scene = await fetch_s2_composite(
         bbox=bbox,
         datetime_range=date_range,
         max_size_px=max_size_px,
         max_cloud_cover=40.0,
     )
-
-    # Load the model up-front so we can query its patch_size for the crop.
-    model, device = await asyncio.to_thread(olmoearth_model.load_encoder, model_repo_id)
-    ts = timestamp_from_iso(scene.datetime_str)
-
-    # Different FT models were trained with different patch sizes (Mangrove=2,
-    # others=4). Crop the fetched S2 image so it's divisible by the model's
-    # native patch size, and — if sliding_window is on — also by window_size.
-    if isinstance(model, olmoearth_ft.FTModel):
-        effective_patch = (model.metadata or {}).get("patch_size") or _PATCH_SIZE
-    else:
-        effective_patch = _PATCH_SIZE
-    crop_step = window_size if sliding_window else effective_patch
+    ts: tuple[int, int, int] | list[tuple[int, int, int]] = timestamp_from_iso(scene.datetime_str)
     h, w, _ = scene.image.shape
     h4 = (h // crop_step) * crop_step
     w4 = (w // crop_step) * crop_step
@@ -369,9 +1935,8 @@ async def _run_real_inference(
         raise ValueError(
             f"fetched scene {scene.image.shape} too small for crop_step={crop_step}"
         )
-    image = scene.image[:h4, :w4, :]
-
-    scene_fields = {
+    image_bhwtc = image_to_bhwtc(scene.image[:h4, :w4, :])
+    scene_fields: dict[str, Any] = {
         "raster_transform": scene.transform,
         "raster_crs": scene.crs,
         "raster_height": int(h4),
@@ -382,6 +1947,7 @@ async def _run_real_inference(
         "patch_size": effective_patch,
         "sliding_window": sliding_window,
         "window_size": window_size if sliding_window else None,
+        "temporal_stack": None,
     }
 
     if isinstance(model, olmoearth_ft.FTModel):
@@ -389,7 +1955,7 @@ async def _run_real_inference(
             ft_result = await asyncio.to_thread(
                 olmoearth_model.run_ft_tiled_inference,
                 model,
-                image_to_bhwtc(image),
+                image_bhwtc,
                 ts,
                 window_size,
                 effective_patch,
@@ -399,7 +1965,7 @@ async def _run_real_inference(
             ft_result = await asyncio.to_thread(
                 olmoearth_model.run_ft_inference,
                 model,
-                image_to_bhwtc(image),
+                image_bhwtc,
                 ts,
                 effective_patch,
                 device,
@@ -461,7 +2027,7 @@ async def _run_real_inference(
     result = await asyncio.to_thread(
         olmoearth_model.run_s2_inference,
         model,
-        image_to_bhwtc(image),
+        image_bhwtc,
         ts,
         _PATCH_SIZE,
         device,
@@ -848,16 +2414,30 @@ def _png_from_rgba(rgba: np.ndarray) -> bytes:
 def _render_pytorch_tile(job: dict[str, Any], z: int, x: int, y: int) -> bytes:
     """Render one 256×256 tile for a real-inference job.
 
-    Dispatch:
-      - classification / segmentation with a ``class_raster`` → class-colored
-        tile using per-class legend colors. Each class is a flat fill — the
-        user sees a thematic map whose colors exactly match the legend.
-      - everything else (embedding, regression) → scalar gradient colormap.
+    Dispatch (in order, first match wins):
+      - **rgb_raster present** (e.g. embedding PCA false-color, future
+        similarity heatmaps rendered as multi-channel) → direct pass-
+        through of the 3-band uint8 tensor, no colormap.
+      - classification / segmentation with a ``class_raster`` → class-
+        colored tile using per-class legend colors.
+      - everything else (embedding, regression) → scalar gradient
+        colormap.
     """
     task_type = job.get("task_type", "embedding")
     class_raster: np.ndarray | None = job.get("class_raster")
+    rgb_raster: np.ndarray | None = job.get("rgb_raster")
     legend = job.get("legend_override") or job.get("legend") or {}
     legend_classes = legend.get("classes") or []
+
+    # RGB path — for tools whose output is a 3-band uint8 visualization
+    # (PCA false-color, RGB similarity overlays). Each channel samples
+    # independently from the source raster; out-of-bounds pixels go
+    # fully transparent so the base map shows through.
+    if rgb_raster is not None and rgb_raster.ndim == 3 and rgb_raster.shape[-1] == 3:
+        rgba = _render_rgb_tile(rgb_raster, job, z, x, y)
+        if rgba is None:
+            return _empty_tile_png()
+        return _png_from_rgba(rgba)
 
     if (
         class_raster is not None
@@ -885,6 +2465,41 @@ def _render_pytorch_tile(job: dict[str, Any], z: int, x: int, y: int) -> bytes:
     stops = colormap["stops"]
     rgba = _colorize(scalar_tile, list(stops))
     return _png_from_rgba(rgba)
+
+
+def _render_rgb_tile(
+    rgb_raster: np.ndarray, job: dict[str, Any], z: int, x: int, y: int,
+) -> np.ndarray | None:
+    """Sample a ``(H, W, 3)`` uint8 RGB raster onto a 256×256 tile grid.
+
+    Mirrors ``_sample_raster_tile`` but for a 3-channel source. Out-of-
+    bounds pixels get ``alpha=0`` so the base map shows through at AOI
+    edges. Inside the AOI, ``alpha=210`` matches the opacity used by
+    the other tile renderers so overlays stay legible.
+    """
+    # Re-use the 2D sampler by independently sampling each channel at
+    # the same tile coordinates. Cheaper than re-implementing the CRS
+    # math for 3 dimensions — 256×256 × 3 is trivially fast.
+    sampled_r = _sample_raster_tile(rgb_raster[:, :, 0], job, z, x, y)
+    if sampled_r is None:
+        return None
+    sampled_g = _sample_raster_tile(rgb_raster[:, :, 1], job, z, x, y)
+    sampled_b = _sample_raster_tile(rgb_raster[:, :, 2], job, z, x, y)
+    # Both g and b must also be within bounds at this point (same source
+    # transform) — defensive check anyway.
+    if sampled_g is None or sampled_b is None:
+        return None
+    r_tile, outside = sampled_r
+    g_tile, _ = sampled_g
+    b_tile, _ = sampled_b
+
+    rgba = np.zeros((256, 256, 4), dtype=np.uint8)
+    rgba[..., 0] = r_tile.astype(np.uint8)
+    rgba[..., 1] = g_tile.astype(np.uint8)
+    rgba[..., 2] = b_tile.astype(np.uint8)
+    rgba[..., 3] = 210
+    rgba[outside] = (0, 0, 0, 0)
+    return rgba
 
 
 def raster_class_histogram(job_id: str, top_n: int = 20) -> dict[str, Any]:

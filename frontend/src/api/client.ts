@@ -14,7 +14,12 @@ const BASE = "/api";
  * hung backend doesn't lock up the UI forever. Pass ``timeoutMs`` in
  * ``RequestOptions`` to override — e.g. OlmoEarth inference endpoints
  * that legitimately run for minutes pass a longer value. */
-const DEFAULT_TIMEOUT_MS = 30_000;
+// Disabled by default — users repeatedly hit timeouts on legitimate slow
+// requests (cold S2 fetches, multi-period chunked inference, large polygon
+// stats). Per user direction the policy is "no timeouts"; the browser still
+// has its own per-tab kill-switch and the backend's own upstream timeouts
+// (OpenAI/NIM/PC SAS) bound any truly stuck request server-side.
+const DEFAULT_TIMEOUT_MS = 0;
 
 export interface RequestOptions extends RequestInit {
   /** Override the default 30 s request timeout. Set to ``0`` to disable
@@ -82,16 +87,12 @@ async function request<T>(path: string, init?: RequestOptions): Promise<T> {
 }
 
 export async function analyze(req: AnalysisRequest): Promise<AnalysisResult> {
-  // /analyze hits Planetary Computer STAC twice (WorldCover COG reads +
-  // OlmoEarth catalog lookup) plus HuggingFace for dataset metadata. Even
-  // with the backend parallelizing those calls, cold-cache worst-case can
-  // reach ~60 s when PC is slow. The default 30 s timeout surfaced as a
-  // visible "API timeout after 30000 ms: /analyze" in the UI. Give it a
-  // 90 s budget — long enough for cold cache, short enough that a truly
-  // hung backend still releases the UI within a minute and a half.
+  // No client-side timeout — /analyze hits Planetary Computer STAC twice
+  // and HuggingFace for dataset metadata; cold cache + slow PC can run
+  // arbitrarily long, and the backend bounds upstream calls itself.
   return request("/analyze", {
     method: "POST",
-    timeoutMs: 90_000,
+    timeoutMs: 0,
     body: JSON.stringify(req),
   });
 }
@@ -577,7 +578,7 @@ export async function getOlmoEarthCatalog(
   // with the backend now parallelizing them, a flaky HF round can still
   // run ~30 s. 60 s client timeout lets the retry path complete instead of
   // surfacing as "API timeout after 30000 ms" in the UI.
-  return request(`/olmoearth/catalog${qs ? `?${qs}` : ""}`, { timeoutMs: 60_000 });
+  return request(`/olmoearth/catalog${qs ? `?${qs}` : ""}`, { timeoutMs: 0 });
 }
 
 export interface OlmoEarthRepoStatus {
@@ -668,15 +669,12 @@ export async function explainRaster(
 ): Promise<ExplainRasterResponse> {
   const nimKey = readProviderKey("geoenv.cloud.apiKey");
   const claudeKey = readProviderKey("geoenv.claude.apiKey");
-  // 180 s timeout — NIM free-tier (minimax-m2.7) under load can take
-  // 90–120 s on its own; Claude fallback then adds another ~15 s if
-  // NIM fails. Earlier 60 s client-side cap was shorter than NIM's own
-  // server-side timeout (120 s), so the browser gave up while the
-  // server was still waiting for the LLM — user saw "API timeout after
-  // 60000 ms" even when the request was still in flight.
+  // No client-side timeout — NIM/Claude upstream calls bound their own
+  // duration server-side, and the browser shouldn't give up on a request
+  // the server is still actively processing.
   return request("/explain-raster", {
     method: "POST",
-    timeoutMs: 180_000,
+    timeoutMs: 0,
     body: JSON.stringify({
       ...req,
       nim_api_key: nimKey || undefined,
@@ -782,15 +780,12 @@ export async function startOlmoEarthInference(args: {
   slidingWindow?: boolean;
   windowSize?: number;
 }): Promise<OlmoEarthInferenceResult> {
-  // Inference can legitimately take minutes (S2 STAC search + multi-band
-  // download + encoder forward + FT head + raster caching). Raise the
-  // request timeout accordingly so the default 30 s doesn't kill a
-  // real run. The backend itself has its own ``OPENAI_TIMEOUT`` /
-  // ``NVIDIA_TIMEOUT`` etc. for upstream calls; this is just the
-  // browser→backend leg.
+  // No client-side timeout — chunked native-resolution inference can
+  // legitimately run multi-minute on slow connections / large AOIs.
+  // Backend has its own per-chunk timeouts on PC fetches.
   return request("/olmoearth/infer", {
     method: "POST",
-    timeoutMs: 5 * 60 * 1000, // 5 min
+    timeoutMs: 0,
     body: JSON.stringify({
       bbox: args.bbox,
       model_repo_id: args.modelRepoId,
@@ -799,6 +794,198 @@ export async function startOlmoEarthInference(args: {
       window_size: args.windowSize,
     }),
   });
+}
+
+
+/** Parameters for a custom OlmoEarth embedding export. Mirrors the
+ * backend ``EmbeddingExportRequest`` schema in
+ * ``backend/app/routers/olmoearth.py``; only base encoders (Nano/Tiny/
+ * Base/Large) are accepted — FT heads produce task outputs, not
+ * embeddings. */
+export interface OlmoEarthEmbeddingExportArgs {
+  bbox: BBox;
+  modelRepoId: string;      // "allenai/OlmoEarth-v1-Nano" | Tiny | Base | Large
+  dateRange?: string;       // default "2024-04-01/2024-10-01"
+  nPeriods?: number;        // 1..12, default 12
+  periodDays?: number;      // default 30
+  timeOffsetDays?: number;  // default 0
+  targetGsdM?: number;      // 10/20/40/80 m, default 10
+  patchSize?: number;       // default 4
+  chunkSizeM?: number;      // default 5000
+}
+
+/** Result of an embedding export — the raw COG bytes plus metadata the
+ * UI surfaces (embedding dim, patch GSD, chunk success rate). */
+export interface OlmoEarthEmbeddingExportResult {
+  blob: Blob;
+  filename: string;
+  embeddingDim: number | null;
+  patchGsdM: number | null;
+  chunksProcessed: number | null;
+  chunksFailed: number | null;
+}
+
+/** Run the chunked embedding export and return the binary COG as a
+ * browser ``Blob`` so the caller can trigger a download.
+ *
+ * Bypasses the JSON-assuming ``request()`` wrapper because the backend
+ * streams ``image/tiff`` bytes. Still honors the no-timeout policy and
+ * surfaces backend errors (status, body text) as Error messages the
+ * caller can show in-UI. */
+export async function exportOlmoEarthEmbedding(
+  args: OlmoEarthEmbeddingExportArgs,
+): Promise<OlmoEarthEmbeddingExportResult> {
+  const body = JSON.stringify({
+    bbox: args.bbox,
+    model_repo_id: args.modelRepoId,
+    date_range: args.dateRange ?? "2024-04-01/2024-10-01",
+    n_periods: args.nPeriods ?? 12,
+    period_days: args.periodDays ?? 30,
+    time_offset_days: args.timeOffsetDays ?? 0,
+    target_gsd_m: args.targetGsdM ?? 10.0,
+    patch_size: args.patchSize ?? 4,
+    chunk_size_m: args.chunkSizeM ?? 5000,
+  });
+
+  const res = await fetch(`${BASE}/olmoearth/export-embedding`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body,
+    // No AbortSignal — user-initiated downloads may legitimately take
+    // several minutes on cold cache + slow networks.
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`API ${res.status}: ${text}`);
+  }
+
+  // Extract filename from Content-Disposition, fall back to a synthesized
+  // name so the download always has a sensible label.
+  const cd = res.headers.get("content-disposition") ?? "";
+  const match = cd.match(/filename="?([^";]+)"?/i);
+  const repoTag = args.modelRepoId.replace(/[/:]/g, "_");
+  const filename = match?.[1] ?? `${repoTag}_embedding.tif`;
+
+  const parseIntHeader = (name: string): number | null => {
+    const v = res.headers.get(name);
+    if (!v) return null;
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) ? n : null;
+  };
+  const parseFloatHeader = (name: string): number | null => {
+    const v = res.headers.get(name);
+    if (!v) return null;
+    const n = parseFloat(v);
+    return Number.isFinite(n) ? n : null;
+  };
+
+  const blob = await res.blob();
+  return {
+    blob,
+    filename,
+    embeddingDim: parseIntHeader("x-embedding-dim"),
+    patchGsdM: parseFloatHeader("x-embedding-patch-gsd-m"),
+    chunksProcessed: parseIntHeader("x-chunks-processed"),
+    chunksFailed: parseIntHeader("x-chunks-failed"),
+  };
+}
+
+/** Embedding-tools workflow: PCA false-color visualization. Computes
+ * embeddings + maps top-3 PCs to RGB, returns the same shape as
+ * ``startOlmoEarthInference`` so the result drops straight into the
+ * existing ImageryLayer flow.
+ *
+ * First of four planned embedding tools (similarity search, few-shot
+ * segmentation, change detection follow). Works globally — unlike the
+ * region-locked FT heads, PCA on the raw embedding gives meaningful
+ * structure anywhere on Earth. */
+export interface OlmoEarthPCARgbArgs {
+  bbox: BBox;
+  modelRepoId?: string;     // Tiny / Base / Large / Nano — base encoders only
+  dateRange?: string;
+  nPeriods?: number;
+  periodDays?: number;
+  timeOffsetDays?: number;
+  targetGsdM?: number;
+  patchSize?: number;
+  chunkSizeM?: number;
+}
+
+/** Embedding-tools workflow: cosine-similarity heatmap. The user's
+ * query is currently the AOI center (no pixel-pick UI yet); a follow-up
+ * iteration will let them click anywhere on the map to set a custom
+ * query point. */
+export interface OlmoEarthSimilarityArgs extends OlmoEarthPCARgbArgs {
+  /** WGS-84 longitude of the query pixel. Defaults to AOI center on
+   * the backend if omitted. */
+  queryLon?: number;
+  /** WGS-84 latitude of the query pixel. */
+  queryLat?: number;
+  /** Mean-pool the query embedding over a window — 1 = single pixel,
+   * larger = more robust to noise. Defaults to 1 (matches Ai2 tutorial). */
+  windowPx?: number;
+}
+
+export async function runOlmoEarthEmbeddingSimilarity(
+  args: OlmoEarthSimilarityArgs,
+): Promise<OlmoEarthInferenceResult> {
+  return request("/olmoearth/embedding-tools/similarity", {
+    method: "POST",
+    timeoutMs: 0,
+    body: JSON.stringify({
+      bbox: args.bbox,
+      model_repo_id: args.modelRepoId ?? "allenai/OlmoEarth-v1-Tiny",
+      date_range: args.dateRange ?? "2024-04-01/2024-10-01",
+      n_periods: args.nPeriods ?? 12,
+      period_days: args.periodDays ?? 30,
+      time_offset_days: args.timeOffsetDays ?? 0,
+      target_gsd_m: args.targetGsdM ?? 10.0,
+      patch_size: args.patchSize ?? 4,
+      chunk_size_m: args.chunkSizeM ?? 5000,
+      query_lon: args.queryLon ?? null,
+      query_lat: args.queryLat ?? null,
+      window_px: args.windowPx ?? 1,
+    }),
+  });
+}
+
+
+export async function runOlmoEarthEmbeddingPCARgb(
+  args: OlmoEarthPCARgbArgs,
+): Promise<OlmoEarthInferenceResult> {
+  return request("/olmoearth/embedding-tools/pca-rgb", {
+    method: "POST",
+    timeoutMs: 0,
+    body: JSON.stringify({
+      bbox: args.bbox,
+      model_repo_id: args.modelRepoId ?? "allenai/OlmoEarth-v1-Tiny",
+      date_range: args.dateRange ?? "2024-04-01/2024-10-01",
+      n_periods: args.nPeriods ?? 12,
+      period_days: args.periodDays ?? 30,
+      time_offset_days: args.timeOffsetDays ?? 0,
+      target_gsd_m: args.targetGsdM ?? 10.0,
+      patch_size: args.patchSize ?? 4,
+      chunk_size_m: args.chunkSizeM ?? 5000,
+    }),
+  });
+}
+
+
+/** Trigger a browser download of an embedding export result. Creates a
+ * temporary object URL and clicks a synthetic anchor — standard pattern
+ * for "send me the bytes" flows without needing a server-side attachment
+ * endpoint. */
+export function downloadEmbeddingExport(result: OlmoEarthEmbeddingExportResult): void {
+  const url = URL.createObjectURL(result.blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = result.filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  // Revoke after a tick — some browsers need the URL alive briefly after
+  // click() for the download to attach to it.
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 // Shape of one demo side returned from /api/olmoearth/demo-pairs. The
@@ -883,16 +1070,12 @@ export async function getPolygonStats(
   geometry: GeoJSON.Polygon | GeoJSON.MultiPolygon,
   opts: { includeElevation?: boolean; resolution?: number } = {}
 ): Promise<PolygonStatsResponse> {
-  // /polygon-stats hits Open-Meteo for the full elevation sample grid
-  // (default 20×20 = 400 points). Cold-cache or large polygons can run
-  // 30-50 s, which previously surfaced as "API timeout after 30000 ms:
-  // /polygon-stats" — give it a 60 s budget. Backend additionally skips
-  // elevation entirely on absurdly large polygons (> 10⁶ km²) since the
-  // grid would need thousands of samples and the result is meaningless
-  // at country-scale anyway.
+  // No client-side timeout — Open-Meteo elevation grid + per-pixel raster
+  // sampling on the new chunked native-resolution rasters can take
+  // arbitrarily long on a big polygon.
   return request("/polygon-stats", {
     method: "POST",
-    timeoutMs: 60_000,
+    timeoutMs: 0,
     body: JSON.stringify({
       geometry,
       include_elevation: opts.includeElevation ?? true,

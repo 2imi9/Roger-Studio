@@ -114,12 +114,118 @@ need a stronger GPU. See `docs/llm-setup.md` for the full matrix.
 - **MCP server** — optional `fastmcp` wrapper around the geo-tools for
   external agents like Claude Desktop. See `backend/app/mcp_server.py`.
 
+## Performance and limitations
+
+Roger Studio targets **native 10 m/pixel inference** — the same resolution
+the OlmoEarth FT heads were trained on — rather than the legacy
+downsample-to-256-px approach. Reaching that quality means fighting
+network latency, so the pipeline is built around three layers of
+optimization:
+
+1. **Chunked AOI inference.** The AOI is sliced into 5 km × 5 km tiles;
+   each tile fetches + infers independently and outputs are stitched into
+   a single pixel-aligned global raster. One STAC search per 30-day
+   period covers every chunk (S2 scenes are ~110 km wide), and per-chunk
+   windowed reads pull only the bytes that tile needs.
+2. **Parallel fetching at two levels.** Chunks run 4-wide via an
+   asyncio semaphore; within each chunk, all 6 periods × 12 bands
+   (72 reads) fire concurrently via `asyncio.gather` + `asyncio.to_thread`.
+   GDAL is tuned for HTTP/2 multiplex and 10 MB read chunks to match
+   Planetary Computer's COG layout.
+3. **On-disk scene cache.** The first run over a bbox writes every
+   fetched band window to `data/s2_cache/` as `.npy`. Every subsequent
+   inference over the same bbox (different FT head, different date — as
+   long as the scenes overlap) skips PC entirely and runs ~50× faster.
+   Cache is keyed on `(scene_id, bbox, gsd, band)`; S2 scenes on PC are
+   immutable so the cache is valid indefinitely. Set
+   `S2_CACHE_DISABLED=1` to force re-fetch, or delete the cache dir to
+   clear it.
+
+### Typical timings
+
+| AOI size | Chunks | First run | Cached run |
+|---|---|---|---|
+| 2 km × 2 km | 1 | ~5–15 s | ~1 s |
+| 22 km × 14 km | 12 | ~30–60 s | ~3 s |
+| 50 km × 35 km | 70 | ~2–4 min | ~10 s |
+
+The spread in first-run times depends almost entirely on your internet
+connection to Microsoft's US East region. On home connections (50–200
+Mbps) the pipeline is **network-bound**: your GPU is idle ~95 % of the
+time during a first fetch. The real production answer for instant
+interactivity is deploying the backend inside Azure East US so the
+backend and PC's COGs share a ~10 Gbps intra-datacenter link.
+
+### Known limitations
+
+**Fine-tuned head training regions.** The published OlmoEarth FT heads
+were each trained on a specific geographic slice. Running them outside
+that slice produces confident-looking but scientifically meaningless
+output (the ecosystem head will happily classify New Jersey pine forest
+as "tropical rainforest" because its training set was north Africa
+only). Current head coverage:
+
+| Head | Training region |
+|---|---|
+| `EcosystemTypeMapping-Base` | north Africa only |
+| `AWF-Base` | southern Kenya only |
+| `Mangrove-Base` | global tropical coastal belt |
+| `LFMC-Base` | fire-prone regions (California, Mediterranean, Australia) |
+| `ForestLossDriver-Base` | pantropical |
+
+For AOIs outside these regions the **base encoder** (`OlmoEarth-v1-Base`,
+-Nano, -Tiny, -Large) still produces useful unsupervised embeddings
+visualized via PCA. Classification heads need to be fine-tuned on
+in-region labels — not shipped in this repo.
+
+**LFMC and ForestLossDriver need extra modalities.** LFMC was trained on
+Sentinel-1 + Sentinel-2 multi-modal input; ForestLossDriver needs a
+pre/post Sentinel-2 pair with a `CONTAINS` space mode. Roger Studio's
+S2-only fetch path does not yet support either, so both heads
+silently fall back to a single-scene S2 path — you get output, but it's
+known off-distribution. The dispatcher logs a warning
+(`falling back to legacy S2-only single-scene path`) on every run of
+these heads. Fixing this requires a new S1 fetcher + the pre/post
+grouping logic in `fetch_s2_temporal_stack`, not in this release.
+
+**Home-internet latency bounds everything.** Chunked + parallel +
+cached together cut first-run times by ~5× vs the naive path, but
+moving 600 MB of Sentinel-2 bytes from Microsoft to a residential ISP
+still takes ~1 minute minimum. The only way below that is local
+caching (done) or colocated hosting (future).
+
+**Hallucinated super-resolution is a trap.** Using a diffusion model
+(cBottle, CorrDiff, similar) to upsample cheap low-res fetches would
+sound like a speedup but would destroy scientific validity — the
+downstream classifier would see plausible-but-fake pixels and emit
+confident nonsense, without any flag telling the user. Roger Studio
+deliberately does not go this route.
+
+## Custom embedding exports
+
+When no fine-tuned head covers your region, compute **OlmoEarth
+embeddings** instead and run lightweight downstream analysis on your own
+labels. The **Export embeddings as COG** button in the OlmoEarth Import
+panel (visible for base encoders) produces a multi-band int8 GeoTIFF
+bit-for-bit compatible with Ai2 OlmoEarth Studio's published format.
+Use the exported file for:
+
+- **Similarity search** — "where else looks like this?"
+- **Few-shot segmentation** — ~60 labels + sklearn = wall-to-wall map
+- **Change detection** — diff two date ranges
+- **PCA false-color** — unsupervised exploration
+
+See [`docs/EMBEDDINGS.md`](docs/EMBEDDINGS.md) for copy-paste-ready
+Python recipes for all four workflows, including AlphaEarth-compatible
+int8 dequantization via
+`olmoearth_pretrain.evals.embedding_transforms.dequantize_embeddings`.
+
 ## Running the tests
 
 ```bash
 cd backend
-pytest                      # 64 offline tests
-pytest -m network           # 12 network tests (PC STAC, HF, etc.)
+pytest                      # 74 offline tests
+pytest -m network           # 11 network tests (PC STAC, HF, etc.)
 ```
 
 ## Contributing

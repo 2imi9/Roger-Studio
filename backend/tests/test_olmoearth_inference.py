@@ -262,3 +262,237 @@ async def test_start_inference_real_path_returns_pytorch_kind() -> None:
     import numpy as np
     arr = np.array(im)
     assert arr[..., 3].max() > 0
+
+
+# ---------------------------------------------------------------------------
+# Global concurrency cap on chunked jobs (P0 host-safety guard).
+#
+# These tests verify the module-scope semaphore added to prevent the
+# multi-request RAM pile-up that crashed the dev host (35 GB resident from
+# overlapping PCA requests, breaker tripped per-request but couldn't see
+# the global picture). The mechanism:
+#   * ``_max_concurrent_jobs()`` reads OE_MAX_CONCURRENT_JOBS, default 1.
+#   * ``_global_job_sem()`` lazy-inits an asyncio.Semaphore(_max).
+#   * ``_with_global_job_lock`` decorator wraps both chunked orchestrators
+#     so only N can be running at once across the whole process.
+# ---------------------------------------------------------------------------
+
+
+def test_max_concurrent_jobs_default(monkeypatch):
+    monkeypatch.delenv("OE_MAX_CONCURRENT_JOBS", raising=False)
+    assert OI._max_concurrent_jobs() == 1
+
+
+def test_max_concurrent_jobs_env_override(monkeypatch):
+    monkeypatch.setenv("OE_MAX_CONCURRENT_JOBS", "4")
+    assert OI._max_concurrent_jobs() == 4
+
+
+def test_max_concurrent_jobs_garbage_falls_back_to_one(monkeypatch):
+    monkeypatch.setenv("OE_MAX_CONCURRENT_JOBS", "not-a-number")
+    assert OI._max_concurrent_jobs() == 1
+
+
+def test_max_concurrent_jobs_zero_or_negative_clamped_to_one(monkeypatch):
+    """``0`` and negatives clamp to 1 — disabling the safety guard via
+    this env var would defeat its purpose, so we refuse rather than
+    silently drop the protection."""
+    monkeypatch.setenv("OE_MAX_CONCURRENT_JOBS", "0")
+    assert OI._max_concurrent_jobs() == 1
+    monkeypatch.setenv("OE_MAX_CONCURRENT_JOBS", "-3")
+    assert OI._max_concurrent_jobs() == 1
+
+
+@pytest.mark.asyncio
+async def test_with_global_job_lock_serializes_when_max_is_one(monkeypatch):
+    """Default config (max=1): three concurrent jobs must run one at a time.
+
+    Without the lock, all three would be in flight simultaneously; the
+    counter would peak at 3. With the lock, peak is 1.
+    """
+    import asyncio as _asyncio
+    monkeypatch.setenv("OE_MAX_CONCURRENT_JOBS", "1")
+    OI._reset_global_job_sem_for_tests()
+
+    in_flight = 0
+    peak = 0
+
+    @OI._with_global_job_lock
+    async def fake_job(tag: str) -> str:
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        # Yield the loop so the next coroutine *would* run if the sem
+        # weren't holding it back. 5 ms is enough to expose any race.
+        await _asyncio.sleep(0.005)
+        in_flight -= 1
+        return tag
+
+    results = await _asyncio.gather(fake_job("a"), fake_job("b"), fake_job("c"))
+    assert results == ["a", "b", "c"]
+    assert peak == 1, f"sem should serialize, but {peak} ran in parallel"
+    OI._reset_global_job_sem_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_with_global_job_lock_allows_parallelism_when_max_is_higher(monkeypatch):
+    """OE_MAX_CONCURRENT_JOBS=3: three jobs may all run concurrently."""
+    import asyncio as _asyncio
+    monkeypatch.setenv("OE_MAX_CONCURRENT_JOBS", "3")
+    OI._reset_global_job_sem_for_tests()
+
+    in_flight = 0
+    peak = 0
+
+    @OI._with_global_job_lock
+    async def fake_job() -> None:
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await _asyncio.sleep(0.01)
+        in_flight -= 1
+
+    await _asyncio.gather(fake_job(), fake_job(), fake_job())
+    assert peak == 3, f"max=3 should allow 3-wide parallelism, got peak={peak}"
+    OI._reset_global_job_sem_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_with_global_job_lock_releases_on_exception(monkeypatch):
+    """If a wrapped coroutine raises, the semaphore must still release —
+    otherwise a single failed job permanently wedges the backend."""
+    import asyncio as _asyncio
+    monkeypatch.setenv("OE_MAX_CONCURRENT_JOBS", "1")
+    OI._reset_global_job_sem_for_tests()
+
+    @OI._with_global_job_lock
+    async def fail_job() -> None:
+        raise RuntimeError("simulated chunk failure")
+
+    @OI._with_global_job_lock
+    async def ok_job() -> str:
+        return "second-job-ran"
+
+    with pytest.raises(RuntimeError, match="simulated"):
+        await fail_job()
+    # Sem must be released; the next job must acquire and complete.
+    result = await _asyncio.wait_for(ok_job(), timeout=1.0)
+    assert result == "second-job-ran"
+    OI._reset_global_job_sem_for_tests()
+
+
+# ---------------------------------------------------------------------------
+# Client-disconnect polling (P0 host-safety guard).
+#
+# Background: with chunk_sem(4) per request and 300 s per-chunk timeout, a
+# single abandoned PCA tab on a 25-chunk AOI keeps the worker grinding for
+# ~30 minutes after the user gave up. Across a session this stacks into a
+# resource leak. _watch_for_disconnect polls a caller-supplied async check
+# every 5 s and cancels the in-flight gather task on disconnect, so the
+# orchestrator surfaces ClientDisconnectedError and the route returns 499.
+# These tests target the helper directly because exercising the full
+# orchestrator would require mocking the entire S2 fetch + encoder stack.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_watch_for_disconnect_cancels_target_when_check_returns_true(monkeypatch):
+    """Disconnect → target task is cancelled."""
+    import asyncio as _asyncio
+    # Use a tiny poll interval so the test runs quickly.
+    monkeypatch.setattr(OI, "_DISCONNECT_POLL_INTERVAL_S", 0.01)
+
+    async def long_work():
+        await _asyncio.sleep(2.0)
+        return "should-be-cancelled"
+
+    fired = {"n": 0}
+
+    async def disconnect_check():
+        fired["n"] += 1
+        # Simulate "client still here" for 2 polls, then "client gone".
+        return fired["n"] >= 2
+
+    target = _asyncio.create_task(long_work())
+    watcher = _asyncio.create_task(OI._watch_for_disconnect(disconnect_check, target))
+
+    with pytest.raises(_asyncio.CancelledError):
+        await target
+    await watcher  # watcher exits cleanly after cancelling
+    assert fired["n"] >= 2  # check was actually polled
+
+
+@pytest.mark.asyncio
+async def test_watch_for_disconnect_exits_quietly_when_target_finishes(monkeypatch):
+    """Happy path: target completes normally → watcher exits without cancelling."""
+    import asyncio as _asyncio
+    monkeypatch.setattr(OI, "_DISCONNECT_POLL_INTERVAL_S", 0.01)
+
+    async def quick_work():
+        await _asyncio.sleep(0.02)
+        return "done"
+
+    async def disconnect_check():
+        return False  # client never disconnects
+
+    target = _asyncio.create_task(quick_work())
+    watcher = _asyncio.create_task(OI._watch_for_disconnect(disconnect_check, target))
+
+    result = await target
+    assert result == "done"
+    # Wait for the watcher to notice target finished. With 10 ms poll, this
+    # should be < 50 ms — but the watcher is also sleeping so we await it.
+    await _asyncio.wait_for(watcher, timeout=1.0)
+    assert not target.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_watch_for_disconnect_survives_check_raising(monkeypatch, caplog):
+    """A broken disconnect_check must not wedge the job — log + exit poll."""
+    import asyncio as _asyncio
+    import logging as _logging
+    monkeypatch.setattr(OI, "_DISCONNECT_POLL_INTERVAL_S", 0.01)
+    caplog.set_level(_logging.WARNING)
+
+    async def long_work():
+        await _asyncio.sleep(0.05)
+        return "ok"
+
+    async def broken_check():
+        raise RuntimeError("disconnect probe failed")
+
+    target = _asyncio.create_task(long_work())
+    watcher = _asyncio.create_task(OI._watch_for_disconnect(broken_check, target))
+
+    # Watcher should give up on the first exception and exit.
+    await _asyncio.wait_for(watcher, timeout=1.0)
+    # Target still finishes normally — watcher's failure didn't poison the job.
+    result = await target
+    assert result == "ok"
+    assert any("disconnect_check raised" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_watch_for_disconnect_can_be_cancelled_by_caller(monkeypatch):
+    """The orchestrator's finally cancels the watcher when gather completes —
+    the watcher must accept cancellation cleanly."""
+    import asyncio as _asyncio
+    monkeypatch.setattr(OI, "_DISCONNECT_POLL_INTERVAL_S", 5.0)  # long sleep
+
+    async def long_work():
+        await _asyncio.sleep(5.0)
+
+    async def never_disconnects():
+        return False
+
+    target = _asyncio.create_task(long_work())
+    watcher = _asyncio.create_task(OI._watch_for_disconnect(never_disconnects, target))
+
+    # Give the watcher a moment to enter its sleep, then cancel it.
+    await _asyncio.sleep(0.02)
+    watcher.cancel()
+    with pytest.raises(_asyncio.CancelledError):
+        await watcher
+    target.cancel()
+    with pytest.raises(_asyncio.CancelledError):
+        await target

@@ -101,32 +101,18 @@
   --font-sans: "Inter", "Helvetica Neue", system-ui, sans-serif;
 }
 
-html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; }
+html, body, #root { height: 100%; margin: 0; padding: 0; }
 
-/* Global 10% scale-up applied to the app root only, NOT to body. CSS
-   ``zoom`` scales every descendant (fonts, icons, map canvas) 1.1x
-   while keeping pointer coordinates correctly mapped, so MapLibre
-   hit-testing and terra-draw polygon drags still work without
-   rewriting anything. Keeping it off `body` is important: the
-   GuidedTour overlay portals to `document.body`, so a zoomed body
-   would double-apply the scale to the tour's spotlight and misalign
-   them. Supported in Chromium, WebKit, and Firefox 126+.
-   Sizing: #root's layout box is (1 / 1.1) of the viewport so that
-   after ``zoom: 1.1`` it visually fills exactly 100% of the viewport.
-   Without this the zoomed content overflowed by 10% and either
-   clipped or introduced scrollbars on html/body. ``overflow: hidden``
-   on html/body is a safety net so even if a child computes a few
-   rounding pixels wider than expected, no scrollbar appears. */
-#root {
-  /* Sized against the viewport directly rather than 100% of body, since
-     ``100%`` inside a zoomed container can double-count (parent's
-     nominal size × zoom). ``vw`` / ``vh`` always refer to raw viewport
-     pixels, so dividing by 1.1 and applying zoom 1.1 lands on exactly
-     100vw / 100vh visually. */
-  width: calc(100vw / 1.1);
-  height: calc(100vh / 1.1);
-  zoom: 1.1;
-}
+/* NOTE: a previous revision used ``#root { zoom: 1.1 }`` for a 10%
+   global scale-up. That was reverted because CSS ``zoom`` breaks
+   MapLibre + terra-draw pointer coordinates. MapLibre reads the
+   canvas via ``offsetWidth`` and ``getBoundingClientRect()``, which
+   disagree under CSS zoom in Chromium, so every click on the map
+   landed a fraction of a percent off-target, drifting further from
+   the cursor as you moved toward the edges. For a bigger UI, use
+   browser Ctrl+Plus (it re-syncs the canvas correctly) or bump
+   individual Tailwind ``text-[Npx]`` utilities where readability
+   is the problem. */
 * { box-sizing: border-box; }
 
 body {

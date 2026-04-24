@@ -4,7 +4,8 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from fastapi import APIRouter, Body, HTTPException, Query, Response
+from fastapi import APIRouter, Body, HTTPException, Query, Request, Response
+from pydantic import BaseModel, Field
 
 from app.models.schemas import (
     BBox,
@@ -20,6 +21,103 @@ from app.services import (
     olmoearth_loader,
     olmoearth_model,
 )
+from app.services.system_health import (
+    AOISizeExceededError,
+    CircuitBreakerTrippedError,
+    ClientDisconnectedError,
+    InsufficientMemoryError,
+    measure_memory,
+)
+
+
+# --- Embedding export request schema (kept local to the router since it
+# isn't shared with other modules; hoist to schemas.py if it becomes a
+# public API contract or picks up frontend consumers).
+class EmbeddingSimilarityRequest(BaseModel):
+    """Parameters for the cosine-similarity embedding tool.
+
+    ``query_lon`` / ``query_lat`` default to ``None`` so a quick demo
+    (no pixel picking) just uses the AOI center — matches Ai2 tutorial's
+    "show me what looks like this region" first-step flow. Once the
+    frontend has a click-to-pick UI, callers will supply explicit
+    coordinates."""
+
+    bbox: BBox
+    model_repo_id: str = Field(default="allenai/OlmoEarth-v1-Tiny")
+    date_range: str = Field(default="2024-04-01/2024-10-01")
+    n_periods: int = Field(default=12, ge=1, le=12)
+    period_days: int = Field(default=30, ge=7, le=90)
+    time_offset_days: int = Field(default=0)
+    target_gsd_m: float = Field(default=10.0, ge=10.0, le=80.0)
+    patch_size: int = Field(default=4, ge=1, le=8)
+    chunk_size_m: int = Field(default=5000, ge=1000, le=20000)
+    query_lon: float | None = Field(
+        default=None,
+        description="WGS-84 longitude of the query pixel. Defaults to AOI center.",
+    )
+    query_lat: float | None = Field(
+        default=None,
+        description="WGS-84 latitude of the query pixel. Defaults to AOI center.",
+    )
+    window_px: int = Field(
+        default=1, ge=1, le=15,
+        description=(
+            "Mean-pool the query embedding over a window_px × window_px "
+            "patch area. 1 = single pixel (matches Ai2 tutorial); larger "
+            "windows trade spatial precision for noise robustness."
+        ),
+    )
+
+
+class EmbeddingPCARgbRequest(BaseModel):
+    """Parameters for the PCA false-color embedding tool — first of the
+    in-UI embedding workflows. Mirrors EmbeddingExportRequest's defaults
+    so the same UI controls drive both."""
+
+    bbox: BBox
+    model_repo_id: str = Field(default="allenai/OlmoEarth-v1-Tiny")
+    date_range: str = Field(default="2024-04-01/2024-10-01")
+    n_periods: int = Field(default=12, ge=1, le=12)
+    period_days: int = Field(default=30, ge=7, le=90)
+    time_offset_days: int = Field(default=0)
+    target_gsd_m: float = Field(default=10.0, ge=10.0, le=80.0)
+    patch_size: int = Field(default=4, ge=1, le=8)
+    chunk_size_m: int = Field(default=5000, ge=1000, le=20000)
+
+
+class EmbeddingExportRequest(BaseModel):
+    """Parameters for a chunked OlmoEarth embedding export."""
+
+    bbox: BBox
+    model_repo_id: str = Field(
+        default="allenai/OlmoEarth-v1-Tiny",
+        description=(
+            "Base encoder to use. Only base encoders (Nano/Tiny/Base/Large) "
+            "are supported — FT heads produce task-specific outputs, not "
+            "raw embeddings."
+        ),
+    )
+    date_range: str = Field(
+        default="2024-04-01/2024-10-01",
+        description="RFC-3339 date range; used as the anchor end for the temporal stack.",
+    )
+    n_periods: int = Field(default=12, ge=1, le=12)
+    period_days: int = Field(default=30, ge=7, le=90)
+    time_offset_days: int = Field(default=0)
+    target_gsd_m: float = Field(
+        default=10.0, ge=10.0, le=80.0,
+        description="Input pixel size in meters (10/20/40/80). Output embedding pixel = gsd × patch_size.",
+    )
+    patch_size: int = Field(default=4, ge=1, le=8)
+    chunk_size_m: int = Field(default=5000, ge=1000, le=20000)
+
+
+_BASE_ENCODER_REPO_IDS = {
+    "allenai/OlmoEarth-v1-Nano",
+    "allenai/OlmoEarth-v1-Tiny",
+    "allenai/OlmoEarth-v1-Base",
+    "allenai/OlmoEarth-v1-Large",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -98,9 +196,35 @@ async def olmoearth_unload(payload: dict = Body(...)) -> dict:
     return result
 
 
+@router.get("/olmoearth/system-health")
+async def olmoearth_system_health() -> dict:
+    """Snapshot of host memory + whether a chunked job would be allowed
+    right now. Cheap (one syscall); frontend can poll before clicking
+    Run to show the user "free 1.2 GB before continuing" warnings
+    instead of hitting a 503 after the request."""
+    status = measure_memory()
+    return {
+        "total_gb": round(status.total_gb, 2),
+        "available_gb": round(status.available_gb, 2),
+        "used_gb": round(status.used_gb, 2),
+        "percent_used": round(status.percent, 1),
+        "threshold_gb": round(status.threshold_gb, 2),
+        "ok": status.ok(),
+    }
+
+
 @router.post("/olmoearth/infer", response_model=OlmoEarthInferenceResult)
-async def olmoearth_infer(payload: dict = Body(...)) -> dict:
-    """Register an inference job and return its XYZ tile URL."""
+async def olmoearth_infer(request: Request, payload: dict = Body(...)) -> dict:
+    """Register an inference job and return its XYZ tile URL.
+
+    Returns **503** when the system-health precheck refuses the job for
+    low free RAM — surfaces as a user-actionable error ("free N GB") in
+    the UI instead of letting the chunked pipeline OOM-crash the host.
+
+    Polls ``request.is_disconnected()`` from inside the chunked
+    orchestrator — abandoning the tab cancels in-flight chunk fetches
+    instead of letting them grind for the full 25-minute timeout window.
+    """
     try:
         bbox = BBox(**payload["bbox"])
     except (KeyError, TypeError, ValueError) as e:
@@ -112,14 +236,45 @@ async def olmoearth_infer(payload: dict = Body(...)) -> dict:
     # parity. Silently dropping these meant sliding-window requests over HTTP
     # ran as single-window (bug), and suggested_retries couldn't key off the
     # real sliding_window state (follow-on bug in the stub-retry helper).
-    return await olmoearth_inference.start_inference(
-        bbox=bbox,
-        model_repo_id=model_repo_id,
-        date_range=payload.get("date_range"),
-        max_size_px=int(payload.get("max_size_px", 256)),
-        sliding_window=bool(payload.get("sliding_window", False)),
-        window_size=int(payload.get("window_size", 32)),
-    )
+    try:
+        return await olmoearth_inference.start_inference(
+            bbox=bbox,
+            model_repo_id=model_repo_id,
+            date_range=payload.get("date_range"),
+            max_size_px=int(payload.get("max_size_px", 256)),
+            sliding_window=bool(payload.get("sliding_window", False)),
+            window_size=int(payload.get("window_size", 32)),
+            disconnect_check=request.is_disconnected,
+        )
+    except AOISizeExceededError as e:
+        # 413 Payload Too Large is the RFC 7231 match: the resource the
+        # client is asking the server to process is larger than the
+        # server is willing to handle. Intentionally NO Retry-After —
+        # retrying the same AOI won't help; user must shrink the bbox.
+        raise HTTPException(status_code=413, detail=str(e)) from e
+    except InsufficientMemoryError as e:
+        # 503 Service Unavailable with Retry-After so clients know to try
+        # again after freeing memory. Body is the descriptive message so
+        # the UI can render "close tabs / free X GB" directly.
+        raise HTTPException(
+            status_code=503, detail=str(e),
+            headers={"Retry-After": "30"},
+        ) from e
+    except CircuitBreakerTrippedError as e:
+        # Network died mid-job. Partial scene cache survives — a retry
+        # ~1 minute later will pick up from disk. Retry-After=60 hints
+        # that at clients / the UI auto-retry layer.
+        raise HTTPException(
+            status_code=503, detail=str(e),
+            headers={"Retry-After": "60"},
+        ) from e
+    except ClientDisconnectedError as e:
+        # 499 Client Closed Request — nginx convention. The tab/curl is
+        # already gone; the body won't be read. Logging the cancellation
+        # at info-level avoids polluting the error stream with what is
+        # essentially "user changed their mind".
+        logger.info("inference cancelled (client disconnect): %s", e)
+        raise HTTPException(status_code=499, detail=str(e)) from e
 
 
 @router.get("/olmoearth/demo-pairs", response_model=OlmoEarthDemoPairsResponse)
@@ -214,6 +369,221 @@ async def olmoearth_download_geotiff(job_id: str) -> Response:
             # output) so cache aggressively.
             "Cache-Control": "public, max-age=3600",
             "X-Roger-Raster-Job-Id": job_id,
+        },
+    )
+
+
+@router.post("/olmoearth/embedding-tools/similarity", response_model=OlmoEarthInferenceResult)
+async def olmoearth_embedding_similarity(
+    request: Request,
+    req: EmbeddingSimilarityRequest = Body(...),
+) -> dict:
+    """Compute embeddings + render cosine-similarity heatmap to a query
+    point. Second of the in-UI embedding tools.
+
+    Response is identical to ``/infer`` so the frontend wires the
+    returned ``tile_url`` as an ImageryLayer with no special-casing.
+    Same safety stack (RAM precheck, breaker, AOI guardrail) inherited
+    from the chunked orchestrator.
+
+    Returns 400 on non-base-encoder model_repo_id.
+    """
+    if req.model_repo_id not in _BASE_ENCODER_REPO_IDS:
+        raise HTTPException(
+            400,
+            (
+                f"Similarity search needs a base encoder. "
+                f"Got {req.model_repo_id!r}."
+            ),
+        )
+    try:
+        return await olmoearth_inference.run_embedding_tool_similarity(
+            bbox=req.bbox,
+            model_repo_id=req.model_repo_id,
+            query_lon=req.query_lon,
+            query_lat=req.query_lat,
+            window_px=req.window_px,
+            date_range=req.date_range,
+            n_periods=req.n_periods,
+            period_days=req.period_days,
+            time_offset_days=req.time_offset_days,
+            chunk_size_m=req.chunk_size_m,
+            target_gsd_m=req.target_gsd_m,
+            patch_size=req.patch_size,
+            disconnect_check=request.is_disconnected,
+        )
+    except AOISizeExceededError as e:
+        raise HTTPException(status_code=413, detail=str(e)) from e
+    except InsufficientMemoryError as e:
+        raise HTTPException(
+            status_code=503, detail=str(e),
+            headers={"Retry-After": "30"},
+        ) from e
+    except CircuitBreakerTrippedError as e:
+        raise HTTPException(
+            status_code=503, detail=str(e),
+            headers={"Retry-After": "60"},
+        ) from e
+    except ClientDisconnectedError as e:
+        logger.info("similarity cancelled (client disconnect): %s", e)
+        raise HTTPException(status_code=499, detail=str(e)) from e
+
+
+@router.post("/olmoearth/embedding-tools/pca-rgb", response_model=OlmoEarthInferenceResult)
+async def olmoearth_embedding_pca_rgb(
+    request: Request,
+    req: EmbeddingPCARgbRequest = Body(...),
+) -> dict:
+    """Compute embeddings + render top-3 PCA components as a false-color
+    map layer. First of the in-UI embedding tools (similarity search,
+    few-shot classify, change detection follow with the same scaffolding).
+
+    Response is identical in shape to ``/olmoearth/infer`` so the
+    frontend treats the result like any other map-producing inference —
+    just attach the returned ``tile_url`` as an ImageryLayer.
+
+    Returns 503/413 on the same safety conditions as ``/infer`` (RAM,
+    breaker, oversized AOI), 400 on non-base-encoder model_repo_id.
+    """
+    if req.model_repo_id not in _BASE_ENCODER_REPO_IDS:
+        raise HTTPException(
+            400,
+            (
+                f"PCA false-color is an embedding tool — only base "
+                f"encoders (Nano/Tiny/Base/Large) produce raw "
+                f"embeddings. Got {req.model_repo_id!r}."
+            ),
+        )
+    try:
+        return await olmoearth_inference.run_embedding_tool_pca_rgb(
+            bbox=req.bbox,
+            model_repo_id=req.model_repo_id,
+            date_range=req.date_range,
+            n_periods=req.n_periods,
+            period_days=req.period_days,
+            time_offset_days=req.time_offset_days,
+            chunk_size_m=req.chunk_size_m,
+            target_gsd_m=req.target_gsd_m,
+            patch_size=req.patch_size,
+            disconnect_check=request.is_disconnected,
+        )
+    except AOISizeExceededError as e:
+        raise HTTPException(status_code=413, detail=str(e)) from e
+    except InsufficientMemoryError as e:
+        raise HTTPException(
+            status_code=503, detail=str(e),
+            headers={"Retry-After": "30"},
+        ) from e
+    except CircuitBreakerTrippedError as e:
+        raise HTTPException(
+            status_code=503, detail=str(e),
+            headers={"Retry-After": "60"},
+        ) from e
+    except ClientDisconnectedError as e:
+        logger.info("PCA cancelled (client disconnect): %s", e)
+        raise HTTPException(status_code=499, detail=str(e)) from e
+
+
+@router.post("/olmoearth/export-embedding")
+async def olmoearth_export_embedding(
+    request: Request,
+    req: EmbeddingExportRequest = Body(...),
+) -> Response:
+    """Compute + export OlmoEarth embeddings for an AOI as an int8 COG.
+
+    Mirrors Ai2 OlmoEarth Studio's "custom embedding exports" feature:
+    runs the chosen base encoder over a chunked native-resolution S2
+    pipeline, stitches per-patch embeddings, quantizes to int8 using the
+    AlphaEarth-compatible scheme from olmoearth_pretrain.evals, and
+    streams a COG with one band per embedding dimension.
+
+    The int8 layout is bit-for-bit compatible with Studio's exports — use
+    ``dequantize_embeddings`` from olmoearth_pretrain.evals.embedding_transforms
+    to recover float vectors. nodata value is -128 (pixels with no scene
+    coverage across all periods).
+
+    Returns 400 when the requested model isn't a base encoder, and 500
+    with a clear error body when every chunk fails (e.g. PC outage).
+    """
+    if req.model_repo_id not in _BASE_ENCODER_REPO_IDS:
+        raise HTTPException(
+            400,
+            (
+                f"{req.model_repo_id!r} is not a base encoder. Embedding "
+                f"export supports only: "
+                f"{sorted(_BASE_ENCODER_REPO_IDS)}."
+            ),
+        )
+
+    # Load the base encoder (cached after first call by olmoearth_model).
+    try:
+        model, device = await asyncio.to_thread(
+            olmoearth_model.load_encoder, req.model_repo_id,
+        )
+    except Exception as e:
+        raise HTTPException(500, f"Failed to load {req.model_repo_id}: {e}") from e
+
+    try:
+        result = await olmoearth_inference._run_chunked_embedding_export(
+            bbox=req.bbox,
+            model=model,
+            device=device,
+            model_repo_id=req.model_repo_id,
+            date_range=req.date_range,
+            n_periods=req.n_periods,
+            period_days=req.period_days,
+            time_offset_days=req.time_offset_days,
+            chunk_size_m=req.chunk_size_m,
+            target_gsd_m=req.target_gsd_m,
+            patch_size=req.patch_size,
+            disconnect_check=request.is_disconnected,
+        )
+    except AOISizeExceededError as e:
+        # AOI exceeds the deployment's chunk-count ceiling — refuse at
+        # submit rather than stress the host. Same 413 pattern as /infer.
+        raise HTTPException(status_code=413, detail=str(e)) from e
+    except ClientDisconnectedError as e:
+        logger.info("export-embedding cancelled (client disconnect): %s", e)
+        raise HTTPException(status_code=499, detail=str(e)) from e
+    except InsufficientMemoryError as e:
+        # System-health precheck rejected the job — surface as 503 with a
+        # Retry-After hint so clients / UI can render "free RAM, retry".
+        raise HTTPException(
+            status_code=503, detail=str(e),
+            headers={"Retry-After": "30"},
+        ) from e
+    except CircuitBreakerTrippedError as e:
+        raise HTTPException(
+            status_code=503, detail=str(e),
+            headers={"Retry-After": "60"},
+        ) from e
+    except Exception as e:
+        logger.exception("embedding export failed")
+        raise HTTPException(
+            500, f"Embedding export failed: {type(e).__name__}: {e}",
+        ) from e
+
+    try:
+        cog_bytes, filename = await asyncio.to_thread(
+            olmoearth_inference.build_embedding_cog_bytes, result,
+        )
+    except Exception as e:
+        logger.exception("COG serialization failed")
+        raise HTTPException(
+            500, f"COG serialization failed: {type(e).__name__}: {e}",
+        ) from e
+
+    return Response(
+        content=cog_bytes,
+        media_type="image/tiff",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Embedding-Dim": str(result["embedding_dim"]),
+            "X-Embedding-Patch-GSD-M": str(
+                result["target_gsd_m"] * result["patch_size"]
+            ),
+            "X-Chunks-Processed": str(result["chunks_processed"]),
+            "X-Chunks-Failed": str(result["chunks_failed"]),
         },
     )
 

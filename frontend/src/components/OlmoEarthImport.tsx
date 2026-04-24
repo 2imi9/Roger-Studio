@@ -1,6 +1,10 @@
 import { useState } from "react";
 import {
+  downloadEmbeddingExport,
+  exportOlmoEarthEmbedding,
   loadOlmoEarthRepo,
+  runOlmoEarthEmbeddingPCARgb,
+  runOlmoEarthEmbeddingSimilarity,
   startOlmoEarthInference,
   type OlmoEarthRepoStatus,
   type OlmoEarthInferenceResult,
@@ -112,6 +116,34 @@ const BASE_ENCODERS: ModelOption[] = [
   { repoId: "allenai/OlmoEarth-v1-Large", label: "Large", kind: "base", task: "Largest encoder · embedding output", supported: true },
 ];
 
+/**
+ * Pull the human-readable detail out of an API error.
+ *
+ * The api/client wrappers throw ``new Error(`API ${status}: ${responseText}`)``
+ * and the FastAPI handlers return JSON like ``{"detail": "Circuit breaker
+ * tripped: …"}``. So a raw error message looks like:
+ *
+ *   API 503: {"detail":"Circuit breaker tripped: 3 chunks failed in a row…"}
+ *
+ * That's hostile to read. The detail string itself is already crafted to be
+ * user-actionable (mentions OE_MAX_CHUNKS, suggests retry, etc.). We just
+ * need to unwrap it. Returns the original string if parsing fails so we
+ * never swallow useful info.
+ */
+function formatApiError(e: unknown): string {
+  const raw = e instanceof Error ? e.message : String(e);
+  const m = raw.match(/^API (\d+): ([\s\S]+)$/);
+  if (!m) return raw;
+  const [, status, body] = m;
+  try {
+    const parsed = JSON.parse(body) as { detail?: unknown };
+    if (typeof parsed.detail === "string") return `${status} — ${parsed.detail}`;
+  } catch {
+    // Body wasn't JSON; fall through.
+  }
+  return raw;
+}
+
 export function OlmoEarthImport({
   olmoCache,
   compact,
@@ -139,11 +171,29 @@ export function OlmoEarthImport({
   const [repoId, setRepoId] = useState(initialOption.repoId);
   const [hfToken, setHfToken] = useState("");
   const [status, setStatus] = useState<string | null>(null);
-  const [busy, setBusy] = useState<null | "infer" | "cache">(null);
+  const [busy, setBusy] = useState<null | "infer" | "cache" | "embed" | "pca" | "sim">(null);
+  // Subtab split: Run inference vs. Embedding tools. The panel had grown to
+  // 1 inference action + 3 embedding actions + 1 advanced action in a flat
+  // list, which pushed the primary Run button below the fold on short
+  // popovers. Two tabs keep each workflow focused.
+  const [activeTab, setActiveTab] = useState<"inference" | "embedding">("inference");
 
   const selected = allOptions.find((m) => m.repoId === repoId) ?? FT_HEADS[0];
   const live = olmoCache?.[repoId];
   const cached = live?.status === "cached";
+
+  // Embedding tools require raw per-patch vectors, which only base encoders
+  // expose. When the user switches to the Embedding tab while an FT head is
+  // selected, auto-swap to Tiny so the tools are usable without an extra
+  // click. Switching back to Inference keeps the current base encoder —
+  // inference works on both kinds (base encoders render via PCA-on-first-
+  // component).
+  const switchTab = (next: "inference" | "embedding") => {
+    setActiveTab(next);
+    if (next === "embedding" && selected.kind === "ft") {
+      setRepoId("allenai/OlmoEarth-v1-Tiny");
+    }
+  };
 
   const handleRun = async () => {
     if (!selectedArea) return;
@@ -171,7 +221,111 @@ export function OlmoEarthImport({
         setStatus(`done — tile URL ready (job ${res.job_id})`);
       }
     } catch (e) {
-      setStatus(`failed: ${e instanceof Error ? e.message : String(e)}`);
+      setStatus(`failed: ${formatApiError(e)}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  // Embedding export — available only for base encoders. Streams the int8
+  // COG as a browser download; no map layer is added because embeddings
+  // are per-dimension bands, not a single thematic raster. Downstream
+  // analysis (similarity search, few-shot segmentation, change detection,
+  // PCA) runs off the downloaded file.
+  const handleExportEmbedding = async () => {
+    if (!selectedArea) return;
+    if (selected.kind !== "base") return;
+    setBusy("embed");
+    setStatus("Exporting embeddings — chunked fetch + encoder forward, may take several minutes…");
+    try {
+      const result = await exportOlmoEarthEmbedding({
+        bbox: selectedArea,
+        modelRepoId: repoId,
+      });
+      downloadEmbeddingExport(result);
+      const parts: string[] = [
+        `downloaded ${result.filename}`,
+        result.embeddingDim != null ? `${result.embeddingDim} dims` : null,
+        result.patchGsdM != null ? `${result.patchGsdM} m/pixel` : null,
+        result.chunksProcessed != null && result.chunksFailed != null
+          ? `${result.chunksProcessed} chunks ok, ${result.chunksFailed} failed`
+          : null,
+      ].filter((s): s is string => s !== null);
+      setStatus(parts.join(" · "));
+    } catch (e) {
+      setStatus(`export failed: ${formatApiError(e)}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  // Embedding tool: PCA false-color visualization. Reuses the same
+  // chunked fetch + base encoder forward as the export, but instead of
+  // returning a COG file it projects the embedding to top-3 PCs and
+  // registers a tile job — drops onto the map like any other inference
+  // result. Works globally (no FT-head region lock).
+  const handlePCARgb = async () => {
+    if (!selectedArea) return;
+    if (selected.kind !== "base") return;
+    setBusy("pca");
+    setStatus("Computing embedding + PCA false-color — this is the same chunked fetch as Export, just with PCA on top.");
+    try {
+      const res = await runOlmoEarthEmbeddingPCARgb({
+        bbox: selectedArea,
+        modelRepoId: repoId,
+      });
+      if (onAddImageryLayer) {
+        onAddImageryLayer({
+          id: `olmoearth-pca-${res.job_id}`,
+          tileUrl: res.tile_url,
+          label: `${selected.label} · PCA · ${res.job_id.slice(0, 6)}`,
+          inferenceMetadata: res,
+        });
+        setStatus(
+          res.kind === "stub"
+            ? `preview stub — PCA failed (${res.stub_reason ?? "unknown"})`
+            : "added to map — top-3 PCs as RGB. Similar embeddings = similar colors.",
+        );
+      } else {
+        setStatus(`done — tile URL ready (job ${res.job_id})`);
+      }
+    } catch (e) {
+      setStatus(`PCA failed: ${formatApiError(e)}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  // Embedding tool: cosine similarity heatmap. v1 uses the AOI center
+  // as the query (zero clicks, instant demo). A future iteration will
+  // expose a click-on-map pixel-pick UI for arbitrary query points.
+  const handleSimilarity = async () => {
+    if (!selectedArea) return;
+    if (selected.kind !== "base") return;
+    setBusy("sim");
+    setStatus("Computing embedding + cosine similarity vs AOI center — bright pixels = looks like the middle of your area.");
+    try {
+      const res = await runOlmoEarthEmbeddingSimilarity({
+        bbox: selectedArea,
+        modelRepoId: repoId,
+      });
+      if (onAddImageryLayer) {
+        onAddImageryLayer({
+          id: `olmoearth-sim-${res.job_id}`,
+          tileUrl: res.tile_url,
+          label: `${selected.label} · similarity · ${res.job_id.slice(0, 6)}`,
+          inferenceMetadata: res,
+        });
+        setStatus(
+          res.kind === "stub"
+            ? `preview stub — similarity failed (${res.stub_reason ?? "unknown"})`
+            : "added to map — bright = similar to AOI center, dark = unrelated.",
+        );
+      } else {
+        setStatus(`done — tile URL ready (job ${res.job_id})`);
+      }
+    } catch (e) {
+      setStatus(`Similarity failed: ${formatApiError(e)}`);
     } finally {
       setBusy(null);
     }
@@ -188,7 +342,7 @@ export function OlmoEarthImport({
       });
       setStatus(res.error ? `error: ${res.error}` : "queued — watch status below");
     } catch (e) {
-      setStatus(`failed: ${e instanceof Error ? e.message : String(e)}`);
+      setStatus(`failed: ${formatApiError(e)}`);
     } finally {
       setBusy(null);
     }
@@ -201,11 +355,53 @@ export function OlmoEarthImport({
           Import OlmoEarth / OlmoEarth-FT data
         </div>
         <div className="text-[10px] text-geo-muted leading-snug">
-          Pick an OlmoEarth FT head or base encoder. <b>Run + add to map</b>{" "}
-          executes inference over your currently-selected area and adds the
-          resulting raster as a map layer. <b>Load weights only</b> just
-          caches the model on disk for later.
+          {activeTab === "inference" ? (
+            <>
+              Pick an FT head (task-specific) or base encoder (PCA-rendered
+              embeddings). <b>Run + add to map</b> executes inference over
+              your AOI and drops the resulting raster as a map layer.
+            </>
+          ) : (
+            <>
+              Pick a base encoder to produce raw per-patch embeddings over
+              your AOI, then visualize them as a false-color layer, find
+              similar patches, or export as a COG for downstream analysis.
+            </>
+          )}
         </div>
+      </div>
+
+      {/* Subtab pills. Styled to match the main Map/Analysis/3D Globe/
+          OlmoEarth/LLM tab bar so the visual language is consistent. */}
+      <div className="flex gap-1 p-0.5 bg-geo-bg border border-geo-border rounded">
+        <button
+          type="button"
+          onClick={() => switchTab("inference")}
+          disabled={busy !== null}
+          className={`flex-1 px-2 py-1 text-[11px] font-semibold rounded transition-colors ${
+            activeTab === "inference"
+              ? "bg-geo-accent text-white cursor-default"
+              : busy !== null
+                ? "text-geo-muted cursor-not-allowed"
+                : "text-geo-muted hover:text-geo-text cursor-pointer"
+          }`}
+        >
+          Run inference
+        </button>
+        <button
+          type="button"
+          onClick={() => switchTab("embedding")}
+          disabled={busy !== null}
+          className={`flex-1 px-2 py-1 text-[11px] font-semibold rounded transition-colors ${
+            activeTab === "embedding"
+              ? "bg-geo-accent text-white cursor-default"
+              : busy !== null
+                ? "text-geo-muted cursor-not-allowed"
+                : "text-geo-muted hover:text-geo-text cursor-pointer"
+          }`}
+        >
+          Embedding tools
+        </button>
       </div>
 
       <div>
@@ -218,14 +414,19 @@ export function OlmoEarthImport({
           disabled={busy !== null}
           className="w-full mt-0.5 px-2 py-1.5 text-[12px] bg-geo-surface border border-geo-border rounded focus:border-geo-accent focus:outline-none cursor-pointer"
         >
-          <optgroup label="Fine-tuned heads (task-specific)">
-            {FT_HEADS.map((m) => (
-              <option key={m.repoId} value={m.repoId}>
-                {m.label} — {m.task}
-                {!m.supported ? " (loader not supported yet)" : ""}
-              </option>
-            ))}
-          </optgroup>
+          {/* FT heads are hidden on the Embedding tab — they project
+              embeddings to task outputs and don't expose raw vectors, so
+              none of the embedding tools could run against them. */}
+          {activeTab === "inference" && (
+            <optgroup label="Fine-tuned heads (task-specific)">
+              {FT_HEADS.map((m) => (
+                <option key={m.repoId} value={m.repoId}>
+                  {m.label} — {m.task}
+                  {!m.supported ? " (loader not supported yet)" : ""}
+                </option>
+              ))}
+            </optgroup>
+          )}
           <optgroup label="Base encoders (embedding output)">
             {BASE_ENCODERS.map((m) => (
               <option key={m.repoId} value={m.repoId}>
@@ -280,61 +481,157 @@ export function OlmoEarthImport({
         )}
       </div>
 
-      <button
-        type="button"
-        onClick={handleRun}
-        disabled={busy !== null || !selectedArea || !selected.supported}
-        className={`w-full px-3 py-2 text-[12px] font-semibold rounded border transition-colors ${
-          busy !== null || !selectedArea || !selected.supported
-            ? "border-geo-border text-geo-muted cursor-not-allowed"
-            : "border-geo-accent bg-geo-accent text-white hover:bg-geo-accent-hover cursor-pointer"
-        }`}
-        title={
-          !selected.supported
-            ? "This FT head's decoder shape isn't supported by the loader yet. Pick a supported head (Mangrove, AWF, Ecosystem, or any base encoder)."
-            : selectedArea
-              ? "Run inference on the selected area and add the result as a map layer"
-              : "Draw an area on the map first"
-        }
-      >
-        {busy === "infer" ? "Running inference…" : "Run + add to map"}
-      </button>
+      {activeTab === "inference" && (
+        <button
+          type="button"
+          onClick={handleRun}
+          disabled={busy !== null || !selectedArea || !selected.supported}
+          className={`w-full px-3 py-2 text-[12px] font-semibold rounded border transition-colors ${
+            busy !== null || !selectedArea || !selected.supported
+              ? "border-geo-border text-geo-muted cursor-not-allowed"
+              : "border-geo-accent bg-geo-accent text-white hover:bg-geo-accent-hover cursor-pointer"
+          }`}
+          title={
+            !selected.supported
+              ? "This FT head's decoder shape isn't supported by the loader yet. Pick a supported head (Mangrove, AWF, Ecosystem, or any base encoder)."
+              : selectedArea
+                ? "Run inference on the selected area and add the result as a map layer"
+                : "Draw an area on the map first"
+          }
+        >
+          {busy === "infer" ? "Running inference…" : "Run + add to map"}
+        </button>
+      )}
 
-      {/* Secondary: load-weights-only. Smaller / less prominent styling so
-          it's clearly the advanced-user path, not the default. */}
-      <details className="border border-geo-border rounded">
-        <summary className="px-2 py-1.5 text-[11px] cursor-pointer hover:bg-geo-bg/60">
-          Advanced: load weights only
-        </summary>
-        <div className="p-2 space-y-2 border-t border-geo-border">
-          <label className="block">
-            <span className="text-[10px] font-semibold uppercase tracking-wider text-geo-muted">
-              HF token{" "}
-              <span className="font-normal normal-case">(only for gated repos)</span>
-            </span>
-            <input
-              type="password"
-              value={hfToken}
-              onChange={(e) => setHfToken(e.target.value)}
-              placeholder="hf_..."
-              className="w-full mt-0.5 px-2 py-1.5 text-[11px] font-mono bg-geo-surface border border-geo-border rounded focus:border-geo-accent focus:outline-none"
-              disabled={busy !== null}
-            />
-          </label>
+      {/* Embedding tools — only rendered on the Embedding subtab. Each
+          tool shares the same chunked fetch + base encoder forward; the
+          difference is what we do with the resulting embedding tensor:
+            * PCA false-color: top-3 PCs → RGB → map layer (in-UI)
+            * Similarity to AOI center: cosine heatmap → map layer
+            * Export as COG: int8 quantize → download (offline analysis)
+          The `selected.kind === "base"` guard is now belt-and-suspenders:
+          the model selector on this tab already hides FT heads. */}
+      {activeTab === "embedding" && selected.kind === "base" && (
+        <>
+          {/* PCA false-color — primary in-UI embedding tool. Adds a real
+              map layer (no download, no extra app). Works globally —
+              meaningful structure anywhere on Earth, including regions
+              the FT heads can't classify. */}
           <button
             type="button"
-            onClick={handleLoadCache}
-            disabled={busy !== null}
-            className={`w-full px-3 py-1.5 text-[11px] font-semibold rounded border transition-colors ${
-              busy !== null
+            onClick={handlePCARgb}
+            disabled={busy !== null || !selectedArea}
+            className={`w-full px-3 py-2 text-[12px] font-semibold rounded border transition-colors ${
+              busy !== null || !selectedArea
                 ? "border-geo-border text-geo-muted cursor-not-allowed"
-                : "border-geo-border text-geo-text hover:border-geo-accent hover:text-geo-accent cursor-pointer"
+                : "border-geo-accent bg-geo-accent text-white hover:bg-geo-accent-hover cursor-pointer"
             }`}
+            title={
+              selectedArea
+                ? "Compute embeddings + map top-3 PCA components to RGB, then add as a map layer. Same chunked pipeline as inference, no download."
+                : "Draw an area on the map first"
+            }
           >
-            {busy === "cache" ? "Queuing…" : "Load weights to disk"}
+            {busy === "pca" ? "Computing PCA false-color…" : "PCA false-color (embedding tool)"}
           </button>
-        </div>
-      </details>
+          <div className="text-[10px] text-geo-muted leading-snug -mt-1">
+            Top-3 principal components of the per-patch embedding mapped
+            to R/G/B. Similar embeddings get similar colors automatically
+            — works globally, no labels required.
+          </div>
+
+          {/* Similarity search — v1 uses AOI center as the query.
+              Pixel-pick upgrade (click-on-map) ships in the next pass. */}
+          <button
+            type="button"
+            onClick={handleSimilarity}
+            disabled={busy !== null || !selectedArea}
+            className={`w-full px-3 py-2 text-[12px] font-semibold rounded border transition-colors ${
+              busy !== null || !selectedArea
+                ? "border-geo-border text-geo-muted cursor-not-allowed"
+                : "border-geo-accent text-geo-accent hover:bg-geo-accent hover:text-white cursor-pointer"
+            }`}
+            title={
+              selectedArea
+                ? "Compute embeddings + cosine-similarity heatmap vs the AOI center. Bright = looks like the middle of your area."
+                : "Draw an area on the map first"
+            }
+          >
+            {busy === "sim" ? "Computing similarity…" : "Similarity to AOI center (embedding tool)"}
+          </button>
+          <div className="text-[10px] text-geo-muted leading-snug -mt-1">
+            Cosine similarity heatmap to the embedding at your AOI center.
+            Find more pixels that "look like" your reference — works
+            globally, no labels required. Pixel-pick UI ships next.
+          </div>
+
+          {/* Export as COG — offline analysis path. Use when you want
+              to do downstream work in QGIS / sklearn / a notebook. */}
+          <button
+            type="button"
+            onClick={handleExportEmbedding}
+            disabled={busy !== null || !selectedArea}
+            className={`w-full px-3 py-2 text-[12px] font-semibold rounded border transition-colors ${
+              busy !== null || !selectedArea
+                ? "border-geo-border text-geo-muted cursor-not-allowed"
+                : "border-geo-accent text-geo-accent hover:bg-geo-accent hover:text-white cursor-pointer"
+            }`}
+            title={
+              selectedArea
+                ? "Compute per-patch embeddings over the selected area and download as an int8 COG"
+                : "Draw an area on the map first"
+            }
+          >
+            {busy === "embed" ? "Exporting embeddings…" : "Export embeddings as COG"}
+          </button>
+          <div className="text-[10px] text-geo-muted leading-snug -mt-1">
+            Multi-band int8 GeoTIFF (one band per dim, nodata = -128). Use
+            with <code className="font-mono">dequantize_embeddings</code>{" "}
+            from <code className="font-mono">olmoearth_pretrain</code> for
+            similarity search, few-shot segmentation, or change detection.
+          </div>
+        </>
+      )}
+
+      {/* Secondary: load-weights-only. Inference-tab only — pre-warming
+          the disk cache is a knob you pull before running inference.
+          Smaller / less prominent styling so it's clearly the advanced-
+          user path, not the default. */}
+      {activeTab === "inference" && (
+        <details className="border border-geo-border rounded">
+          <summary className="px-2 py-1.5 text-[11px] cursor-pointer hover:bg-geo-bg/60">
+            Advanced: load weights only
+          </summary>
+          <div className="p-2 space-y-2 border-t border-geo-border">
+            <label className="block">
+              <span className="text-[10px] font-semibold uppercase tracking-wider text-geo-muted">
+                HF token{" "}
+                <span className="font-normal normal-case">(only for gated repos)</span>
+              </span>
+              <input
+                type="password"
+                value={hfToken}
+                onChange={(e) => setHfToken(e.target.value)}
+                placeholder="hf_..."
+                className="w-full mt-0.5 px-2 py-1.5 text-[11px] font-mono bg-geo-surface border border-geo-border rounded focus:border-geo-accent focus:outline-none"
+                disabled={busy !== null}
+              />
+            </label>
+            <button
+              type="button"
+              onClick={handleLoadCache}
+              disabled={busy !== null}
+              className={`w-full px-3 py-1.5 text-[11px] font-semibold rounded border transition-colors ${
+                busy !== null
+                  ? "border-geo-border text-geo-muted cursor-not-allowed"
+                  : "border-geo-border text-geo-text hover:border-geo-accent hover:text-geo-accent cursor-pointer"
+              }`}
+            >
+              {busy === "cache" ? "Queuing…" : "Load weights to disk"}
+            </button>
+          </div>
+        </details>
+      )}
 
       {/* Live cache status from the 2s /olmoearth/cache-status poll. */}
       {live && (
@@ -369,7 +666,11 @@ export function OlmoEarthImport({
       {status && (
         <div
           className={`text-[10px] leading-snug ${
-            status.startsWith("error") || status.startsWith("failed") || status.startsWith("preview stub")
+            // Catch "failed", "error", or "preview stub" anywhere — not just
+            // as a prefix. Status strings now look like "PCA failed: …",
+            // "Similarity failed: …", "export failed: …" so a startsWith
+            // check missed them and the actionable error rendered in grey.
+            /\b(failed|error|preview stub)\b/i.test(status)
               ? "text-geo-danger"
               : "text-geo-text"
           }`}
