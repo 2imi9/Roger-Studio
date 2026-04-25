@@ -1091,7 +1091,14 @@ async def _run_chunked_embedding_export(
 
     chunk_t0 = time.time()
     chunks_done_counter = {"n": 0}
-    _CHUNK_TIMEOUT_S = 180.0
+    # Bumped 180 → 300 s. With slow PC days (some band reads take 30 s
+    # before failing over to the per-period second-pass retry) and 4
+    # chunks competing for the asyncio thread pool, 180 s was too tight
+    # — chunks all hit the wall before any could finish a full
+    # fetch + encoder forward. 300 s gives a real cold-start budget
+    # while still bailing fast enough that the breaker can trip on
+    # genuinely dead networks.
+    _CHUNK_TIMEOUT_S = 300.0
     _CHUNK_FAIL = object()
     chunk_sem = asyncio.Semaphore(4)
 
@@ -1417,7 +1424,14 @@ async def run_embedding_tool_pca_rgb(
     bbox: BBox,
     model_repo_id: str,
     date_range: str = "2024-04-01/2024-10-01",
-    n_periods: int = 12,
+    # Default reduced from 12 → 3 periods for the embedding tools: PCA
+    # false-color visualisation just needs enough temporal context to
+    # extract spatial structure, not a full year. 3 periods × 30 days =
+    # ~90 days of S2 history. Cuts band fetches 4× (3×12=36 reads/chunk
+    # vs 12×12=144) and encoder forward time roughly proportionally,
+    # turning a 3-min PCA into ~45-60 s. Operators can still pass
+    # higher n_periods explicitly when temporal richness matters.
+    n_periods: int = 3,
     period_days: int = 30,
     time_offset_days: int = 0,
     chunk_size_m: int = 5000,
@@ -1569,7 +1583,9 @@ async def run_embedding_tool_similarity(
     query_lat: float | None = None,
     window_px: int = 1,
     date_range: str = "2024-04-01/2024-10-01",
-    n_periods: int = 12,
+    # Same rationale as the PCA tool — 3 periods is enough to compute a
+    # meaningful similarity signal without burning 4× the network.
+    n_periods: int = 3,
     period_days: int = 30,
     time_offset_days: int = 0,
     chunk_size_m: int = 5000,

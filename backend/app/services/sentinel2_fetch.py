@@ -55,10 +55,10 @@ _GDAL_DEFAULTS = {
     "GDAL_CACHEMAX": "512",                              # MB of in-RAM cache
     "CPL_VSIL_CURL_CHUNK_SIZE": "10485760",              # 10 MB read chunks
     "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",         # don't list dirs
-    "GDAL_HTTP_TIMEOUT": "30",                           # total request timeout (s)
-    "GDAL_HTTP_CONNECTTIMEOUT": "10",                    # TCP connect timeout (s)
-    "GDAL_HTTP_LOW_SPEED_TIME": "15",                    # abort if throughput < below
-    "GDAL_HTTP_LOW_SPEED_LIMIT": "1000",                 # ...1 KB/s for 15 s
+    "GDAL_HTTP_TIMEOUT": "15",                           # total request timeout (s)
+    "GDAL_HTTP_CONNECTTIMEOUT": "5",                     # TCP connect timeout (s)
+    "GDAL_HTTP_LOW_SPEED_TIME": "10",                    # abort if throughput < below
+    "GDAL_HTTP_LOW_SPEED_LIMIT": "1000",                 # ...1 KB/s for 10 s
     "CPL_VSIL_CURL_USE_S3_SIGNING_V4": "NO",             # harmless for PC; avoid probes
     "CPL_VSIL_CURL_NON_CACHED": "NO",                    # re-use curl handles across reads
     "VSI_CACHE": "TRUE",
@@ -68,12 +68,20 @@ _GDAL_DEFAULTS = {
     # the same PC endpoint sometimes succeeds (HTTP 200 in 1 s) and
     # sometimes fails with "Connection was reset" — intermittent TLS
     # handshake drops somewhere between the residential ISP and Azure.
-    # Without retries, a single reset kills an entire band read. Five
-    # attempts with exponential backoff recovers from the typical
-    # 2-3-second blip windows.
-    "GDAL_HTTP_MAX_RETRY": "5",                          # retry up to 5x on transient errors
-    "GDAL_HTTP_RETRY_DELAY": "1",                        # 1 s base, exponential
-    "CPL_VSIL_CURL_MAX_RETRY": "5",                      # same for VSI layer
+    #
+    # Cap GDAL retries LOW (1, not 5). Rationale: with 12 bands × 4 chunks
+    # competing for a 20-thread asyncio pool, a single band burning its
+    # full GDAL budget (5 retries × 30 s = 150 s) starves siblings and
+    # blows past the 180 s per-chunk timeout — observed ALL 4 chunks
+    # timing out simultaneously in dev. The application-level
+    # ``failed_pass1`` retry inside ``_fetch_one_period`` re-attempts
+    # failed bands once after the parallel pass returns, so we don't
+    # need GDAL to retry hard. Net behaviour: 2 attempts per band (1
+    # GDAL retry + 1 application-level), each fail-fast at 15 s — total
+    # worst case ~30 s per band instead of 150+ s.
+    "GDAL_HTTP_MAX_RETRY": "1",                          # one retry, fail fast
+    "GDAL_HTTP_RETRY_DELAY": "1",                        # 1 s before retry
+    "CPL_VSIL_CURL_MAX_RETRY": "1",                      # same for VSI layer
     "CPL_VSIL_CURL_RETRY_DELAY": "1",
 }
 for _k, _v in _GDAL_DEFAULTS.items():
@@ -272,10 +280,45 @@ def _s2_cache_put(
 PC_STAC_API = "https://planetarycomputer.microsoft.com/api/stac/v1"
 PC_SAS_API = "https://planetarycomputer.microsoft.com/api/sas/v1"
 
+# Element84 hosts the same Sentinel-2 L2A collection on AWS (sentinel-cogs
+# bucket, requester-pays-but-public). Used as a fallback when PC's /search
+# endpoint flakes — different infra, different reliability profile, no SAS
+# signing required (asset hrefs are public HTTPS S3 URLs).
+E84_STAC_API = "https://earth-search.aws.element84.com/v1"
+
+# Map PC's official S2 band names → Element84's friendly aliases for the
+# same bands. Element84's STAC catalog uses common-name aliases instead of
+# the official ESA "B0X" identifiers, so a translation layer is needed for
+# the inference pipeline (which keys off ``Modality.SENTINEL2_L2A.band_order``
+# = the official "B0X" names).
+_E84_BAND_NAME_MAP = {
+    "B01": "coastal",
+    "B02": "blue",
+    "B03": "green",
+    "B04": "red",
+    "B05": "rededge1",
+    "B06": "rededge2",
+    "B07": "rededge3",
+    "B08": "nir",
+    "B8A": "nir08",
+    "B09": "nir09",
+    "B11": "swir16",
+    "B12": "swir22",
+}
+
 # Windows + httpx async occasionally raises ConnectError on the first call in a
 # fresh loop. Retry with exponential backoff on top of the transport retries.
-_HTTP_MAX_ATTEMPTS = 4
-_HTTP_BACKOFF_SEC = 1.5
+#
+# Bumped from 4 → 7 attempts after observing PC's STAC /search at ~50 % TLS
+# reset rate from a residential IP. With 4 attempts × 50 % flake, P(all
+# fail) = 6 %; with 12 periods that's ~50 % of requests with at least one
+# unrecoverable period skip. With 7 attempts P(all fail) drops to 0.8 %,
+# making single-period skips rare even on a bad PC window. The cost is
+# tail latency: worst-case wait grows from 1.5×(1+2+4+8) = 22 s to
+# 1.5×(1+2+4+8+16+32+64) = 190 s — but this only fires when PC is
+# struggling, and is bounded by the per-chunk timeout above.
+_HTTP_MAX_ATTEMPTS = int(os.environ.get("OE_STAC_HTTP_MAX_ATTEMPTS", "7"))
+_HTTP_BACKOFF_SEC = float(os.environ.get("OE_STAC_HTTP_BACKOFF_SEC", "1.5"))
 
 # Cache SAS tokens per collection. PC issues them with a ~1 hour TTL so we
 # refresh a few minutes before expiry to avoid mid-fetch 403s.
@@ -775,12 +818,35 @@ async def fetch_aoi_period_scenes(
         start_t = end_t - timedelta(days=period_days)
         period_ranges.append((start_t, end_t))
 
+    # Throttle concurrent STAC searches — firing 12 periods in parallel against
+    # PC's /search endpoint reliably triggers TLS connection resets from a
+    # residential IP (observed 50–80 % per-call flake when N=12 concurrent).
+    # Serializing to 3 in-flight cuts the burst rate without significantly
+    # hurting wall time (PC search is ~0.5 s when it works). Tunable via
+    # OE_STAC_SEARCH_CONCURRENCY env var; ``0`` keeps the legacy unbounded
+    # behaviour (only safe on intra-Azure deployments).
+    _stac_search_sem = asyncio.Semaphore(
+        max(1, int(os.environ.get("OE_STAC_SEARCH_CONCURRENCY", "3")))
+    )
+
     async def _safe_search(dt_range: str) -> dict[str, Any] | None:
-        try:
-            return await _search_least_cloudy(bbox, dt_range, max_cloud_cover)
-        except SentinelFetchError as e:
-            logger.info("aoi_period_scenes: period %s empty (%s)", dt_range, e)
-            return None
+        async with _stac_search_sem:
+            try:
+                # _search_with_fallback tries PC first, then Element84 — so a
+                # PC TLS reset cluster doesn't doom this period.
+                return await _search_with_fallback(bbox, dt_range, max_cloud_cover)
+            except SentinelFetchError as e:
+                logger.info("aoi_period_scenes: period %s empty (%s)", dt_range, e)
+                return None
+            except Exception as e:
+                # _http_retrying_request raises httpx exceptions after exhausting
+                # its retry budget on BOTH PC and Element84. Catch them here so
+                # one bad period doesn't take down the whole AOI search via gather().
+                logger.warning(
+                    "aoi_period_scenes: period %s failed after HTTP retries (%s)",
+                    dt_range, e,
+                )
+                return None
 
     period_dt_ranges = [
         f"{s.date().isoformat()}/{e.date().isoformat()}"
@@ -812,15 +878,13 @@ def _read_one_band_window(
     array — the caller decides whether to skip the period or proceed.
     Designed to run inside ``asyncio.to_thread`` so multiple bands fetch in
     parallel without the GIL (rasterio releases it during IO).
+
+    Note: a Python-level retry-with-backoff was tried here but caused an
+    unhandled exception path under live load (route returned 500 + a stuck
+    worker). Reverted in favour of GDAL's native ``GDAL_HTTP_MAX_RETRY=5``
+    (set at module top). PC-flake mitigation needs to land at a different
+    surface — tracked separately.
     """
-    # Roll-back from the over-engineered "hang-proof" version: the extra
-    # ``rasterio.Env`` wrapper, global band semaphore, and broad Exception
-    # catch were added to handle a diagnosed "flaky ISP" symptom, but
-    # ended up strangling a pipeline that worked fine earlier in the
-    # session on the same network. The env vars set at module top
-    # (before rasterio import) are enough — GDAL reads them at first
-    # use. Keep the simple RasterioIOError path and let anything weirder
-    # propagate so we actually SEE new bugs instead of masking them.
     try:
         with rasterio.open(href) as src:
             with WarpedVRT(
@@ -880,8 +944,9 @@ async def fetch_s2_chunk_stack(
         )
     anchor_ps = period_scenes[anchor_period_idx]
     assert anchor_ps.scene is not None
-    anchor_token = await _get_sas_token(anchor_ps.scene["collection"])
-    anchor_first_href = _sign(anchor_ps.scene["assets"][want_bands[0]]["href"], anchor_token)
+    anchor_first_href = await _signed_href_for_scene(
+        anchor_ps.scene, anchor_ps.scene["assets"][want_bands[0]]["href"],
+    )
     if pinned_crs is None:
         with rasterio.open(anchor_first_href) as src0:
             scene_crs = src0.crs
@@ -934,8 +999,11 @@ async def fetch_s2_chunk_stack(
                 need_fetch.append((band_idx, band_name))
 
         if need_fetch:
-            token = await _get_sas_token(scene["collection"])
-            signed_hrefs = [_sign(scene["assets"][bn]["href"], token) for _, bn in need_fetch]
+            # Sign once per scene (PC) or no-op (Element84 — public S3 URLs).
+            signed_hrefs = [
+                await _signed_href_for_scene(scene, scene["assets"][bn]["href"])
+                for _, bn in need_fetch
+            ]
 
             if _S2_SEQUENTIAL:
                 # Safety mode — one read at a time. Matches the Ai2
@@ -961,6 +1029,42 @@ async def fetch_s2_chunk_stack(
                     )
                     for href in signed_hrefs
                 ])
+            # Second-pass retry on the bands that failed in pass 1. PC's
+            # /vsicurl/ COG asset reads occasionally drop TLS connections
+            # (~20 % per-request observed) — when 12 bands run in parallel,
+            # one transient failure used to skip the WHOLE period (line
+            # ``if any(not ok ...)`` below). With 12 bands, P(period skip)
+            # under a 20 % per-band rate is 1 - 0.8¹² ≈ 93 %. A single
+            # extra pass on JUST the failed bands cuts joint failure to
+            # ~7 % per band → P(period skip) ≈ 1 - 0.95¹² ≈ 46 % — and
+            # since most "failures" are transient TLS resets, in practice
+            # the retry rescues most periods.
+            #
+            # Why per-period and not inside ``_read_one_band_window``: the
+            # latter approach (with time.sleep + broad OSError catch) tied
+            # up the asyncio thread pool and caused live PCA requests to
+            # 500 with stuck workers. Doing the retry one level up keeps
+            # the existing exception envelope (only RasterioIOError /
+            # RasterioError surface as failures) and re-uses the same
+            # asyncio.to_thread fan-out the parallel pass already proved
+            # safe. No sleep — GDAL's own ``GDAL_HTTP_MAX_RETRY=5`` already
+            # adds spacing at the libcurl layer.
+            failed_pass1 = [
+                (i, signed_hrefs[i]) for i, (ok, _) in enumerate(results) if not ok
+            ]
+            if failed_pass1 and not _S2_SEQUENTIAL:
+                logger.info(
+                    "scene %s period: retrying %d/%d band reads that failed pass 1",
+                    scene["id"], len(failed_pass1), len(signed_hrefs),
+                )
+                retry_results = await asyncio.gather(*[
+                    asyncio.to_thread(
+                        _read_one_band_window, href, scene_crs, dst_transform, out_h, out_w,
+                    )
+                    for _, href in failed_pass1
+                ])
+                for (orig_idx, _), retry_outcome in zip(failed_pass1, retry_results):
+                    results[orig_idx] = retry_outcome
             if any(not ok for ok, _ in results):
                 return _skip_record(ps)
             for (band_idx, band_name), (_, arr) in zip(need_fetch, results):
@@ -1068,8 +1172,9 @@ async def resolve_aoi_grid(
             f"resolve_aoi_grid: no period had a usable scene with all 12 S2 bands"
         )
     assert first_ps.scene is not None
-    token = await _get_sas_token(first_ps.scene["collection"])
-    first_href = _sign(first_ps.scene["assets"][want_bands[0]]["href"], token)
+    first_href = await _signed_href_for_scene(
+        first_ps.scene, first_ps.scene["assets"][want_bands[0]]["href"],
+    )
     with rasterio.open(first_href) as src0:
         pinned_crs = src0.crs
 
@@ -1141,7 +1246,124 @@ async def _search_least_cloudy(
         "datetime": props.get("datetime"),
         "cloud_cover": props.get("eo:cloud_cover"),
         "assets": feat.get("assets") or {},
+        # Provider tag — drives downstream signing logic. PC needs SAS
+        # tokens appended to asset hrefs; Element84 (below) does not.
+        "_provider": "pc",
     }
+
+
+async def _search_element84_least_cloudy(
+    bbox: BBox, datetime_range: str, max_cloud_cover: float
+) -> dict[str, Any]:
+    """Same shape as ``_search_least_cloudy`` but hits Element84's AWS-hosted
+    Sentinel-2 STAC catalog. Used as a fallback when PC is flaking.
+
+    Two normalizations applied so the returned scene plugs directly into
+    the existing chunk-fetch path:
+
+      1. Datetime ranges are converted to RFC3339 (Element84 rejects
+         ``YYYY-MM-DD/YYYY-MM-DD``).
+      2. Asset keys are remapped from Element84's friendly aliases
+         (``coastal`` / ``blue`` / ``swir16`` / etc.) to PC's official
+         ``B0X`` identifiers, since downstream code keys off
+         ``Modality.SENTINEL2_L2A.band_order``.
+
+    Asset hrefs from Element84 are public S3 HTTPS URLs (no SAS signing
+    required); the ``"_provider": "element84"`` tag tells the chunk
+    fetcher to skip ``_sign()`` for these scenes.
+    """
+    # Element84 wants RFC3339 datetimes — pad bare YYYY-MM-DD with T00:00:00Z.
+    def _to_rfc3339(piece: str) -> str:
+        piece = piece.strip()
+        if "T" in piece:
+            return piece if piece.endswith("Z") else piece + "Z"
+        return piece + "T00:00:00Z"
+    if "/" in datetime_range:
+        a, b = datetime_range.split("/", 1)
+        rfc = f"{_to_rfc3339(a)}/{_to_rfc3339(b)}"
+    else:
+        rfc = _to_rfc3339(datetime_range)
+
+    body = {
+        "bbox": [bbox.west, bbox.south, bbox.east, bbox.north],
+        "datetime": rfc,
+        "collections": ["sentinel-2-l2a"],
+        "query": {"eo:cloud_cover": {"lt": float(max_cloud_cover)}},
+        "sortby": [{"field": "eo:cloud_cover", "direction": "asc"}],
+        "limit": 5,
+    }
+    r = await _http_retrying_request("POST", f"{E84_STAC_API}/search", json=body)
+    data = r.json()
+    features = data.get("features") or []
+    if not features:
+        raise SentinelFetchError(
+            f"element84: no Sentinel-2 scenes for bbox={bbox.model_dump()} "
+            f"range={datetime_range} cloud<{max_cloud_cover}"
+        )
+    feat = features[0]
+    props = feat.get("properties") or {}
+    raw_assets = feat.get("assets") or {}
+
+    # Remap E84's aliases → PC's B0X keys so the rest of the pipeline doesn't
+    # need to know which provider produced the scene. Skip bands E84 doesn't
+    # expose — leaving them out causes the per-chunk anchor check to drop
+    # this scene rather than crash.
+    assets: dict[str, Any] = {}
+    for pc_name, e84_name in _E84_BAND_NAME_MAP.items():
+        a = raw_assets.get(e84_name)
+        if a and "href" in a:
+            assets[pc_name] = a
+
+    return {
+        "id": feat["id"],
+        "collection": feat.get("collection", "sentinel-2-l2a"),
+        "datetime": props.get("datetime"),
+        "cloud_cover": props.get("eo:cloud_cover"),
+        "assets": assets,
+        "_provider": "element84",
+    }
+
+
+async def _search_with_fallback(
+    bbox: BBox, datetime_range: str, max_cloud_cover: float
+) -> dict[str, Any]:
+    """Try PC first; on any failure (HTTP retry exhaustion, 0-results, TLS
+    reset cluster), fall through to Element84. Returns whichever finds a
+    usable scene; raises only when BOTH providers come up empty.
+
+    PC remains primary because it serves data co-located with our compute
+    on Azure (when we eventually deploy there) and has SAS-signed CDN
+    URLs which are slightly faster from arbitrary IPs. Element84 is the
+    safety net for the "PC is having a bad day" case observed in dev
+    where ~50 % of /search calls return TLS resets.
+    """
+    try:
+        return await _search_least_cloudy(bbox, datetime_range, max_cloud_cover)
+    except SentinelFetchError:
+        # PC said "no scenes here" — Element84 indexes the same catalog,
+        # so it'll likely say the same. Skip the fallback to avoid a
+        # pointless extra round-trip.
+        raise
+    except Exception as pc_err:
+        logger.info(
+            "PC search failed (%s) — falling back to Element84 for %s",
+            type(pc_err).__name__, datetime_range,
+        )
+        try:
+            return await _search_element84_least_cloudy(
+                bbox, datetime_range, max_cloud_cover,
+            )
+        except SentinelFetchError:
+            raise
+        except Exception as e84_err:
+            logger.warning(
+                "BOTH STAC providers failed for %s: pc=%s, element84=%s",
+                datetime_range, type(pc_err).__name__, type(e84_err).__name__,
+            )
+            # Re-raise PC's error since it was the primary attempt — the
+            # caller's catch only knows about SentinelFetchError + Exception
+            # so the type doesn't change observable behaviour.
+            raise pc_err
 
 
 async def _get_sas_token(collection: str) -> str:
@@ -1171,3 +1393,13 @@ def _sign(href: str, token: str) -> str:
     if "?" in href:
         return f"{href}&{token}"
     return f"{href}?{token}"
+
+
+async def _signed_href_for_scene(scene: dict[str, Any], href: str) -> str:
+    """Provider-aware signing. PC needs a SAS token appended; Element84
+    URLs are public S3 HTTPS — no signing required. Routing on the
+    ``_provider`` tag keeps the chunk-fetch path provider-agnostic."""
+    if scene.get("_provider") == "element84":
+        return href
+    token = await _get_sas_token(scene["collection"])
+    return _sign(href, token)

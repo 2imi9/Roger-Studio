@@ -454,3 +454,5 @@ async def test_fetch_s2_composite_returns_12_bands_seattle() -> None:
     assert 1 <= dmy[0] <= 31
     assert 0 <= dmy[1] <= 11
     assert dmy[2] >= 2015  # S2 archive starts in 2015.
+
+
