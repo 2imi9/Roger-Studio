@@ -403,6 +403,67 @@ async def test_parallel_mode_allows_concurrent_reads(tmp_path, monkeypatch) -> N
     )
 
 
+@pytest.mark.asyncio
+async def test_fetch_s2_pre_post_pair_returns_both_windows(monkeypatch) -> None:
+    """Pre/post wrapper must call ``fetch_aoi_period_scenes`` once for each
+    window, with the correct anchor offsets and period counts, and return
+    a (pre, post) tuple. Networkless: we patch the underlying search."""
+    from app.services import sentinel2_fetch as sf
+    from app.services.sentinel2_fetch import (
+        AoiPeriodScene,
+        fetch_s2_pre_post_pair,
+    )
+
+    captured: list[dict] = []
+
+    async def fake_fetch_aoi_period_scenes(
+        *, bbox, anchor_date, n_periods, period_days, time_offset_days, max_cloud_cover,
+    ):
+        captured.append({
+            "anchor_date": anchor_date,
+            "n_periods": n_periods,
+            "period_days": period_days,
+            "time_offset_days": time_offset_days,
+        })
+        # Return distinct fake scenes per window so we can assert order.
+        tag = "PRE" if time_offset_days < 0 else "POST"
+        return [
+            AoiPeriodScene(
+                scene={"id": f"S2_{tag}_{i}"},
+                period_start_iso="2022-01-01",
+                period_end_iso="2022-01-31",
+            )
+            for i in range(n_periods)
+        ]
+
+    monkeypatch.setattr(sf, "fetch_aoi_period_scenes", fake_fetch_aoi_period_scenes)
+
+    bbox = BBox(west=-60.0, south=-5.0, east=-59.99, north=-4.99)
+    pre, post = await fetch_s2_pre_post_pair(
+        bbox=bbox,
+        event_date="2022-08-15",
+        n_pre=4,
+        n_post=4,
+        pre_offset_days=300,
+        post_offset_days=7,
+        period_days=30,
+    )
+
+    assert len(captured) == 2
+    pre_call, post_call = captured
+    assert pre_call["time_offset_days"] == -300
+    assert pre_call["n_periods"] == 4
+    assert post_call["time_offset_days"] == 7
+    assert post_call["n_periods"] == 4
+    assert pre_call["anchor_date"] == "2022-08-15"
+    assert post_call["anchor_date"] == "2022-08-15"
+
+    assert len(pre) == 4
+    assert len(post) == 4
+    assert pre[0].scene["id"] == "S2_PRE_0"
+    assert post[0].scene["id"] == "S2_POST_0"
+
+
 def test_s2_cache_version_tag_in_key() -> None:
     """Bumping the cache version invalidates every previous entry — the
     key must incorporate the version, not just the data inputs."""

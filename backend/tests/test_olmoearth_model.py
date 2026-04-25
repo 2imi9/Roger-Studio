@@ -87,6 +87,150 @@ def test_run_s2_inference_rejects_non_divisible_hw() -> None:
         M.run_s2_inference(dummy, bad, timestamp_dmy=(15, 6, 2024), patch_size=4)
 
 
+def test_pre_post_inference_concatenates_768_to_1536() -> None:
+    """``run_ft_pre_post_inference`` must encode pre and post stacks
+    independently and feed the head a tensor whose feature dim is
+    ``2 × encoder_dim`` — the contract the conv-pool-fc decoder of
+    ForestLossDriver was trained against.
+    """
+    import torch
+    import torch.nn as nn
+
+    from app.services import olmoearth_ft as FT
+
+    embed_dim = 8        # tiny stand-in for 768; the contract is "2D after concat"
+    num_classes = 10     # mirrors ForestLossDriver's 10-driver classification
+    patch_size = 4
+    h = w = 8            # 2 × 2 patches
+
+    captured: dict[str, torch.Tensor] = {}
+
+    class _FakeEncoder(nn.Module):
+        def forward(self, sample, fast_pass: bool = True, patch_size: int = 4):
+            # tokens_and_masks.sentinel2_l2a — shape (B, H', W', T, S, D).
+            # Use the sample's image to know T; pick S=3 to mirror the
+            # real encoder's per-band-set output.
+            t = sample.timestamps.shape[1]
+            tokens = torch.randn(1, h // patch_size, w // patch_size, t, 3, embed_dim)
+
+            class _Out:
+                pass
+
+            class _TM:
+                pass
+
+            tm = _TM()
+            tm.sentinel2_l2a = tokens
+            o = _Out()
+            o.__dict__["tokens_and_masks"] = tm  # type: ignore[attr-defined]
+
+            class _Holder(dict):
+                pass
+
+            return _Holder({"tokens_and_masks": tm})
+
+    class _FakeEncoderParent(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = _FakeEncoder()
+
+    class _FakeHead(nn.Module):
+        def forward(self, tokens_bhwtsd: torch.Tensor) -> torch.Tensor:
+            captured["head_input"] = tokens_bhwtsd
+            # Scene-level classification: (B, num_classes) logits.
+            return torch.zeros(tokens_bhwtsd.shape[0], num_classes)
+
+    spec = FT.FTHeadSpec(
+        task_type="classification",
+        num_classes=num_classes,
+        decoder_key="conv_pool_fc_classification",
+        weight_shape=(num_classes, 2 * embed_dim),
+        head_prefix="model.decoder",
+    )
+
+    fake_model = FT.FTModel(
+        encoder_parent=_FakeEncoderParent(),
+        head=_FakeHead(),
+        repo_id="allenai/OlmoEarth-v1-FT-ForestLossDriver-Base",
+        spec=spec,
+        metadata={"colormap": "forestloss", "patch_size": patch_size},
+    )
+
+    rng = np.random.default_rng(0)
+    pre = (rng.random((1, h, w, 4, 12)) * 5000).astype(np.float32)
+    post = (rng.random((1, h, w, 4, 12)) * 5000).astype(np.float32)
+
+    result = M.run_ft_pre_post_inference(
+        model=fake_model,
+        pre_image_bhwtc=pre,
+        post_image_bhwtc=post,
+        pre_timestamp_dmy=(15, 7, 2022),
+        post_timestamp_dmy=(22, 8, 2022),
+        patch_size=patch_size,
+        device=torch.device("cpu"),
+        normalize=False,
+    )
+
+    head_in = captured["head_input"]
+    # Head input must be 6D (B, H', W', T, S, D) with the LAST dim equal to
+    # 2 × embed_dim — the concatenation contract.
+    assert head_in.ndim == 6
+    assert head_in.shape[-1] == 2 * embed_dim
+    # T and S collapsed to 1 each (we pooled before concat).
+    assert head_in.shape[3] == 1
+    assert head_in.shape[4] == 1
+    # Spatial dims = h/patch_size.
+    assert head_in.shape[1] == h // patch_size
+    assert head_in.shape[2] == w // patch_size
+
+    # Result still has the FT classification shape contract.
+    assert result.task_type == "classification"
+    assert result.num_classes == num_classes
+    assert result.class_raster is not None
+    assert result.class_raster.shape == (h // patch_size, w // patch_size)
+
+
+def test_run_ft_pre_post_inference_rejects_mismatched_spatial_dims() -> None:
+    """Pre and post stacks must share H/W; if they don't, the concatenation
+    contract breaks. Surface a ValueError before the encoder runs."""
+    import torch.nn as nn
+
+    from app.services import olmoearth_ft as FT
+
+    spec = FT.FTHeadSpec(
+        task_type="classification",
+        num_classes=10,
+        decoder_key="conv_pool_fc_classification",
+        weight_shape=(10, 16),
+        head_prefix="model.decoder",
+    )
+
+    class _Stub(nn.Module):
+        pass
+
+    fake_model = FT.FTModel(
+        encoder_parent=_Stub(),
+        head=_Stub(),
+        repo_id="x",
+        spec=spec,
+        metadata={},
+    )
+
+    pre = np.zeros((1, 8, 8, 4, 12), dtype=np.float32)
+    post = np.zeros((1, 12, 12, 4, 12), dtype=np.float32)
+
+    with pytest.raises(ValueError, match="must equal post H/W"):
+        M.run_ft_pre_post_inference(
+            model=fake_model,
+            pre_image_bhwtc=pre,
+            post_image_bhwtc=post,
+            pre_timestamp_dmy=(15, 7, 2022),
+            post_timestamp_dmy=(22, 8, 2022),
+            patch_size=4,
+            normalize=False,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Network-gated: hits Hugging Face for Nano weights (~4 MB) + runs a forward.
 # ---------------------------------------------------------------------------

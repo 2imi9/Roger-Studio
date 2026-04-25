@@ -87,15 +87,14 @@ const FT_HEADS: ModelOption[] = [
     label: "Forest-loss driver",
     kind: "ft",
     task: "Driver classification (pre/post S2 pair)",
-    // Loader wired 2026-04-21 (conv_pool_fc_classification head).
-    // Weights load cleanly — the blocker is upstream: the decoder
-    // expects 1536-channel input = concatenation of pre-event + post-
-    // event Sentinel-2 feature maps (768 × 2). Our current inference
-    // pipeline fetches a single S2 composite and can't produce the
-    // required pair. Gated until we add pre/post date_range support.
-    supported: false,
-    unsupportedReason:
-      "ForestLossDriver is a pre/post change-detection head — it expects two Sentinel-2 scenes (before + after the forest-loss event) concatenated along the feature dim. The weights load fine via the new conv_pool_fc loader, but the inference pipeline only supports a single scene today. Needs pipeline support for paired dates.",
+    // Pre/post pipeline wired 2026-04-24. Backend fetches a pre group
+    // (~event - 300d, 4 scenes) and a post group (~event + 7d, 4
+    // scenes), concatenates encoder outputs along the feature dim
+    // (768 + 768 → 1536), and feeds the conv_pool_fc head. Requires the
+    // user to supply an ``event_date`` (the post-event date is the
+    // natural anchor) — surfaced as a date picker below the model
+    // selector when this head is active.
+    supported: true,
   },
   {
     repoId: "allenai/OlmoEarth-v1-FT-EcosystemTypeMapping-Base",
@@ -173,6 +172,15 @@ export function OlmoEarthImport({
   const [hfToken, setHfToken] = useState("");
   const [status, setStatus] = useState<string | null>(null);
   const [busy, setBusy] = useState<null | "infer" | "cache" | "embed" | "pca" | "sim" | "geojson">(null);
+  // Event date for pre/post change-detection FT heads (ForestLossDriver).
+  // Only surfaced when such a head is selected. Default is one year ago —
+  // recent enough to have S2 coverage on both pre and post windows, old
+  // enough that a 300-day pre offset doesn't fall outside the S2 archive.
+  const [eventDate, setEventDate] = useState<string>(() => {
+    const d = new Date();
+    d.setFullYear(d.getFullYear() - 1);
+    return d.toISOString().slice(0, 10);
+  });
   // Subtab split: Run inference vs. Embedding tools. The panel had grown to
   // 1 inference action + 3 embedding actions + 1 advanced action in a flat
   // list, which pushed the primary Run button below the fold on short
@@ -182,6 +190,10 @@ export function OlmoEarthImport({
   const selected = allOptions.find((m) => m.repoId === repoId) ?? FT_HEADS[0];
   const live = olmoCache?.[repoId];
   const cached = live?.status === "cached";
+  // Pre/post change-detection heads need an event_date. Today only
+  // ForestLossDriver fits; check by repo id rather than threading a flag
+  // through ModelOption since the list is short.
+  const isPrePostHead = selected.repoId === "allenai/OlmoEarth-v1-FT-ForestLossDriver-Base";
 
   // Embedding tools require raw per-patch vectors, which only base encoders
   // expose. When the user switches to the Embedding tab while an FT head is
@@ -199,12 +211,14 @@ export function OlmoEarthImport({
   const handleRun = async () => {
     if (!selectedArea) return;
     if (!selected.supported) return;
+    if (isPrePostHead && !eventDate) return;
     setBusy("infer");
     setStatus(null);
     try {
       const res: OlmoEarthInferenceResult = await startOlmoEarthInference({
         bbox: selectedArea,
         modelRepoId: repoId,
+        eventDate: isPrePostHead ? eventDate : undefined,
       });
       if (onAddImageryLayer) {
         onAddImageryLayer({
@@ -239,12 +253,14 @@ export function OlmoEarthImport({
     if (!selectedArea) return;
     if (selected.kind !== "ft") return;
     if (!selected.supported) return;
+    if (isPrePostHead && !eventDate) return;
     setBusy("geojson");
     setStatus("Downloading classification as GeoJSON — reuses cached inference if available, else runs a fresh job (may take a few minutes)…");
     try {
       const res = await downloadFtClassificationGeoJson({
         bbox: selectedArea,
         modelRepoId: repoId,
+        eventDate: isPrePostHead ? eventDate : undefined,
       });
       const count = res.featureCount;
       const countStr = count != null ? `${count} polygon${count === 1 ? "" : "s"}` : "polygons";
@@ -491,6 +507,34 @@ export function OlmoEarthImport({
         )}
       </div>
 
+      {/* Event date picker — only for pre/post change-detection heads
+          (ForestLossDriver today). The backend treats this as the
+          post-event anchor: pre window ~event - 300d, post window
+          ~event + 7d. Without a date the request falls back to the
+          legacy single-scene path which produces off-distribution
+          output, so we make the field required for pre/post heads. */}
+      {activeTab === "inference" && isPrePostHead && (
+        <div>
+          <span className="text-[10px] font-semibold uppercase tracking-wider text-geo-muted">
+            Event date <span className="text-geo-danger">*</span>
+          </span>
+          <input
+            type="date"
+            value={eventDate}
+            onChange={(e) => setEventDate(e.target.value)}
+            disabled={busy !== null}
+            className="w-full mt-0.5 px-2 py-1.5 text-[12px] bg-geo-surface border border-geo-border rounded focus:border-geo-accent focus:outline-none cursor-pointer"
+          />
+          <div className="mt-1 text-[10px] text-geo-muted leading-snug">
+            Approximate date of the forest-loss event. The model fetches
+            ~4 Sentinel-2 scenes from the year before (pre window,
+            ~event − 300 d) and ~4 scenes immediately after (post
+            window, ~event + 7 d). Pick a recent enough date that
+            S2 has coverage on both sides — late 2017 onward is safe.
+          </div>
+        </div>
+      )}
+
       {/* AOI status — the Run button needs a selected area. Surfacing this
           inline (rather than letting Run just no-op) avoids the "I clicked
           the button and nothing happened" reaction. */}
@@ -514,18 +558,20 @@ export function OlmoEarthImport({
         <button
           type="button"
           onClick={handleRun}
-          disabled={busy !== null || !selectedArea || !selected.supported}
+          disabled={busy !== null || !selectedArea || !selected.supported || (isPrePostHead && !eventDate)}
           className={`w-full px-3 py-2 text-[12px] font-semibold rounded border transition-colors ${
-            busy !== null || !selectedArea || !selected.supported
+            busy !== null || !selectedArea || !selected.supported || (isPrePostHead && !eventDate)
               ? "border-geo-border text-geo-muted cursor-not-allowed"
               : "border-geo-accent bg-geo-accent text-white hover:bg-geo-accent-hover cursor-pointer"
           }`}
           title={
             !selected.supported
               ? "This FT head's decoder shape isn't supported by the loader yet. Pick a supported head (Mangrove, AWF, Ecosystem, or any base encoder)."
-              : selectedArea
-                ? "Run inference on the selected area and add the result as a map layer"
-                : "Draw an area on the map first"
+              : isPrePostHead && !eventDate
+                ? "Pick an event date first — pre/post heads need it to fetch the before/after S2 pair"
+                : selectedArea
+                  ? "Run inference on the selected area and add the result as a map layer"
+                  : "Draw an area on the map first"
           }
         >
           {busy === "infer" ? "Running inference…" : "Run + add to map"}

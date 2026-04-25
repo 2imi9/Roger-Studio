@@ -150,6 +150,14 @@ class FtClassificationGeoJsonRequest(BaseModel):
             "half S2 GSD — visually identical, often 5–10× smaller GeoJSON."
         ),
     )
+    event_date: str | None = Field(
+        default=None,
+        description=(
+            "ISO date for pre/post change-detection heads (ForestLossDriver). "
+            "Plumbed into the underlying ``start_inference`` call so the cache "
+            "key matches the map-tile run with the same event."
+        ),
+    )
 
 
 _BASE_ENCODER_REPO_IDS = {
@@ -284,6 +292,7 @@ async def olmoearth_infer(request: Request, payload: dict = Body(...)) -> dict:
             max_size_px=int(payload.get("max_size_px", 256)),
             sliding_window=bool(payload.get("sliding_window", False)),
             window_size=int(payload.get("window_size", 32)),
+            event_date=payload.get("event_date") or None,
             disconnect_check=request.is_disconnected,
         )
     except AOISizeExceededError as e:
@@ -664,6 +673,7 @@ async def olmoearth_ft_classification_geojson(
             bbox=req.bbox,
             model_repo_id=req.model_repo_id,
             date_range=req.date_range,
+            event_date=req.event_date,
             disconnect_check=request.is_disconnected,
         )
     except AOISizeExceededError as e:

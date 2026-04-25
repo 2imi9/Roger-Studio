@@ -863,6 +863,50 @@ async def fetch_aoi_period_scenes(
     ]
 
 
+async def fetch_s2_pre_post_pair(
+    bbox: BBox,
+    event_date: str,
+    n_pre: int = 4,
+    n_post: int = 4,
+    pre_offset_days: int = 300,
+    post_offset_days: int = 7,
+    period_days: int = 30,
+    max_cloud_cover: float = 40.0,
+) -> tuple[list[AoiPeriodScene], list[AoiPeriodScene]]:
+    """Fetch pre-event + post-event Sentinel-2 scene pairs for change-detection FT heads.
+
+    Mirrors ForestLossDriver's training-time data spec — a pre group of
+    scenes ~``pre_offset_days`` BEFORE the event and a post group ~``post_offset_days``
+    AFTER it. Each group uses the same per-period least-cloudy search as
+    :func:`fetch_aoi_period_scenes`, just with two different anchor offsets:
+
+      * pre: anchor = event_date, time_offset_days = -pre_offset_days
+      * post: anchor = event_date, time_offset_days = +post_offset_days
+
+    Both lists are AOI-scoped (one search per period across the whole bbox);
+    per-chunk reads use :func:`fetch_s2_chunk_stack` against each list
+    independently and the caller concatenates encoder outputs along the
+    feature dim.
+    """
+    pre = await fetch_aoi_period_scenes(
+        bbox=bbox,
+        anchor_date=event_date,
+        n_periods=n_pre,
+        period_days=period_days,
+        time_offset_days=-pre_offset_days,
+        max_cloud_cover=max_cloud_cover,
+    )
+    post = await fetch_aoi_period_scenes(
+        bbox=bbox,
+        anchor_date=event_date,
+        n_periods=n_post,
+        period_days=period_days,
+        time_offset_days=post_offset_days,
+        max_cloud_cover=max_cloud_cover,
+    )
+    return pre, post
+
+
 def _read_one_band_window(
     href: str, scene_crs: Any, dst_transform: Any, out_h: int, out_w: int
 ) -> tuple[bool, np.ndarray]:

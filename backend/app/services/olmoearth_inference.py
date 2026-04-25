@@ -61,6 +61,7 @@ from app.services.sentinel2_fetch import (
     fetch_aoi_period_scenes,
     fetch_s2_chunk_stack,
     fetch_s2_composite,
+    fetch_s2_pre_post_pair,
     image_to_bhwtc,
     plan_chunks,
     resolve_aoi_grid,
@@ -320,6 +321,7 @@ async def start_inference(
     max_size_px: int = _DEFAULT_MAX_SIZE_PX,
     sliding_window: bool = False,
     window_size: int = 32,
+    event_date: str | None = None,
     _auto_retry_depth: int = 0,
     disconnect_check=None,
 ) -> dict[str, Any]:
@@ -343,6 +345,10 @@ async def start_inference(
         "max_size_px": max_size_px,
         "sliding_window": sliding_window,
         "window_size": window_size if sliding_window else None,
+        # event_date drives the pre/post split for change-detection FT
+        # heads (ForestLossDriver). Hashed into job_id so two runs with
+        # different events produce distinct cached jobs.
+        "event_date": event_date,
     }
     job_id = _make_job_id(spec)
 
@@ -390,6 +396,7 @@ async def start_inference(
         real = await _run_real_inference(
             bbox, model_repo_id, spec["date_range"], max_size_px,
             sliding_window=sliding_window, window_size=window_size,
+            event_date=event_date,
             disconnect_check=disconnect_check,
         )
     except (SentinelFetchError, Exception) as e:
@@ -961,6 +968,430 @@ async def _run_chunked_aoi_inference(
             "chunks_processed": chunks_processed,
             "chunks_failed": chunks_failed,
             "target_gsd_m": target_gsd_m,
+        },
+        "scalar_raster": global_scalar_raster,
+        "task_type": last_chunk_result.task_type,
+        "num_classes": last_chunk_result.num_classes,
+        "class_names": last_chunk_result.class_names,
+        "class_names_tentative": last_chunk_result.class_names_tentative,
+        "class_raster": final_class_raster,
+        "class_probs": (
+            last_chunk_result.class_probs.tolist()
+            if last_chunk_result.class_probs is not None else None
+        ),
+        "present_class_ids": present_class_ids,
+        "prediction_value": last_chunk_result.prediction_value,
+        "units": last_chunk_result.units,
+        "decoder_key": last_chunk_result.decoder_key,
+        "colormap_override": colormap,
+        "legend_override": legend,
+    }
+
+
+@_with_global_job_lock
+async def _run_chunked_pre_post_inference(
+    bbox: BBox,
+    model: olmoearth_ft.FTModel,
+    device: Any,
+    input_spec: dict[str, Any],
+    effective_patch: int,
+    event_date: str,
+    chunk_size_m: int = 5000,
+    target_gsd_m: float = 10.0,
+    disconnect_check=None,
+) -> dict[str, Any]:
+    """Native-resolution chunked inference for pre/post change-detection FT heads.
+
+    Mirrors :func:`_run_chunked_aoi_inference` (same chunking, safety stack,
+    circuit breaker, RAM gates) but fetches TWO scene groups per chunk —
+    pre-event and post-event — and concatenates encoder outputs along the
+    feature dim before running the head. Required by ForestLossDriver,
+    whose conv-pool-fc decoder expects 1536-channel input
+    (``2 × 768 = pre + post``).
+
+    Each chunk does roughly twice the work of the single-stack path
+    (fetch + encoder forward both run twice), so wall time is ~2× the
+    temporal-stack pipeline at the same chunk count.
+    """
+    check_memory_or_raise()
+
+    n_pre = int(input_spec.get("n_periods", 8) // 2 or 4)
+    n_post = int(input_spec.get("n_periods", 8) - n_pre or 4)
+    pre_offset_days = int(-(input_spec.get("time_offset_days") or -300)) or 300
+    post_offset_days = 7
+    period_days = 30  # CONTAINS-spec metadata says 0; we use 30-day windows for least-cloudy search
+
+    chunks = plan_chunks(bbox, chunk_size_m=chunk_size_m)
+    _mid_lat = (bbox.north + bbox.south) / 2.0
+    _m_per_deg_lon = 111_000.0 * math.cos(math.radians(_mid_lat))
+    _aoi_area_km2 = (
+        abs(bbox.east - bbox.west) * _m_per_deg_lon
+        * abs(bbox.north - bbox.south) * 111_000.0
+    ) / 1e6
+    check_aoi_size_or_raise(
+        chunks=len(chunks),
+        chunk_size_m=chunk_size_m,
+        aoi_area_km2=_aoi_area_km2,
+    )
+    logger.info(
+        "chunked pre/post inference for %s: %d chunks, n_pre=%d, n_post=%d, event=%s",
+        model.repo_id, len(chunks), n_pre, n_post, event_date,
+    )
+
+    pre_scenes, post_scenes = await fetch_s2_pre_post_pair(
+        bbox=bbox,
+        event_date=event_date,
+        n_pre=n_pre,
+        n_post=n_post,
+        pre_offset_days=pre_offset_days,
+        post_offset_days=post_offset_days,
+        period_days=period_days,
+        max_cloud_cover=40.0,
+    )
+    if all(ps.scene is None for ps in pre_scenes):
+        raise SentinelFetchError(
+            f"chunked pre/post: pre-event search returned 0 usable scenes "
+            f"across {n_pre} periods at {event_date} - {pre_offset_days}d"
+        )
+    if all(ps.scene is None for ps in post_scenes):
+        raise SentinelFetchError(
+            f"chunked pre/post: post-event search returned 0 usable scenes "
+            f"across {n_post} periods at {event_date} + {post_offset_days}d"
+        )
+
+    # Use the union of pre + post scenes to resolve a single AOI grid so
+    # both groups read the same chunk extents — the head requires identical
+    # H, W on both sides of the concat.
+    pinned_crs, global_transform, global_h, global_w = await resolve_aoi_grid(
+        bbox, list(pre_scenes) + list(post_scenes), target_gsd_m=target_gsd_m,
+    )
+
+    global_class_raster = np.zeros((global_h, global_w), dtype=np.int32)
+    global_scalar_raster = np.zeros((global_h, global_w), dtype=np.float32)
+
+    chunk_sem = asyncio.Semaphore(4)
+    _CHUNK_TIMEOUT_S = 300.0
+    _CHUNK_FAIL = object()
+
+    _BREAKER_THRESHOLD = circuit_breaker_threshold()
+    _BREAKER_MIN_TOTAL = circuit_breaker_min_total_fails()
+    _BREAKER_RATE = circuit_breaker_fail_rate_threshold()
+    breaker_state = {
+        "consecutive_fails": 0,
+        "tripped": False,
+        "successes": 0,
+        "failures": 0,
+    }
+
+    def _record_chunk_outcome(success: bool) -> None:
+        if success:
+            breaker_state["successes"] += 1
+            breaker_state["consecutive_fails"] = 0
+            return
+        breaker_state["failures"] += 1
+        breaker_state["consecutive_fails"] += 1
+        if breaker_state["tripped"]:
+            return
+        if (
+            _BREAKER_THRESHOLD > 0
+            and breaker_state["consecutive_fails"] >= _BREAKER_THRESHOLD
+        ):
+            breaker_state["tripped"] = True
+            logger.warning(
+                "circuit breaker TRIPPED (consecutive) — pre/post chunked",
+            )
+            return
+        if should_trip_fractional(
+            failures=breaker_state["failures"],
+            successes=breaker_state["successes"],
+            min_total_fails=_BREAKER_MIN_TOTAL,
+            rate_threshold=_BREAKER_RATE,
+        ):
+            breaker_state["tripped"] = True
+            logger.warning("circuit breaker TRIPPED (fractional) — pre/post chunked")
+
+    chunk_t0 = time.time()
+    chunks_done_counter = {"n": 0}
+
+    async def _process_chunk(ch_idx: int, chunk_bbox: BBox) -> Any:
+        t_chunk_start = time.time()
+        # Fetch pre + post stacks in parallel so both halves of the chunk's
+        # network bill complete in roughly one stack's wall time, not two.
+        try:
+            pre_stack, post_stack = await asyncio.gather(
+                fetch_s2_chunk_stack(
+                    chunk_bbox=chunk_bbox,
+                    period_scenes=pre_scenes,
+                    target_gsd_m=target_gsd_m,
+                    pinned_crs=pinned_crs,
+                ),
+                fetch_s2_chunk_stack(
+                    chunk_bbox=chunk_bbox,
+                    period_scenes=post_scenes,
+                    target_gsd_m=target_gsd_m,
+                    pinned_crs=pinned_crs,
+                ),
+            )
+        except SentinelFetchError as e:
+            chunks_done_counter["n"] += 1
+            logger.warning(
+                "pre/post chunk %d/%d skipped (fetch): %s",
+                ch_idx + 1, len(chunks), e,
+            )
+            return _CHUNK_FAIL
+        t_after_fetch = time.time()
+
+        # Pre and post may differ in H, W by 1 px due to floating-point
+        # bounds rounding. Crop both to the common extent before stacking.
+        ph, pw = pre_stack.stack.shape[:2]
+        qh, qw = post_stack.stack.shape[:2]
+        ch = min(ph, qh)
+        cw = min(pw, qw)
+        ch4 = (ch // effective_patch) * effective_patch
+        cw4 = (cw // effective_patch) * effective_patch
+        if ch4 == 0 or cw4 == 0:
+            logger.warning(
+                "pre/post chunk %d/%d too small for patch=%d (pre=%s post=%s)",
+                ch_idx + 1, len(chunks), effective_patch,
+                pre_stack.stack.shape, post_stack.stack.shape,
+            )
+            return _CHUNK_FAIL
+
+        pre_image = stack_to_bhwtc(pre_stack.stack[:ch4, :cw4, :, :])
+        post_image = stack_to_bhwtc(post_stack.stack[:ch4, :cw4, :, :])
+
+        try:
+            chunk_result = await asyncio.to_thread(
+                olmoearth_model.run_ft_pre_post_inference,
+                model,
+                pre_image,
+                post_image,
+                pre_stack.timestamps,
+                post_stack.timestamps,
+                effective_patch,
+                device,
+            )
+        except Exception as e:
+            logger.warning("pre/post chunk %d/%d inference failed: %s", ch_idx + 1, len(chunks), e)
+            return _CHUNK_FAIL
+
+        chunk_scalar_hi = np.repeat(
+            np.repeat(chunk_result.scalar, effective_patch, axis=0),
+            effective_patch, axis=1,
+        )
+        chunk_class_hi: np.ndarray | None = None
+        if chunk_result.class_raster is not None:
+            chunk_class_hi = np.repeat(
+                np.repeat(chunk_result.class_raster, effective_patch, axis=0),
+                effective_patch, axis=1,
+            )
+
+        chunk_west = pre_stack.transform.c
+        chunk_north = pre_stack.transform.f
+        col_offset = int(round((chunk_west - global_transform.c) / target_gsd_m))
+        row_offset = int(round((global_transform.f - chunk_north) / target_gsd_m))
+
+        if row_offset < 0 or col_offset < 0:
+            logger.warning(
+                "pre/post chunk %d/%d negative offset (row=%d col=%d) — skipping",
+                ch_idx + 1, len(chunks), row_offset, col_offset,
+            )
+            return _CHUNK_FAIL
+        h_to_paste = min(ch4, global_h - row_offset)
+        w_to_paste = min(cw4, global_w - col_offset)
+        if h_to_paste <= 0 or w_to_paste <= 0:
+            return _CHUNK_FAIL
+
+        chunks_done_counter["n"] += 1
+        t_total = time.time() - t_chunk_start
+        t_fetch = t_after_fetch - t_chunk_start
+        logger.info(
+            "pre/post chunk %d/%d done in %.1fs (fetch=%.1fs, fwd=%.1fs)",
+            ch_idx + 1, len(chunks), t_total, t_fetch, t_total - t_fetch,
+        )
+        return {
+            "scalar_hi": chunk_scalar_hi,
+            "class_hi": chunk_class_hi,
+            "row_offset": row_offset,
+            "col_offset": col_offset,
+            "h_to_paste": h_to_paste,
+            "w_to_paste": w_to_paste,
+            "result": chunk_result,
+        }
+
+    async def _process_chunk_bounded(ch_idx: int, chunk_bbox: BBox) -> Any:
+        if breaker_state["tripped"]:
+            return _CHUNK_FAIL
+        async with chunk_sem:
+            if breaker_state["tripped"]:
+                return _CHUNK_FAIL
+            ram_ok, ram_status = await asyncio.to_thread(chunk_ram_ok)
+            if not ram_ok:
+                chunks_done_counter["n"] += 1
+                logger.warning(
+                    "pre/post chunk %d/%d skipped — RAM gate (%s)",
+                    ch_idx + 1, len(chunks), ram_status.describe(),
+                )
+                _record_chunk_outcome(success=False)
+                return _CHUNK_FAIL
+            try:
+                result = await asyncio.wait_for(
+                    _process_chunk(ch_idx, chunk_bbox), timeout=_CHUNK_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                chunks_done_counter["n"] += 1
+                logger.warning("pre/post chunk %d/%d TIMED OUT", ch_idx + 1, len(chunks))
+                _record_chunk_outcome(success=False)
+                return _CHUNK_FAIL
+            else:
+                _record_chunk_outcome(success=result is not _CHUNK_FAIL)
+                return result
+
+    async def _heartbeat() -> None:
+        while True:
+            await asyncio.sleep(30.0)
+            done = chunks_done_counter["n"]
+            elapsed = time.time() - chunk_t0
+            logger.info(
+                "pre/post heartbeat: %d/%d chunks done, %.0fs elapsed",
+                done, len(chunks), elapsed,
+            )
+
+    heartbeat_task = asyncio.create_task(_heartbeat())
+
+    async def _gather_chunks():
+        return await asyncio.gather(
+            *[_process_chunk_bounded(i, c) for i, c in enumerate(chunks)]
+        )
+
+    gather_task = asyncio.create_task(_gather_chunks())
+    disconnect_task = (
+        asyncio.create_task(_watch_for_disconnect(disconnect_check, gather_task))
+        if disconnect_check is not None else None
+    )
+    try:
+        try:
+            chunk_records = await gather_task
+        except asyncio.CancelledError:
+            if (
+                disconnect_task is not None
+                and disconnect_task.done()
+                and not disconnect_task.cancelled()
+            ):
+                raise ClientDisconnectedError(
+                    "client closed connection during pre/post inference; "
+                    f"in-flight chunks cancelled "
+                    f"(processed={breaker_state['successes']}, "
+                    f"failed={breaker_state['failures']}, total={len(chunks)})"
+                )
+            raise
+    finally:
+        heartbeat_task.cancel()
+        if disconnect_task is not None:
+            disconnect_task.cancel()
+        for _t in (heartbeat_task, disconnect_task):
+            if _t is None:
+                continue
+            try:
+                await _t
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    if breaker_state["tripped"]:
+        raise CircuitBreakerTrippedError(
+            processed=breaker_state["successes"],
+            failed=breaker_state["failures"],
+            total=len(chunks),
+            threshold=_BREAKER_THRESHOLD,
+        )
+
+    last_chunk_result = None
+    chunks_processed = 0
+    chunks_failed = 0
+    for record in chunk_records:
+        if record is _CHUNK_FAIL:
+            chunks_failed += 1
+            continue
+        global_scalar_raster[
+            record["row_offset"]:record["row_offset"] + record["h_to_paste"],
+            record["col_offset"]:record["col_offset"] + record["w_to_paste"],
+        ] = record["scalar_hi"][:record["h_to_paste"], :record["w_to_paste"]]
+        if record["class_hi"] is not None:
+            global_class_raster[
+                record["row_offset"]:record["row_offset"] + record["h_to_paste"],
+                record["col_offset"]:record["col_offset"] + record["w_to_paste"],
+            ] = record["class_hi"][:record["h_to_paste"], :record["w_to_paste"]]
+        last_chunk_result = record["result"]
+        chunks_processed += 1
+
+    if chunks_processed == 0:
+        raise SentinelFetchError(
+            f"all {len(chunks)} pre/post chunks failed during inference"
+        )
+    assert last_chunk_result is not None
+
+    final_class_raster = global_class_raster if (
+        last_chunk_result.class_raster is not None
+    ) else None
+    colormap = last_chunk_result.colormap
+    legend = _build_ft_legend(last_chunk_result)
+
+    present_class_ids: list[int] | None = None
+    if final_class_raster is not None:
+        uniq = np.unique(final_class_raster).astype(int)
+        uniq = uniq[(uniq >= 0) & (uniq < last_chunk_result.num_classes)]
+        present_class_ids = uniq.tolist()[:256]
+
+    # Most recent post-event scene as the "primary" scene metadata (matches
+    # the user's mental model — "what does the post-event imagery show").
+    recent_post_idx = next(
+        (i for i in range(n_post - 1, -1, -1) if post_scenes[i].scene is not None),
+        n_post - 1,
+    )
+    recent_scene = post_scenes[recent_post_idx].scene or {}
+
+    return {
+        "raster_transform": global_transform,
+        "raster_crs": pinned_crs,
+        "raster_height": int(global_h),
+        "raster_width": int(global_w),
+        "scene_id": recent_scene.get("id"),
+        "scene_datetime": recent_scene.get("datetime"),
+        "scene_cloud_cover": recent_scene.get("eo:cloud_cover")
+            or recent_scene.get("cloud_cover"),
+        "patch_size": effective_patch,
+        "sliding_window": False,
+        "window_size": None,
+        "temporal_stack": {
+            "n_periods": n_pre + n_post,
+            "n_pre": n_pre,
+            "n_post": n_post,
+            "event_date": event_date,
+            "periods_used": int(
+                sum(1 for ps in list(pre_scenes) + list(post_scenes) if ps.scene is not None)
+            ),
+            "periods_skipped": int(
+                sum(1 for ps in list(pre_scenes) + list(post_scenes) if ps.scene is None)
+            ),
+            "pre_scene_ids": [
+                ps.scene.get("id") if ps.scene else None for ps in pre_scenes
+            ],
+            "pre_scene_datetimes": [
+                ps.scene.get("datetime") if ps.scene else None for ps in pre_scenes
+            ],
+            "post_scene_ids": [
+                ps.scene.get("id") if ps.scene else None for ps in post_scenes
+            ],
+            "post_scene_datetimes": [
+                ps.scene.get("datetime") if ps.scene else None for ps in post_scenes
+            ],
+            "chunked": True,
+            "chunk_size_m": chunk_size_m,
+            "chunks_total": len(chunks),
+            "chunks_processed": chunks_processed,
+            "chunks_failed": chunks_failed,
+            "target_gsd_m": target_gsd_m,
+            "pre_post_split": True,
         },
         "scalar_raster": global_scalar_raster,
         "task_type": last_chunk_result.task_type,
@@ -1865,25 +2296,30 @@ async def _run_real_inference(
     max_size_px: int,
     sliding_window: bool = False,
     window_size: int = 32,
+    event_date: str | None = None,
     disconnect_check=None,
 ) -> dict[str, Any]:
     """Fetch S2 composite + run forward pass (encoder or full FT model).
 
-    Two fetch paths, chosen by the FT head's declared ``input_spec``:
+    Three fetch paths, chosen by the FT head's declared ``input_spec``:
 
-      1. **Temporal stack** (most FT heads) — when the head was trained on
+      1. **Pre/post pair** (ForestLossDriver) — when ``pre_post_split`` is
+         set AND the caller provided an ``event_date``, we fetch two AOI-
+         scope groups of scenes (pre window ~``-300d``, post window
+         ~``+7d``), encode each independently, concatenate features along
+         the channel dim (768 + 768 → 1536), and feed the resulting
+         tensor to the conv-pool-fc head.
+
+      2. **Temporal stack** (most FT heads) — when the head was trained on
          PER_PERIOD_MOSAIC layers (Ecosystem / AWF / Mangrove), we fetch
          ``n_periods`` sequential 30-day mosaics ending at ``date_range``
-         and stack them along T. This matches the training distribution;
-         feeding the head a single scene produces the well-documented
-         "one class everywhere" collapse we see in the ecosystem output
-         over Tunisia.
+         and stack them along T.
 
-      2. **Legacy single scene** — for base encoders, unknown repos, and
+      3. **Legacy single scene** — for base encoders, unknown repos, and
          FT heads with input_spec flags we can't satisfy yet (LFMC needs
-         S1; ForestLossDriver needs a pre/post pair with CONTAINS mode).
-         We log a known-broken warning for the latter so users aren't
-         surprised when output looks degenerate.
+         S1; ForestLossDriver without an ``event_date``). We log a known-
+         broken warning for the latter so users aren't surprised when
+         output looks degenerate.
     """
     # Load the model up-front so we can query its input_spec + patch_size.
     model, device = await asyncio.to_thread(olmoearth_model.load_encoder, model_repo_id)
@@ -1895,6 +2331,13 @@ async def _run_real_inference(
     else:
         effective_patch = _PATCH_SIZE
 
+    use_pre_post = bool(
+        input_spec
+        and input_spec.get("pre_post_split")
+        and event_date
+        and not input_spec.get("s1_required")
+    )
+
     use_temporal = bool(
         input_spec
         and input_spec.get("n_periods", 1) > 1
@@ -1902,17 +2345,33 @@ async def _run_real_inference(
         and not input_spec.get("pre_post_split")
     )
 
-    if input_spec and (input_spec.get("s1_required") or input_spec.get("pre_post_split")):
-        # Dispatcher knows this head is architecturally mismatched with the
-        # current S2-only single-scene fallback. Users see the warning
-        # surfaced via ``notes`` in the response; output will still render
-        # but predictions are unreliable until the multi-modal / pre-post
-        # fetch paths land.
+    if input_spec and input_spec.get("pre_post_split") and not event_date:
+        # User picked a pre/post head but didn't supply an event_date — the
+        # change-detection pipeline can't run without it. Log and fall
+        # through to the legacy single-scene path so the request still
+        # produces *some* output rather than 500ing.
         logger.warning(
-            "inference %s requires %s — falling back to legacy S2-only "
+            "inference %s requires pre/post pair but event_date is missing — "
+            "falling back to legacy single-scene path; output will be off-distribution",
+            model_repo_id,
+        )
+    elif input_spec and input_spec.get("s1_required"):
+        logger.warning(
+            "inference %s requires sentinel1 — falling back to legacy S2-only "
             "single-scene path; output will be off-distribution",
             model_repo_id,
-            "sentinel1" if input_spec.get("s1_required") else "pre/post pair",
+        )
+
+    if use_pre_post:
+        assert isinstance(model, olmoearth_ft.FTModel)
+        return await _run_chunked_pre_post_inference(
+            bbox=bbox,
+            model=model,
+            device=device,
+            input_spec=input_spec,
+            effective_patch=effective_patch,
+            event_date=event_date,
+            disconnect_check=disconnect_check,
         )
 
     # Temporal-path FT heads route to the chunked native-resolution

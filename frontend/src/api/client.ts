@@ -779,6 +779,11 @@ export async function startOlmoEarthInference(args: {
   dateRange?: string;
   slidingWindow?: boolean;
   windowSize?: number;
+  /** ISO date (YYYY-MM-DD) of the event for pre/post change-detection
+   * heads (ForestLossDriver). When set, the backend fetches a pre group
+   * (~event - 300d) and a post group (~event + 7d) and concatenates
+   * encoder outputs along the feature dim. Ignored by other heads. */
+  eventDate?: string;
 }): Promise<OlmoEarthInferenceResult> {
   // No client-side timeout — chunked native-resolution inference can
   // legitimately run multi-minute on slow connections / large AOIs.
@@ -792,6 +797,7 @@ export async function startOlmoEarthInference(args: {
       date_range: args.dateRange,
       sliding_window: args.slidingWindow,
       window_size: args.windowSize,
+      event_date: args.eventDate,
     }),
   });
 }
@@ -1007,6 +1013,11 @@ export interface FtClassificationGeoJsonArgs {
   /** Douglas–Peucker tolerance in meters. Default 5 m (half S2 GSD).
    *  0 disables, keeping every vertex. */
   simplifyToleranceM?: number;
+  /** ISO date for pre/post change-detection heads (ForestLossDriver).
+   *  Threaded through to the underlying ``start_inference`` call so the
+   *  GeoJSON export reuses the same cached job as the map-tile run with
+   *  the matching event_date. Ignored by other heads. */
+  eventDate?: string;
 }
 
 export interface FtClassificationGeoJsonResult {
@@ -1027,6 +1038,7 @@ export async function downloadFtClassificationGeoJson(
     date_range: args.dateRange ?? undefined,
     min_pixels: args.minPixels ?? 4,
     simplify_tolerance_m: args.simplifyToleranceM ?? 5.0,
+    event_date: args.eventDate,
   });
 
   const res = await fetch(`${BASE}/olmoearth/ft-classification/geojson`, {

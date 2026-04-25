@@ -62,6 +62,174 @@ def test_interp_color_linear() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pre_post_branch_dispatches_on_input_spec_flag() -> None:
+    """When the loaded FT head declares ``pre_post_split=True`` AND the
+    caller supplies an ``event_date``, the dispatcher must route through
+    ``_run_chunked_pre_post_inference`` instead of the legacy single-scene
+    or temporal-stack paths.
+
+    Without ``event_date`` the head should fall through to the legacy
+    path with a warning (preserving backward compatibility).
+    """
+    from app.services import olmoearth_ft as FT
+    from app.services import olmoearth_model as M
+
+    bbox = BBox(west=-60.0, south=-5.0, east=-59.99, north=-4.99)
+    pre_post_called: dict[str, dict] = {}
+    legacy_called = {"n": 0}
+
+    spec = FT.FTHeadSpec(
+        task_type="classification",
+        num_classes=10,
+        decoder_key="conv_pool_fc_classification",
+        weight_shape=(10, 1536),
+        head_prefix="model.decoder",
+    )
+    fake_metadata = {
+        "patch_size": 4,
+        "colormap": "forestloss",
+        "input_spec": {
+            "n_periods": 8,
+            "period_days": 0,
+            "time_offset_days": -300,
+            "s1_required": False,
+            "pre_post_split": True,
+        },
+    }
+
+    class _Stub:
+        pass
+
+    fake_ft_model = FT.FTModel(
+        encoder_parent=_Stub(),
+        head=_Stub(),
+        repo_id="allenai/OlmoEarth-v1-FT-ForestLossDriver-Base",
+        spec=spec,
+        metadata=fake_metadata,
+    )
+
+    def _fake_load_encoder(repo_id):
+        import torch
+        return fake_ft_model, torch.device("cpu")
+
+    async def _fake_pre_post(*, bbox, model, device, input_spec, effective_patch, event_date, **kwargs):
+        pre_post_called["args"] = {
+            "event_date": event_date,
+            "input_spec": dict(input_spec),
+        }
+        return {
+            "raster_transform": None,
+            "raster_crs": None,
+            "raster_height": 32,
+            "raster_width": 32,
+            "scene_id": "S2_FAKE_POST",
+            "scene_datetime": "2022-08-22T00:00:00Z",
+            "scene_cloud_cover": 0.0,
+            "patch_size": 4,
+            "sliding_window": False,
+            "window_size": None,
+            "temporal_stack": {"pre_post_split": True},
+            "scalar_raster": np.zeros((32, 32), dtype=np.float32),
+            "task_type": "classification",
+            "num_classes": 10,
+            "class_names": [],
+            "class_names_tentative": False,
+            "class_raster": np.zeros((32, 32), dtype=np.int32),
+            "class_probs": [0.0] * 10,
+            "present_class_ids": [0],
+            "prediction_value": None,
+            "units": None,
+            "decoder_key": "conv_pool_fc_classification",
+            "colormap_override": "forestloss",
+            "legend_override": {},
+        }
+
+    async def _fake_legacy_fetch(**_kwargs):
+        legacy_called["n"] += 1
+        raise SentinelFetchError("legacy path should not have run")
+
+    import numpy as np  # noqa: PLC0415
+    with patch.object(M, "load_encoder", _fake_load_encoder), \
+         patch.object(OI, "_run_chunked_pre_post_inference", _fake_pre_post), \
+         patch.object(OI, "fetch_s2_composite", _fake_legacy_fetch):
+        # WITH event_date → pre/post branch fires.
+        resp = await OI.start_inference(
+            bbox=bbox,
+            model_repo_id="allenai/OlmoEarth-v1-FT-ForestLossDriver-Base",
+            event_date="2022-08-15",
+        )
+
+    assert "args" in pre_post_called
+    assert pre_post_called["args"]["event_date"] == "2022-08-15"
+    assert pre_post_called["args"]["input_spec"]["pre_post_split"] is True
+    assert legacy_called["n"] == 0
+    assert resp["kind"] == "pytorch"
+    assert resp["status"] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_pre_post_head_without_event_date_falls_back_to_legacy() -> None:
+    """A pre/post head without an ``event_date`` must NOT call the
+    pre/post orchestrator (the function would raise without a date) —
+    instead the dispatcher falls through to the legacy single-scene path.
+    Verifies the safety net the warning log promises."""
+    from app.services import olmoearth_ft as FT
+    from app.services import olmoearth_model as M
+
+    bbox = BBox(west=-60.0, south=-5.0, east=-59.99, north=-4.99)
+    pre_post_called = {"n": 0}
+
+    spec = FT.FTHeadSpec(
+        task_type="classification",
+        num_classes=10,
+        decoder_key="conv_pool_fc_classification",
+        weight_shape=(10, 1536),
+        head_prefix="model.decoder",
+    )
+
+    class _Stub:
+        pass
+
+    fake_ft_model = FT.FTModel(
+        encoder_parent=_Stub(),
+        head=_Stub(),
+        repo_id="allenai/OlmoEarth-v1-FT-ForestLossDriver-Base",
+        spec=spec,
+        metadata={
+            "patch_size": 4,
+            "input_spec": {"n_periods": 8, "pre_post_split": True},
+        },
+    )
+
+    def _fake_load_encoder(repo_id):
+        import torch
+        return fake_ft_model, torch.device("cpu")
+
+    async def _fake_pre_post(**kwargs):
+        pre_post_called["n"] += 1
+        raise AssertionError("pre/post branch should not have fired")
+
+    # Force the legacy path to fail fast so the test doesn't try to fetch
+    # real S2 data — the kind="stub" outcome still proves the dispatcher
+    # routed through the legacy path.
+    async def _fake_legacy_fetch(**_kwargs):
+        raise SentinelFetchError("legacy path stubbed for test")
+
+    with patch.object(M, "load_encoder", _fake_load_encoder), \
+         patch.object(OI, "_run_chunked_pre_post_inference", _fake_pre_post), \
+         patch.object(OI, "fetch_s2_composite", _fake_legacy_fetch):
+        resp = await OI.start_inference(
+            bbox=bbox,
+            model_repo_id="allenai/OlmoEarth-v1-FT-ForestLossDriver-Base",
+            # event_date deliberately omitted
+        )
+
+    assert pre_post_called["n"] == 0
+    # Legacy path was attempted (we forced it to fail → stub).
+    assert resp["kind"] == "stub"
+
+
+@pytest.mark.asyncio
 async def test_start_inference_falls_back_to_stub_on_fetch_failure() -> None:
     """Real-path pre-failure -> the stub path is still served, with a reason."""
     bbox = BBox(west=-122.35, south=47.60, east=-122.32, north=47.63)

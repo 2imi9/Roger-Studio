@@ -672,6 +672,193 @@ def run_ft_inference(
     )
 
 
+def run_ft_pre_post_inference(
+    model: FTModel,
+    pre_image_bhwtc: np.ndarray,
+    post_image_bhwtc: np.ndarray,
+    pre_timestamp_dmy: tuple[int, int, int] | list[tuple[int, int, int]],
+    post_timestamp_dmy: tuple[int, int, int] | list[tuple[int, int, int]],
+    patch_size: int = 4,
+    device: torch.device | None = None,
+    normalize: bool = True,
+) -> FTInferenceResult:
+    """Pre/post change-detection forward pass for ForestLossDriver-style heads.
+
+    The decoder expects 1536-channel features = concat([pre_768, post_768]).
+    We mirror rslearn's ``SimpleTimeSeries(groups=[[0],[1]])`` wrapper:
+
+      1. Encode pre stack independently → tokens_pre (1, H', W', T_pre, S, 768)
+      2. Encode post stack independently → tokens_post (1, H', W', T_post, S, 768)
+      3. Pool each over (T, S) so per-group features are time-averaged
+      4. Concatenate along the feature dim → (1, H', W', 1536)
+      5. Add length-1 T and S dims and feed to ``model.head`` directly,
+         bypassing FTModel.forward (which would re-run the encoder)
+
+    The post-processing path (regression / classification / segmentation)
+    matches :func:`run_ft_inference` 1:1.
+    """
+    for name, arr in (("pre", pre_image_bhwtc), ("post", post_image_bhwtc)):
+        if arr.ndim != 5 or arr.shape[0] != 1:
+            raise ValueError(f"expected {name} BHWTC with B=1, got shape {arr.shape}")
+        if arr.shape[-1] != 12:
+            raise ValueError(f"{name} S2 needs 12 bands, got C={arr.shape[-1]}")
+    if pre_image_bhwtc.shape[1:3] != post_image_bhwtc.shape[1:3]:
+        raise ValueError(
+            f"pre H/W {pre_image_bhwtc.shape[1:3]} must equal post H/W "
+            f"{post_image_bhwtc.shape[1:3]} — pre/post stacks must share spatial grid"
+        )
+    _, h, w, t_pre, _ = pre_image_bhwtc.shape
+    t_post = post_image_bhwtc.shape[3]
+    if h % patch_size != 0 or w % patch_size != 0:
+        raise ValueError(
+            f"image H={h} W={w} must be divisible by patch_size={patch_size}"
+        )
+
+    target_device = device or model.device
+
+    def _encode(img_bhwtc: np.ndarray, ts_in: Any) -> torch.Tensor:
+        t_dim = img_bhwtc.shape[3]
+        ts_list = _normalize_timestamps(ts_in, t_dim)
+        img = img_bhwtc
+        if normalize:
+            _assert_s2_reflectance(img)
+            img = _normalizer.normalize(Modality.SENTINEL2_L2A, img)
+            if not np.isfinite(img).all():
+                raise ValueError(
+                    "Sentinel-2 normalization produced non-finite values — "
+                    "bug in olmoearth_pretrain.Normalizer or its COMPUTED stats."
+                )
+        img_t = torch.as_tensor(img, dtype=torch.float32, device=target_device)
+        mask = torch.full(
+            (1, h, w, t_dim, 3),
+            float(MaskValue.ONLINE_ENCODER.value),
+            dtype=torch.float32,
+            device=target_device,
+        )
+        ts = torch.tensor(
+            [[[int(d), int(m), int(y)] for d, m, y in ts_list]],
+            dtype=torch.long,
+            device=target_device,
+        )
+        sample = MaskedOlmoEarthSample(
+            sentinel2_l2a=img_t,
+            sentinel2_l2a_mask=mask,
+            timestamps=ts,
+        )
+        with torch.no_grad():
+            out = model.encoder_parent.encoder(
+                sample, fast_pass=True, patch_size=patch_size,
+            )
+        # (1, H', W', T, S, D)
+        return out["tokens_and_masks"].sentinel2_l2a
+
+    tokens_pre = _encode(pre_image_bhwtc, pre_timestamp_dmy)
+    tokens_post = _encode(post_image_bhwtc, post_timestamp_dmy)
+
+    # Pool T and S so each group collapses to (1, H', W', D), then concat
+    # along D so the head sees (1, H', W', 1, 1, 2D) — matches the decoder's
+    # expected 1536-channel input.
+    pre_pooled = tokens_pre.mean(dim=(3, 4))    # (1, H', W', D)
+    post_pooled = tokens_post.mean(dim=(3, 4))  # (1, H', W', D)
+    combined = torch.cat([pre_pooled, post_pooled], dim=-1)  # (1, H', W', 2D)
+    tokens_in = combined.unsqueeze(3).unsqueeze(4)  # (1, H', W', 1, 1, 2D)
+
+    with torch.no_grad():
+        logits = model.head(tokens_in)
+
+    spec = model.spec
+    md = model.metadata or {}
+    class_names, tentative = olmoearth_ft.class_names_for(model.repo_id, spec.num_classes)
+    class_colors = olmoearth_ft.class_colors_for(model.repo_id, spec.num_classes)
+
+    hi_h = h // patch_size
+    hi_w = w // patch_size
+
+    if spec.task_type == "regression":
+        # Regression in pre/post mode is unusual but handled symmetrically
+        # with run_ft_inference for shape-correctness. ForestLossDriver
+        # itself is classification, so this branch is defensive.
+        pred_t = logits.detach().cpu().numpy()
+        vr = md.get("value_range") or [0.0, 1.0]
+        lo, hi = float(vr[0]), float(vr[1])
+        denom = max(1e-9, hi - lo)
+        if pred_t.ndim >= 3:
+            arr = pred_t[0]
+            if arr.ndim == 3 and arr.shape[0] == 1:
+                arr = arr[0]
+            normed = np.clip((arr.astype(np.float32) - lo) / denom, 0.0, 1.0)
+            scalar = _resize_nearest(normed, (hi_h, hi_w))
+            pred = float(arr.reshape(-1).mean())
+        else:
+            pred = float(pred_t.reshape(-1)[0])
+            scalar_val = max(0.0, min(1.0, (pred - lo) / denom))
+            scalar = np.full((hi_h, hi_w), scalar_val, dtype=np.float32)
+        return FTInferenceResult(
+            task_type="regression",
+            scalar=scalar,
+            class_raster=None,
+            class_probs=None,
+            class_names=class_names,
+            class_names_tentative=tentative,
+            class_colors=class_colors,
+            colormap=md.get("colormap", "embedding"),
+            units=md.get("units"),
+            prediction_value=pred,
+            num_classes=spec.num_classes,
+            patch_size=patch_size,
+            repo_id=model.repo_id,
+            decoder_key=spec.decoder_key,
+        )
+
+    if spec.task_type == "classification":
+        # Scene-level: head returns (B, num_classes) logits.
+        import torch.nn.functional as F  # noqa: PLC0415
+        probs_t = F.softmax(logits, dim=-1)
+        probs = probs_t.detach().cpu().numpy().reshape(-1).astype(np.float32)
+        argmax = int(probs.argmax())
+        scalar = np.full((hi_h, hi_w), float(probs[argmax]), dtype=np.float32)
+        class_raster = np.full((hi_h, hi_w), argmax, dtype=np.int32)
+        return FTInferenceResult(
+            task_type="classification",
+            scalar=scalar,
+            class_raster=class_raster,
+            class_probs=probs,
+            class_names=class_names,
+            class_names_tentative=tentative,
+            class_colors=class_colors,
+            colormap=md.get("colormap", "embedding"),
+            units=md.get("units"),
+            prediction_value=None,
+            num_classes=spec.num_classes,
+            patch_size=patch_size,
+            repo_id=model.repo_id,
+            decoder_key=spec.decoder_key,
+        )
+
+    # Segmentation — defensive parity with run_ft_inference.
+    import torch.nn.functional as F  # noqa: PLC0415
+    probs_t = F.softmax(logits, dim=1)
+    probs = probs_t.detach().cpu().numpy()[0].astype(np.float32)
+    class_raster_seg = probs.argmax(axis=0).astype(np.int32)
+    max_prob = probs.max(axis=0).astype(np.float32)
+    return FTInferenceResult(
+        task_type="segmentation",
+        scalar=max_prob,
+        class_raster=class_raster_seg,
+        class_probs=None,
+        class_names=class_names,
+        class_names_tentative=tentative,
+        class_colors=class_colors,
+        colormap=md.get("colormap", "embedding"),
+        units=md.get("units"),
+        prediction_value=None,
+        num_classes=spec.num_classes,
+        patch_size=patch_size,
+        repo_id=model.repo_id,
+        decoder_key=spec.decoder_key,
+    )
+
+
 def run_ft_tiled_inference(
     model: FTModel,
     image_bhwtc: np.ndarray,
