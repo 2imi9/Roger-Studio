@@ -513,13 +513,22 @@ export function OlmoEarthImport({
           the model selector on this tab already hides FT heads. */}
       {activeTab === "embedding" && selected.kind === "base" && (
         <>
-          {/* PCA false-color — primary in-UI embedding tool. Adds a real
-              map layer (no download, no extra app). Works globally —
-              meaningful structure anywhere on Earth, including regions
-              the FT heads can't classify. */}
+          {/* Order matters here. We deliberately put Similarity first and
+              Export second — those are the workflows scientists actually
+              use to produce results. PCA false-color is demoted to an
+              "advanced" collapsed section because, while it makes a
+              colorful map, the colors aren't comparable across runs (each
+              call computes a fresh per-chunk PCA basis) and don't map to
+              named classes. PCA's job is "encoder sanity check" + "where
+              should I draw labels", not "the answer". */}
+
+          {/* PRIMARY: Similarity search — interpretable, query-driven, the
+              most direct path from "I drew an AOI" to "show me more like
+              the centre". v1 uses AOI center as the query; click-on-map
+              pixel-pick ships in the next pass. */}
           <button
             type="button"
-            onClick={handlePCARgb}
+            onClick={handleSimilarity}
             disabled={busy !== null || !selectedArea}
             className={`w-full px-3 py-2 text-[12px] font-semibold rounded border transition-colors ${
               busy !== null || !selectedArea
@@ -528,45 +537,21 @@ export function OlmoEarthImport({
             }`}
             title={
               selectedArea
-                ? "Compute embeddings + map top-3 PCA components to RGB, then add as a map layer. Same chunked pipeline as inference, no download."
-                : "Draw an area on the map first"
-            }
-          >
-            {busy === "pca" ? "Computing PCA false-color…" : "PCA false-color (embedding tool)"}
-          </button>
-          <div className="text-[10px] text-geo-muted leading-snug -mt-1">
-            Top-3 principal components of the per-patch embedding mapped
-            to R/G/B. Similar embeddings get similar colors automatically
-            — works globally, no labels required.
-          </div>
-
-          {/* Similarity search — v1 uses AOI center as the query.
-              Pixel-pick upgrade (click-on-map) ships in the next pass. */}
-          <button
-            type="button"
-            onClick={handleSimilarity}
-            disabled={busy !== null || !selectedArea}
-            className={`w-full px-3 py-2 text-[12px] font-semibold rounded border transition-colors ${
-              busy !== null || !selectedArea
-                ? "border-geo-border text-geo-muted cursor-not-allowed"
-                : "border-geo-accent text-geo-accent hover:bg-geo-accent hover:text-white cursor-pointer"
-            }`}
-            title={
-              selectedArea
                 ? "Compute embeddings + cosine-similarity heatmap vs the AOI center. Bright = looks like the middle of your area."
                 : "Draw an area on the map first"
             }
           >
-            {busy === "sim" ? "Computing similarity…" : "Similarity to AOI center (embedding tool)"}
+            {busy === "sim" ? "Computing similarity…" : "Similarity to AOI center"}
           </button>
           <div className="text-[10px] text-geo-muted leading-snug -mt-1">
             Cosine similarity heatmap to the embedding at your AOI center.
-            Find more pixels that "look like" your reference — works
-            globally, no labels required. Pixel-pick UI ships next.
+            Bright pixels look like the middle of your area — directly
+            interpretable. Pixel-pick UI ships next.
           </div>
 
-          {/* Export as COG — offline analysis path. Use when you want
-              to do downstream work in QGIS / sklearn / a notebook. */}
+          {/* SECONDARY: Export as COG — the science-grade exit. Once the
+              user has labels, they want this output to feed sklearn /
+              QGIS / a notebook for proper supervised analysis. */}
           <button
             type="button"
             onClick={handleExportEmbedding}
@@ -590,6 +575,43 @@ export function OlmoEarthImport({
             from <code className="font-mono">olmoearth_pretrain</code> for
             similarity search, few-shot segmentation, or change detection.
           </div>
+
+          {/* TERTIARY: PCA false-color — kept for encoder QA + label-
+              picking, but collapsed by default so it doesn't crowd the
+              real workflows. Caveat in the body makes its limits clear. */}
+          <details className="border border-geo-border rounded">
+            <summary className="px-2 py-1.5 text-[11px] cursor-pointer hover:bg-geo-bg/60">
+              Advanced: encoder sanity check (PCA false-color)
+            </summary>
+            <div className="p-2 space-y-2 border-t border-geo-border">
+              <button
+                type="button"
+                onClick={handlePCARgb}
+                disabled={busy !== null || !selectedArea}
+                className={`w-full px-3 py-1.5 text-[11px] font-semibold rounded border transition-colors ${
+                  busy !== null || !selectedArea
+                    ? "border-geo-border text-geo-muted cursor-not-allowed"
+                    : "border-geo-border text-geo-text hover:border-geo-accent hover:text-geo-accent cursor-pointer"
+                }`}
+                title={
+                  selectedArea
+                    ? "Sanity-check the encoder by mapping top-3 embedding PCs to RGB. Useful for spotting where to draw labels; NOT a classification."
+                    : "Draw an area on the map first"
+                }
+              >
+                {busy === "pca" ? "Computing PCA false-color…" : "Run PCA false-color"}
+              </button>
+              <div className="text-[10px] text-geo-muted leading-snug">
+                Top-3 PCs of the per-patch embedding → R/G/B. Useful for
+                eyeballing landscape diversity and deciding where to draw
+                labels.{" "}
+                <b>Not a classification</b> — colors aren't stable across
+                runs (per-chunk PCA basis), and visible chunk seams are
+                expected. For science output use Similarity (above) or
+                Export-as-COG + sklearn.
+              </div>
+            </div>
+          </details>
         </>
       )}
 

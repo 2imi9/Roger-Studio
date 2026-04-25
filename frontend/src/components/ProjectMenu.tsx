@@ -348,7 +348,7 @@ const TOUR_STEPS: TourStep[] = [
     body: (
       <>
         Roger Studio is an Earth Observation copilot for remote sensing
-        research. This 10-step tour walks through every tab and the
+        research. This 8-step tour walks through every tab and the
         matching map controls. Click Next and Back below, or press the
         arrow keys on your keyboard to step through. Press Esc at any
         time to close the tour.
@@ -445,24 +445,9 @@ const TOUR_STEPS: TourStep[] = [
     ),
   },
   {
-    target: "[data-testid='tab-3d']",
-    placement: "bottom",
-    title: "6. 3D Globe tab",
-    body: (
-      <>
-        The <strong>3D Globe tab</strong> renders your selected bbox or
-        polygon as a 3D view on a CesiumJS globe. Uses the polygon
-        geometry directly when you drew one, or a bbox rectangle
-        otherwise. Useful for checking how a selection sits relative to
-        terrain, coastline, or other regional features before running
-        analysis.
-      </>
-    ),
-  },
-  {
     target: "[data-testid='tab-llm']",
     placement: "bottom",
-    title: "7. LLM tab",
+    title: "6. LLM tab",
     body: (
       <>
         The <strong>LLM tab</strong> connects to five chat providers:
@@ -488,7 +473,7 @@ const TOUR_STEPS: TourStep[] = [
       "[data-testid='tab-llm']",
     ],
     placement: "right",
-    title: "8. Pop out the chat",
+    title: "7. Pop out the chat",
     body: (
       <>
         Inside the LLM tab there's a pop-out chip that detaches the chat
@@ -503,7 +488,7 @@ const TOUR_STEPS: TourStep[] = [
   {
     target: "[data-testid='project-menu']",
     placement: "bottom",
-    title: "9. Save your work",
+    title: "8. Save your work",
     body: (
       <>
         When you're happy with what's on screen, click{" "}

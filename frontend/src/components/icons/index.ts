@@ -8,7 +8,6 @@ export { DrawPolygon } from './DrawPolygon';
 export { DrawRectangle } from './DrawRectangle';
 export { Erase } from './Erase';
 export { FitToBounds } from './FitToBounds';
-export { Globe3DTab } from './Globe3DTab';
 export { ImportDataset } from './ImportDataset';
 export { LLMTab } from './LLMTab';
 export { LayerToggleOff } from './LayerToggleOff';

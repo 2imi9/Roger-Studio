@@ -1,9 +1,8 @@
-import { useState, useCallback, useEffect, useMemo, useRef, Component, type ReactNode } from "react";
+import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import type { BBox, AnalysisResult, DatasetInfo, EnvDataResult, ViewMode } from "./types";
 import type { DataSourceConfig } from "./components/DataSourcePicker";
 import { DEFAULT_CONFIG } from "./components/DataSourcePicker";
 import { MapView, type ImageryLayer } from "./components/MapView";
-import { CesiumView } from "./components/CesiumView";
 import { Sidebar } from "./components/Sidebar";
 import { SplitMap } from "./components/SplitMap";
 import { colorForTag, type LabelFeature, type LabelMode } from "./components/LabelPanel";
@@ -38,19 +37,8 @@ function newId(): string {
 // instead of the empty state SF used to show.
 const DEFAULT_BBOX: BBox = { west: 39.6, south: -4.2, east: 40.0, north: -3.9 };
 
-class ErrorBoundary extends Component<
-  { children: ReactNode; fallback: (err: string) => ReactNode },
-  { error: string | null }
-> {
-  state = { error: null as string | null };
-  static getDerivedStateFromError(error: Error) {
-    return { error: error.message };
-  }
-  render() {
-    if (this.state.error) return this.props.fallback(this.state.error);
-    return this.props.children;
-  }
-}
+// (ErrorBoundary class was here — only consumer was the dropped 3D Globe
+// view. Re-introduce if any future view needs render-time error containment.)
 
 function polygonBounds(poly: GeoJSON.Polygon): BBox {
   const ring = poly.coordinates[0] ?? [];
@@ -381,7 +369,8 @@ export function App() {
     }
   }, []);
 
-  const activeBbox = selectedArea ?? DEFAULT_BBOX;
+  // (``activeBbox`` derivation removed with the 3D Globe — no remaining
+  // consumer uses the "selectedArea ?? DEFAULT_BBOX" fallback shape.)
 
   // Poll OlmoEarth cache status so we can surface cached datasets as toggleable
   // Cache status feeds OlmoEarthImport's "cached / loading / error"
@@ -495,24 +484,7 @@ export function App() {
         compareMode={compareMode}
       />
       <main className="flex-1 relative">
-        {viewMode === "3d" ? (
-          <ErrorBoundary
-            fallback={(err) => (
-              <div className="flex items-center justify-center h-full bg-geo-bg text-geo-danger flex-col gap-3 p-8">
-                <h2 className="text-geo-text font-semibold">3D Globe Error</h2>
-                <pre className="text-sm text-red-300 max-w-[600px] overflow-auto">{err}</pre>
-                <button
-                  onClick={() => setViewMode("map")}
-                  className="px-5 py-2 bg-blue-600 text-white border-none rounded-md cursor-pointer"
-                >
-                  Back to Map
-                </button>
-              </div>
-            )}
-          >
-            <CesiumView bbox={activeBbox} selectedGeometry={selectedGeometry} analysisResult={analysisResult} overlayGeojson={overlayGeojson} />
-          </ErrorBoundary>
-        ) : compareMode ? (
+        {compareMode ? (
           <SplitMap
             selectedArea={selectedArea}
             imageryLayers={imageryLayers}

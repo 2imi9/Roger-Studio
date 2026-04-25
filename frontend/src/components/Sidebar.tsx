@@ -16,7 +16,7 @@ import { LLMExamples } from "./LLMExamples";
 import { DraggablePanel } from "./DraggablePanel";
 import { LabelPanel, type LabelFeature, type LabelMode } from "./LabelPanel";
 import { RogerLogo } from "./ui/RogerLogo";
-import { MapTab, AnalysisTab, Globe3DTab, OlmoEarthTab, LLMTab } from "./icons";
+import { MapTab, AnalysisTab, OlmoEarthTab, LLMTab } from "./icons";
 import { PolygonStats } from "./PolygonStats";
 import { StacImagery } from "./StacImagery";
 import { OlmoEarthPanel } from "./OlmoEarthPanel";
@@ -393,7 +393,7 @@ export function Sidebar({
           spacing look uneven because variable-width labels centered in
           equal slots produce variable inter-label gaps. */}
       <div className="flex-shrink-0 flex border-b border-geo-border px-4 bg-geo-surface justify-evenly">
-        {(["map", "analysis", "3d", "olmoearth", "gemma"] as ViewMode[]).map((mode) => {
+        {(["map", "analysis", "olmoearth", "gemma"] as ViewMode[]).map((mode) => {
           if (mode === "map") {
             return (
               <div key={mode} className="relative group" data-testid="tab-map">
@@ -515,8 +515,8 @@ export function Sidebar({
               </div>
             );
           }
-          // Plain tabs (Analysis + 3D Globe) — no submenu yet, awaiting future features.
-          const TabIcon = mode === "analysis" ? AnalysisTab : Globe3DTab;
+          // Plain Analysis tab — no submenu yet, awaiting future features.
+          // (3D Globe was removed; if more plain-tab modes return, generalise.)
           return (
             <button
               key={mode}
@@ -528,8 +528,8 @@ export function Sidebar({
                   : "text-geo-muted border-transparent hover:text-geo-text hover:border-geo-border hover:bg-geo-bg/60 active:bg-geo-border/40"
               }`}
             >
-              <TabIcon state={viewMode === mode ? "active" : "default"} className="w-4 h-4" />
-              {mode === "3d" ? "3D Globe" : mode === "olmoearth" ? "OlmoEarth" : mode}
+              <AnalysisTab state={viewMode === mode ? "active" : "default"} className="w-4 h-4" />
+              {mode}
             </button>
           );
         })}
@@ -835,8 +835,8 @@ export function Sidebar({
           </div>
         )}
 
-        {/* ============ ANALYSIS / 3D TABS — computed results ============ */}
-        {(viewMode === "analysis" || viewMode === "3d") && (
+        {/* ============ ANALYSIS TAB — computed results ============ */}
+        {viewMode === "analysis" && (
           <>
             {/* Data source config — drives /analyze, not imagery rendering */}
             <DataSourcePicker config={dataSourceConfig} onChange={onDataSourceChange} />
@@ -1101,7 +1101,7 @@ export function Sidebar({
 
       {/* Footer — pinned bottom (shared across all tabs) */}
       <div className="flex-shrink-0 px-10 py-6 border-t border-geo-border bg-geo-surface text-[11px] text-geo-dim tracking-widest">
-        OlmoEarth &middot; TIPSv2 &middot; CesiumJS
+        OlmoEarth &middot; TIPSv2 &middot; MapLibre
       </div>
       </div>
     </aside>
