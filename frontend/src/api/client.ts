@@ -988,6 +988,89 @@ export function downloadEmbeddingExport(result: OlmoEarthEmbeddingExportResult):
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+
+/** FT classification → GeoJSON polygon export.
+ *
+ * Wraps ``POST /api/olmoearth/ft-classification/geojson``. Reuses the same
+ * inference job the map tile is built from (no duplicate forward pass) and
+ * vectorises the per-pixel class raster into polygons readable by Google
+ * Earth Pro, QGIS, ArcGIS, leaflet, etc. The browser download is triggered
+ * here because the response is ``application/geo+json`` bytes — same
+ * "synthetic anchor click" pattern as ``downloadEmbeddingExport``. */
+export interface FtClassificationGeoJsonArgs {
+  bbox: BBox;
+  modelRepoId: string;
+  dateRange?: string | null;
+  /** Drop polygons under this pixel count to suppress speckle. Default 4
+   *  (~160 m² at 10 m GSD). 0 disables. */
+  minPixels?: number;
+  /** Douglas–Peucker tolerance in meters. Default 5 m (half S2 GSD).
+   *  0 disables, keeping every vertex. */
+  simplifyToleranceM?: number;
+}
+
+export interface FtClassificationGeoJsonResult {
+  filename: string;
+  /** Number of polygons in the FeatureCollection (from X-Feature-Count
+   *  header). Lets the UI show "downloaded foo.geojson · 47 polygons"
+   *  without parsing the body. */
+  featureCount: number | null;
+  jobId: string | null;
+}
+
+export async function downloadFtClassificationGeoJson(
+  args: FtClassificationGeoJsonArgs,
+): Promise<FtClassificationGeoJsonResult> {
+  const body = JSON.stringify({
+    bbox: args.bbox,
+    model_repo_id: args.modelRepoId,
+    date_range: args.dateRange ?? undefined,
+    min_pixels: args.minPixels ?? 4,
+    simplify_tolerance_m: args.simplifyToleranceM ?? 5.0,
+  });
+
+  const res = await fetch(`${BASE}/olmoearth/ft-classification/geojson`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body,
+    // No AbortSignal — first-time runs may take minutes (cold model +
+    // PC fetch). Cached jobs return in seconds.
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`API ${res.status}: ${text}`);
+  }
+
+  const cd = res.headers.get("content-disposition") ?? "";
+  const match = cd.match(/filename="?([^";]+)"?/i);
+  const repoTag = args.modelRepoId.replace(/[/:]/g, "_");
+  const filename = match?.[1] ?? `${repoTag}_classification.geojson`;
+
+  const featureCountHeader = res.headers.get("x-feature-count");
+  const featureCount = featureCountHeader != null
+    ? Number.parseInt(featureCountHeader, 10)
+    : null;
+  const jobId = res.headers.get("x-job-id");
+
+  // Trigger the download via the same synthetic-anchor pattern as the
+  // embedding COG path.
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+
+  return {
+    filename,
+    featureCount: Number.isFinite(featureCount) ? featureCount : null,
+    jobId,
+  };
+}
+
 // Shape of one demo side returned from /api/olmoearth/demo-pairs. The
 // frontend uses this directly as an ImageryLayer (id, label, tileUrl).
 // `spec` is the full inference payload — passed back to the prebake

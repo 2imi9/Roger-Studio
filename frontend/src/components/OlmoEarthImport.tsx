@@ -1,6 +1,7 @@
 import { useState } from "react";
 import {
   downloadEmbeddingExport,
+  downloadFtClassificationGeoJson,
   exportOlmoEarthEmbedding,
   loadOlmoEarthRepo,
   runOlmoEarthEmbeddingPCARgb,
@@ -171,7 +172,7 @@ export function OlmoEarthImport({
   const [repoId, setRepoId] = useState(initialOption.repoId);
   const [hfToken, setHfToken] = useState("");
   const [status, setStatus] = useState<string | null>(null);
-  const [busy, setBusy] = useState<null | "infer" | "cache" | "embed" | "pca" | "sim">(null);
+  const [busy, setBusy] = useState<null | "infer" | "cache" | "embed" | "pca" | "sim" | "geojson">(null);
   // Subtab split: Run inference vs. Embedding tools. The panel had grown to
   // 1 inference action + 3 embedding actions + 1 advanced action in a flat
   // list, which pushed the primary Run button below the fold on short
@@ -222,6 +223,34 @@ export function OlmoEarthImport({
       }
     } catch (e) {
       setStatus(`failed: ${formatApiError(e)}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  // FT classification → GeoJSON polygon download. Only meaningful for
+  // classification heads (Mangrove, AWF, Ecosystem) — regression (LFMC)
+  // doesn't have discrete regions to vectorise. Reuses the same job_id
+  // as the map-tile run, so if the user already clicked "Run + add to map"
+  // the GeoJSON download is near-instant (no second forward pass).
+  // Output is a standard application/geo+json file ready to drop into
+  // Google Earth Pro, QGIS, ArcGIS, leaflet, etc.
+  const handleDownloadGeoJson = async () => {
+    if (!selectedArea) return;
+    if (selected.kind !== "ft") return;
+    if (!selected.supported) return;
+    setBusy("geojson");
+    setStatus("Downloading classification as GeoJSON — reuses cached inference if available, else runs a fresh job (may take a few minutes)…");
+    try {
+      const res = await downloadFtClassificationGeoJson({
+        bbox: selectedArea,
+        modelRepoId: repoId,
+      });
+      const count = res.featureCount;
+      const countStr = count != null ? `${count} polygon${count === 1 ? "" : "s"}` : "polygons";
+      setStatus(`downloaded ${res.filename} · ${countStr}`);
+    } catch (e) {
+      setStatus(`GeoJSON download failed: ${formatApiError(e)}`);
     } finally {
       setBusy(null);
     }
@@ -501,6 +530,43 @@ export function OlmoEarthImport({
         >
           {busy === "infer" ? "Running inference…" : "Run + add to map"}
         </button>
+      )}
+
+      {/* GeoJSON polygon download — only rendered for FT classification
+          heads (Mangrove, AWF, Ecosystem). Reuses the same job_id as the
+          map-tile run, so if "Run + add to map" already fired this is
+          near-instant. Output drops straight into Google Earth Pro,
+          QGIS, ArcGIS, leaflet, etc. — no in-app rendering required. */}
+      {activeTab === "inference"
+        && selected.kind === "ft"
+        && selected.supported
+        && selected.task.toLowerCase().includes("classification") && (
+        <>
+          <button
+            type="button"
+            onClick={handleDownloadGeoJson}
+            disabled={busy !== null || !selectedArea}
+            className={`w-full px-3 py-2 text-[12px] font-semibold rounded border transition-colors ${
+              busy !== null || !selectedArea
+                ? "border-geo-border text-geo-muted cursor-not-allowed"
+                : "border-geo-accent text-geo-accent hover:bg-geo-accent hover:text-white cursor-pointer"
+            }`}
+            title={
+              selectedArea
+                ? "Vectorise the FT classification raster into polygons and download as a GeoJSON file. Reuses cached inference if you already ran this AOI."
+                : "Draw an area on the map first"
+            }
+          >
+            {busy === "geojson" ? "Downloading GeoJSON…" : "Download as GeoJSON (for Google Earth / QGIS)"}
+          </button>
+          <div className="text-[10px] text-geo-muted leading-snug -mt-1">
+            One polygon per contiguous class region. Properties carry
+            class id, name, color, and area (m²). Loads natively in
+            Google Earth Pro, QGIS, ArcGIS, My Maps. Editable as
+            vector — refine boundaries or delete misclassifications
+            before downstream use.
+          </div>
+        </>
       )}
 
       {/* Embedding tools — only rendered on the Embedding subtab. Each

@@ -496,3 +496,200 @@ async def test_watch_for_disconnect_can_be_cancelled_by_caller(monkeypatch):
     target.cancel()
     with pytest.raises(_asyncio.CancelledError):
         await target
+
+
+# ---------------------------------------------------------------------------
+# vectorize_classification — turn a per-pixel class raster into GeoJSON
+# polygons for export to Google Earth / QGIS / etc.
+#
+# These tests construct synthetic class rasters with known structure so we
+# can assert exactly which polygons should come out, what their properties
+# look like, and that the noise-suppression knobs do what they claim.
+# ---------------------------------------------------------------------------
+
+
+def _make_test_raster_and_transform():
+    """Build a small synthetic class raster with known regions.
+
+    Layout (10×10 raster, 10 m/pixel, anchored at lon=0 lat=0 for simplicity):
+        - top-left 5×5 block: class 1 (25 pixels = 2500 m²)
+        - top-right 5×5 block: class 2 (25 pixels = 2500 m²)
+        - bottom 10×5 strip:   class 0 (50 pixels = 5000 m²)
+        - one isolated pixel of class 1 in the middle (noise — should be
+          dropped at min_pixels >= 2)
+    """
+    import numpy as np
+    from rasterio.transform import from_origin
+    from rasterio.crs import CRS
+
+    raster = np.zeros((10, 10), dtype=np.int32)
+    raster[0:5, 0:5] = 1
+    raster[0:5, 5:10] = 2
+    # Bottom 5 rows stay 0 (the default).
+    raster[7, 7] = 1  # noise speckle
+    # Pretend we're in a UTM-like CRS where pixels are isotropic meters.
+    transform = from_origin(0, 100, 10, 10)  # 10 m/pixel, origin (0, 100)
+    crs = CRS.from_epsg(32633)  # UTM 33N — picked to match the scale assumption
+    return raster, transform, crs
+
+
+def test_vectorize_classification_one_polygon_per_contiguous_class_region():
+    raster, transform, crs = _make_test_raster_and_transform()
+    fc = OI.vectorize_classification(
+        class_raster=raster,
+        transform=transform,
+        crs=crs,
+        target_gsd_m=10.0,
+        class_names=["water", "forest", "urban"],
+        legend_classes=[
+            {"index": 0, "name": "water", "color": "#0000ff"},
+            {"index": 1, "name": "forest", "color": "#00ff00"},
+            {"index": 2, "name": "urban", "color": "#ff0000"},
+        ],
+        min_pixels=2,
+        simplify_tolerance_m=0,  # disable to keep area exact
+    )
+    assert fc["type"] == "FeatureCollection"
+    # 3 polygons: water (bottom), forest (top-left 5×5), urban (top-right 5×5).
+    # The 1-pixel forest speckle is dropped by min_pixels=2.
+    by_class = {f["properties"]["class_name"]: f for f in fc["features"]}
+    assert sorted(by_class.keys()) == ["forest", "urban", "water"]
+    # Water occupies the bottom 5×10 = 50 pixels MINUS the one (7, 7) cell
+    # that we flipped to class 1 above as the noise speckle — so 49.
+    assert by_class["water"]["properties"]["pixel_count"] == 49
+    assert by_class["forest"]["properties"]["pixel_count"] == 25
+    assert by_class["urban"]["properties"]["pixel_count"] == 25
+    assert by_class["water"]["properties"]["area_m2"] == 4900.0
+
+
+def test_vectorize_classification_min_pixels_filters_speckle():
+    """Setting min_pixels=2 must drop the 1-pixel forest noise."""
+    raster, transform, crs = _make_test_raster_and_transform()
+    fc = OI.vectorize_classification(
+        class_raster=raster, transform=transform, crs=crs, target_gsd_m=10.0,
+        class_names=["water", "forest", "urban"], min_pixels=2,
+        simplify_tolerance_m=0,
+    )
+    forest_polys = [f for f in fc["features"] if f["properties"]["class_name"] == "forest"]
+    # Only the big 5×5 forest block survives — noise pixel filtered out.
+    assert len(forest_polys) == 1
+    assert forest_polys[0]["properties"]["pixel_count"] == 25
+
+
+def test_vectorize_classification_min_pixels_zero_keeps_speckle():
+    """min_pixels=0 disables filtering — speckle survives."""
+    raster, transform, crs = _make_test_raster_and_transform()
+    fc = OI.vectorize_classification(
+        class_raster=raster, transform=transform, crs=crs, target_gsd_m=10.0,
+        class_names=["water", "forest", "urban"], min_pixels=0,
+        simplify_tolerance_m=0,
+    )
+    forest_polys = [f for f in fc["features"] if f["properties"]["class_name"] == "forest"]
+    assert len(forest_polys) == 2  # big block + speckle
+
+
+def test_vectorize_classification_attaches_published_color():
+    raster, transform, crs = _make_test_raster_and_transform()
+    fc = OI.vectorize_classification(
+        class_raster=raster, transform=transform, crs=crs, target_gsd_m=10.0,
+        class_names=["water", "forest", "urban"],
+        legend_classes=[
+            {"index": 0, "name": "water", "color": "#0033ff"},
+            {"index": 1, "name": "forest", "color": "#22aa22"},
+            {"index": 2, "name": "urban", "color": "#ff5500"},
+        ],
+        min_pixels=2, simplify_tolerance_m=0,
+    )
+    color_by_name = {f["properties"]["class_name"]: f["properties"]["color"] for f in fc["features"]}
+    assert color_by_name == {"water": "#0033ff", "forest": "#22aa22", "urban": "#ff5500"}
+
+
+def test_vectorize_classification_falls_back_to_grey_when_legend_missing():
+    raster, transform, crs = _make_test_raster_and_transform()
+    fc = OI.vectorize_classification(
+        class_raster=raster, transform=transform, crs=crs, target_gsd_m=10.0,
+        class_names=["water", "forest", "urban"],
+        legend_classes=None,  # no legend → fallback grey
+        min_pixels=2, simplify_tolerance_m=0,
+    )
+    assert all(f["properties"]["color"] == "#888888" for f in fc["features"])
+
+
+def test_vectorize_classification_drops_out_of_range_class_ids():
+    """Class IDs outside [0, len(class_names)) are filtered (covers nodata)."""
+    import numpy as np
+    from rasterio.transform import from_origin
+    from rasterio.crs import CRS
+    raster = np.full((4, 4), -1, dtype=np.int32)  # all nodata
+    raster[0:2, 0:2] = 0  # one valid region
+    raster[0:2, 2:4] = 99  # out-of-range
+    transform = from_origin(0, 40, 10, 10)
+    crs = CRS.from_epsg(32633)
+    fc = OI.vectorize_classification(
+        class_raster=raster, transform=transform, crs=crs, target_gsd_m=10.0,
+        class_names=["valid"], min_pixels=1, simplify_tolerance_m=0,
+    )
+    # Only the 1 valid region; nodata (-1) and out-of-range (99) both dropped.
+    assert len(fc["features"]) == 1
+    assert fc["features"][0]["properties"]["class_id"] == 0
+
+
+def test_vectorize_classification_reprojects_to_wgs84():
+    """Output coords must be lon/lat (WGS84), not source CRS units."""
+    raster, transform, crs = _make_test_raster_and_transform()
+    fc = OI.vectorize_classification(
+        class_raster=raster, transform=transform, crs=crs, target_gsd_m=10.0,
+        class_names=["water", "forest", "urban"], min_pixels=2,
+        simplify_tolerance_m=0,
+    )
+    # Pull any polygon's first ring vertex; lon should be in [-180, 180],
+    # lat in [-90, 90]. UTM coords (~0, 100) would fail those bounds only
+    # when interpreted as degrees they happen to fit, so additionally
+    # check that they're NOT the raw UTM corner (0, 100).
+    for feat in fc["features"]:
+        coords = feat["geometry"]["coordinates"][0]
+        for lon, lat in coords:
+            assert -180 <= lon <= 180, f"lon out of range: {lon}"
+            assert -90 <= lat <= 90, f"lat out of range: {lat}"
+
+
+def test_vectorize_classification_extra_properties_attached_at_top_level():
+    raster, transform, crs = _make_test_raster_and_transform()
+    fc = OI.vectorize_classification(
+        class_raster=raster, transform=transform, crs=crs, target_gsd_m=10.0,
+        class_names=["water", "forest", "urban"], min_pixels=2,
+        simplify_tolerance_m=0,
+        extra_properties={"model_repo_id": "allenai/foo", "scene_id": "S2A_x"},
+    )
+    assert fc["properties"]["model_repo_id"] == "allenai/foo"
+    assert fc["properties"]["scene_id"] == "S2A_x"
+
+
+def test_vectorize_classification_simplify_reduces_vertex_count():
+    """Higher simplify tolerance should yield fewer vertices (lossy compression)."""
+    import numpy as np
+    from rasterio.transform import from_origin
+    from rasterio.crs import CRS
+    # Build a circular-ish region by setting class 1 inside a radius.
+    h = w = 40
+    yy, xx = np.mgrid[0:h, 0:w]
+    raster = ((yy - h/2) ** 2 + (xx - w/2) ** 2 < 15 ** 2).astype(np.int32)
+    transform = from_origin(0, h * 10, 10, 10)
+    crs = CRS.from_epsg(32633)
+    fc_full = OI.vectorize_classification(
+        class_raster=raster, transform=transform, crs=crs, target_gsd_m=10.0,
+        class_names=["bg", "circle"], min_pixels=2, simplify_tolerance_m=0,
+    )
+    fc_simplified = OI.vectorize_classification(
+        class_raster=raster, transform=transform, crs=crs, target_gsd_m=10.0,
+        class_names=["bg", "circle"], min_pixels=2, simplify_tolerance_m=20,
+    )
+    # Pull the 'circle' polygon from each; it's a stair-stepped boundary
+    # in the source raster. Simplification at 20 m should drop a lot of
+    # the colinear-ish stair-steps.
+    def vertex_count(fc):
+        for f in fc["features"]:
+            if f["properties"]["class_name"] == "circle":
+                return len(f["geometry"]["coordinates"][0])
+        return 0
+    assert vertex_count(fc_simplified) < vertex_count(fc_full)

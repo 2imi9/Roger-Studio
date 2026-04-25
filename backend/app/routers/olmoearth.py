@@ -112,6 +112,46 @@ class EmbeddingExportRequest(BaseModel):
     chunk_size_m: int = Field(default=5000, ge=1000, le=20000)
 
 
+class FtClassificationGeoJsonRequest(BaseModel):
+    """Parameters for vectorising an FT classification raster as GeoJSON.
+
+    The pipeline reuses the same ``start_inference`` path that powers the
+    map tile — so identical AOI + model + date_range hits the cached job
+    and skips re-running inference. The request body matches ``/infer``'s
+    minimum so the frontend can hand-off the same payload.
+    """
+
+    bbox: BBox
+    model_repo_id: str = Field(
+        ...,
+        description=(
+            "FT classification head, e.g. allenai/OlmoEarth-v1-FT-Mangrove-Base. "
+            "Regression heads (LFMC) and embedding-only base encoders are rejected."
+        ),
+    )
+    date_range: str | None = Field(
+        default=None,
+        description=(
+            "Optional date range; defaults to the FT head's published recommendation "
+            "(see olmoearth_ft.recommended_date_range)."
+        ),
+    )
+    min_pixels: int = Field(
+        default=4, ge=0, le=10_000,
+        description=(
+            "Drop polygons under this pixel count to suppress speckle. "
+            "Default 4 = ~160 m² at 10 m GSD. Set to 0 to disable filtering."
+        ),
+    )
+    simplify_tolerance_m: float = Field(
+        default=5.0, ge=0.0, le=200.0,
+        description=(
+            "Douglas–Peucker tolerance in meters. 0 disables. Default 5 m is "
+            "half S2 GSD — visually identical, often 5–10× smaller GeoJSON."
+        ),
+    )
+
+
 _BASE_ENCODER_REPO_IDS = {
     "allenai/OlmoEarth-v1-Nano",
     "allenai/OlmoEarth-v1-Tiny",
@@ -584,6 +624,147 @@ async def olmoearth_export_embedding(
             ),
             "X-Chunks-Processed": str(result["chunks_processed"]),
             "X-Chunks-Failed": str(result["chunks_failed"]),
+        },
+    )
+
+
+@router.post("/olmoearth/ft-classification/geojson")
+async def olmoearth_ft_classification_geojson(
+    request: Request,
+    req: FtClassificationGeoJsonRequest = Body(...),
+) -> Response:
+    """Vectorise an FT classification raster into a downloadable GeoJSON.
+
+    The Studio frontend renders FT outputs as colored XYZ tiles, which is
+    great for in-app exploration but useless if the user wants to take the
+    classification into Google Earth, QGIS, ArcGIS, or My Maps. This route
+    runs (or reuses cached) inference, polygonises the per-pixel class
+    raster, attaches the published per-class colours + areas, and streams
+    the result as ``application/geo+json`` ready to drop into any GIS.
+
+    Workflow:
+      1. Run / reuse the same ``start_inference`` job the tile renderer uses
+         — identical AOI + model + date_range hits the cached _jobs entry,
+         no duplicate forward pass.
+      2. Reject jobs whose ``task_type`` isn't classification (e.g. LFMC
+         regression doesn't fit the polygon model — direct the user at
+         Export-as-COG instead).
+      3. ``vectorize_classification`` does the rasterio.features.shapes
+         polygonisation + WGS84 reprojection + speckle filter.
+
+    Errors:
+      400 — model isn't a classification FT head.
+      404 — no class raster available (regression task or stub fallback).
+      413/503 — inherits the safety stack of /infer (oversize AOI, OOM,
+              breaker trip).
+    """
+    # Step 1: reuse the same path as /infer so caching kicks in.
+    try:
+        infer_resp = await olmoearth_inference.start_inference(
+            bbox=req.bbox,
+            model_repo_id=req.model_repo_id,
+            date_range=req.date_range,
+            disconnect_check=request.is_disconnected,
+        )
+    except AOISizeExceededError as e:
+        raise HTTPException(status_code=413, detail=str(e)) from e
+    except InsufficientMemoryError as e:
+        raise HTTPException(
+            status_code=503, detail=str(e), headers={"Retry-After": "30"},
+        ) from e
+    except CircuitBreakerTrippedError as e:
+        raise HTTPException(
+            status_code=503, detail=str(e), headers={"Retry-After": "60"},
+        ) from e
+    except ClientDisconnectedError as e:
+        logger.info("ft-classification cancelled (client disconnect): %s", e)
+        raise HTTPException(status_code=499, detail=str(e)) from e
+
+    job_id = infer_resp["job_id"]
+    job = olmoearth_inference._jobs.get(job_id)
+    if job is None:
+        raise HTTPException(500, f"Job {job_id} disappeared after start_inference")
+
+    # Step 2: reject non-classification tasks. The vectoriser only makes
+    # sense for discrete-class outputs.
+    task_type = job.get("task_type")
+    if task_type not in ("classification", "segmentation"):
+        raise HTTPException(
+            400,
+            (
+                f"Model {req.model_repo_id!r} returned task_type={task_type!r}, "
+                f"not a classification. GeoJSON vectorisation only supports "
+                f"classification heads (Mangrove, AWF, Ecosystem, etc.). "
+                f"For regression (LFMC) or embeddings, use Export-as-COG."
+            ),
+        )
+
+    class_raster = job.get("class_raster")
+    if class_raster is None:
+        # Stub fallback path — no real raster to vectorise.
+        raise HTTPException(
+            404,
+            (
+                f"Job {job_id} has no class raster (kind={job.get('kind')!r}, "
+                f"stub_reason={job.get('stub_reason')!r}). Real inference "
+                f"likely failed; retry when network stabilises."
+            ),
+        )
+
+    # Step 3: vectorise. Run in a thread because shapes() + transform_geom
+    # are CPU-bound and shouldn't block the event loop on big rasters.
+    # Per-class colors live on ``legend_override`` (built by _build_ft_legend
+    # with published task colors). The plain ``legend`` field is the
+    # colormap-level legend which has gradient stops, not per-class colors.
+    legend = job.get("legend_override") or job.get("legend") or {}
+    legend_classes = legend.get("classes") if isinstance(legend, dict) else None
+    target_gsd_m = (job.get("temporal_stack") or {}).get("target_gsd_m") or 10.0
+    scene_datetime = (job.get("temporal_stack") or {}).get("scene_datetimes")
+    if isinstance(scene_datetime, list) and scene_datetime:
+        scene_datetime = next((s for s in scene_datetime if s), None)
+
+    try:
+        fc = await asyncio.to_thread(
+            olmoearth_inference.vectorize_classification,
+            class_raster=class_raster,
+            transform=job["raster_transform"],
+            crs=job["raster_crs"],
+            target_gsd_m=float(target_gsd_m),
+            class_names=job.get("class_names") or [],
+            legend_classes=legend_classes,
+            min_pixels=req.min_pixels,
+            simplify_tolerance_m=req.simplify_tolerance_m if req.simplify_tolerance_m > 0 else None,
+            extra_properties={
+                "model_repo_id": req.model_repo_id,
+                "scene_id": job.get("scene_id"),
+                "scene_datetime": scene_datetime,
+                "task_type": task_type,
+                "job_id": job_id,
+                "min_pixels": req.min_pixels,
+                "simplify_tolerance_m": req.simplify_tolerance_m,
+            },
+        )
+    except Exception as e:
+        logger.exception("FT classification vectorisation failed")
+        raise HTTPException(
+            500,
+            f"Vectorisation failed: {type(e).__name__}: {e}",
+        ) from e
+
+    # Stream as application/geo+json (RFC 7946) with a sensible filename.
+    # ``model_short`` cuts the "allenai/OlmoEarth-v1-FT-" prefix so the
+    # filename is human-readable when the user finds it in Downloads.
+    import json  # noqa: PLC0415
+    short_model = req.model_repo_id.split("/")[-1].replace("OlmoEarth-v1-FT-", "")
+    filename = f"{short_model}_{job_id[:8]}.geojson"
+    body = json.dumps(fc, separators=(",", ":")).encode("utf-8")
+    return Response(
+        content=body,
+        media_type="application/geo+json",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Feature-Count": str(len(fc.get("features", []))),
+            "X-Job-Id": job_id,
         },
     )
 

@@ -390,6 +390,7 @@ async def start_inference(
         real = await _run_real_inference(
             bbox, model_repo_id, spec["date_range"], max_size_px,
             sliding_window=sliding_window, window_size=window_size,
+            disconnect_check=disconnect_check,
         )
     except (SentinelFetchError, Exception) as e:
         logger.warning("real inference failed for %s: %s — falling back to stub", job_id, e)
@@ -1864,6 +1865,7 @@ async def _run_real_inference(
     max_size_px: int,
     sliding_window: bool = False,
     window_size: int = 32,
+    disconnect_check=None,
 ) -> dict[str, Any]:
     """Fetch S2 composite + run forward pass (encoder or full FT model).
 
@@ -2104,6 +2106,130 @@ def _build_ft_legend(ft_result: "olmoearth_model.FTInferenceResult") -> dict[str
 def _stop_color(stops: list[tuple[str, float]], t: float) -> str:
     r, g, b = _interp_color(list(stops), t)
     return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def vectorize_classification(
+    *,
+    class_raster: np.ndarray,
+    transform: Any,
+    crs: Any,
+    target_gsd_m: float,
+    class_names: list[str],
+    legend_classes: list[dict[str, Any]] | None = None,
+    min_pixels: int = 4,
+    simplify_tolerance_m: float | None = 5.0,
+    extra_properties: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Convert a per-pixel classification raster into a GeoJSON FeatureCollection.
+
+    Pipeline (each step justified):
+
+      1. ``rasterio.features.shapes`` walks the raster and emits one polygon per
+         contiguous int region — this is the standard rasterio-side vectorize.
+      2. We compute area in the SOURCE CRS (typically UTM where pixels are
+         isotropic meters) BEFORE reprojection, so the ``area_m2`` property
+         reflects real ground area regardless of where the polygon lands in
+         WGS84.
+      3. Drop polygons below ``min_pixels`` to suppress speckle noise — a
+         typical FT classification produces lots of single-pixel "regions"
+         from inference jitter that aren't useful and bloat the file.
+      4. Optional ``simplify_tolerance_m`` runs Douglas–Peucker via shapely
+         to drop colinear vertices. Default 5 m is half the S2 GSD —
+         visually identical, often 5–10× smaller GeoJSON.
+      5. Reproject to EPSG:4326 (WGS84) via ``rasterio.warp.transform_geom``
+         so the output is the lon/lat that GeoJSON consumers (Google Earth,
+         QGIS, My Maps, leaflet, deck.gl) expect by RFC 7946.
+
+    The output is a plain dict shaped as a GeoJSON FeatureCollection — caller
+    serializes to a string at HTTP boundary. Class properties carry the
+    class id, human-readable name, area (m²), pixel count, and the
+    published color (when available, for QGIS / Earth styling).
+
+    Args:
+        class_raster: ``(H, W)`` int raster of class IDs. Pixels with values
+            outside ``[0, len(class_names))`` are filtered out (covers
+            nodata sentinels and out-of-AOI padding).
+        transform: rasterio Affine for the source raster.
+        crs: rasterio CRS the raster is in. Anything ``transform_geom`` can
+            consume.
+        target_gsd_m: source pixel size in meters (assumed isotropic), used
+            for ``area_m2`` and pixel-count calculations.
+        class_names: ``[name_for_id_0, name_for_id_1, ...]``.
+        legend_classes: optional ``[{"index", "name", "color"}, ...]`` from
+            ``_build_ft_legend``; supplies per-class hex colors. Falls back
+            to ``"#888888"`` when missing.
+        min_pixels: drop polygons under this pixel count. Default 4 (=
+            ~160 m² at 10 m GSD).
+        simplify_tolerance_m: Douglas–Peucker tolerance in meters. ``None``
+            or ``0`` disables simplification.
+        extra_properties: merged into the FeatureCollection's top-level
+            ``properties`` block — useful for stamping model_repo_id,
+            scene_datetime, etc. so consumers can trace provenance.
+    """
+    # Local imports — keep heavy/optional deps out of module load time and
+    # near the only function that uses them.
+    from rasterio.features import shapes  # noqa: PLC0415
+    from rasterio.warp import transform_geom  # noqa: PLC0415
+    from shapely.geometry import mapping, shape  # noqa: PLC0415
+
+    color_lookup: dict[int, str] = {}
+    if legend_classes:
+        for c in legend_classes:
+            try:
+                color_lookup[int(c["index"])] = str(c.get("color", "#888888"))
+            except (KeyError, ValueError, TypeError):
+                continue
+
+    pixel_area_m2 = float(target_gsd_m) ** 2
+    n_classes = len(class_names)
+    features: list[dict[str, Any]] = []
+
+    # rasterio.features.shapes wants a contiguous typed array. int32 covers
+    # OlmoEarth's 110-class ecosystem head with room to spare.
+    raster_i32 = np.ascontiguousarray(class_raster, dtype=np.int32)
+
+    for geom_dict, raw_value in shapes(raster_i32, transform=transform):
+        class_id = int(raw_value)
+        if class_id < 0 or class_id >= n_classes:
+            # Out-of-range class — skip nodata sentinels and any padding
+            # the orchestrator may have left at AOI edges.
+            continue
+        geom = shape(geom_dict)
+        if geom.is_empty:
+            continue
+        area_m2 = float(geom.area)
+        pixel_count = int(round(area_m2 / pixel_area_m2)) if pixel_area_m2 else 0
+        if pixel_count < min_pixels:
+            continue
+        if simplify_tolerance_m and simplify_tolerance_m > 0:
+            geom = geom.simplify(simplify_tolerance_m, preserve_topology=True)
+            if geom.is_empty:
+                continue
+        wgs_geom = transform_geom(crs, "EPSG:4326", mapping(geom))
+        features.append({
+            "type": "Feature",
+            "geometry": wgs_geom,
+            "properties": {
+                "class_id": class_id,
+                "class_name": class_names[class_id],
+                "color": color_lookup.get(class_id, "#888888"),
+                "area_m2": round(area_m2, 1),
+                "pixel_count": pixel_count,
+            },
+        })
+
+    fc: dict[str, Any] = {
+        "type": "FeatureCollection",
+        "features": features,
+    }
+    if extra_properties:
+        # GeoJSON spec doesn't define top-level ``properties`` on a
+        # FeatureCollection, but most consumers tolerate it (Google Earth,
+        # QGIS, leaflet) and it's the conventional place to stash
+        # provenance metadata. Keep it as a sibling key, not inside
+        # ``features``, so per-polygon properties stay clean.
+        fc["properties"] = dict(extra_properties)
+    return fc
 
 
 def _build_response(job: dict[str, Any]) -> dict[str, Any]:
