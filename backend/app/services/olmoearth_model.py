@@ -25,6 +25,7 @@ Design notes:
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from dataclasses import dataclass
 from typing import Any
@@ -1026,8 +1027,75 @@ def _pca_to_scalar(embedding_hwd: np.ndarray) -> np.ndarray:
     return ((pc1 - lo) / (hi - lo)).reshape(h, w).astype(np.float32)
 
 
+def _smooth_seams(
+    raster: np.ndarray, *, sigma: float, nodata_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """Apply a small Gaussian blur to bridge encoder-chunk seams in a
+    PCA / similarity raster while preserving most spatial detail.
+
+    The visible "grid lines" in PCA / similarity output come from the
+    encoder's attention context — patches at the edge of one chunk see
+    only that chunk's tokens, while the same physical pixel near the
+    edge of the neighbour chunk sees a different attention context.
+    The embedding values shift subtly at the seam, which becomes a
+    visible color jump after PCA / cosine projection.
+
+    A tight Gaussian blur (default σ ≈ 1.5 patches ≈ 60 m in pixel
+    space at patch_size=4 + 10 m GSD) bridges 2-3 patch wide seams
+    while only smearing real spatial features by the same ~60 m —
+    well below the scale of any meaningful landscape boundary.
+
+    ``nodata_mask`` (True = nodata) is preserved bit-for-bit; the blur
+    pretends nodata pixels are 0 during the convolution, then the mask
+    is reapplied afterward so AOI edges don't "bleed" colour into
+    chunks that never produced data.
+
+    Set ``sigma <= 0`` (or ``OE_PCA_SMOOTH_SIGMA=0``) to disable; this
+    used to be the implicit default and is preserved for callers that
+    want the raw chunk-grid view.
+    """
+    if sigma <= 0:
+        return raster
+    from scipy.ndimage import gaussian_filter  # noqa: PLC0415
+
+    work = raster.astype(np.float32, copy=True)
+    if nodata_mask is not None:
+        work[nodata_mask] = 0.0
+
+    if work.ndim == 3:
+        # Smooth each channel independently in (H, W); leave the channel
+        # dim alone (we don't want PC bands bleeding into each other).
+        for ch in range(work.shape[-1]):
+            work[..., ch] = gaussian_filter(work[..., ch], sigma=sigma)
+    else:
+        work = gaussian_filter(work, sigma=sigma)
+
+    if nodata_mask is not None:
+        if work.ndim == 3:
+            work[nodata_mask] = 0.0
+        else:
+            work[nodata_mask] = 0.0
+    return work
+
+
+def _smooth_sigma_default(env_var: str, fallback: float) -> float:
+    """Read a smoothing sigma from env, with a safe fallback. ``0`` or
+    negative disables smoothing; non-numeric falls back."""
+    raw = os.environ.get(env_var)
+    if raw is None:
+        return fallback
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        logger.warning("ignored bad %s=%r — using default %s", env_var, raw, fallback)
+        return fallback
+
+
 def cosine_similarity_map(
-    embedding_hwd: np.ndarray, query_vec: np.ndarray,
+    embedding_hwd: np.ndarray,
+    query_vec: np.ndarray,
+    *,
+    smooth_sigma: float | None = None,
 ) -> np.ndarray:
     """Compute per-patch cosine similarity against a query vector.
 
@@ -1044,6 +1112,10 @@ def cosine_similarity_map(
         query_vec: ``(D,)`` query vector — typically ``embedding_hwd``
             at the clicked pixel, or the mean over a small window for
             noise robustness.
+        smooth_sigma: Gaussian sigma (in patch units) applied to the
+            similarity raster after projection, to mask encoder-chunk
+            seams. ``None`` reads ``OE_SIM_SMOOTH_SIGMA`` env var
+            (default 1.5). Set ``0`` to disable.
 
     Returns:
         ``(H, W)`` float32 in ``[0, 1]``. The raw cosine range is
@@ -1074,10 +1146,17 @@ def cosine_similarity_map(
     # than leaking a spurious "somewhat similar" value from the zero
     # vector's dot product with the query.
     sim01[nodata_flat] = 0.0
-    return sim01.reshape(h, w)
+    sim_2d = sim01.reshape(h, w)
+    nodata_2d = nodata_flat.reshape(h, w)
+    sigma = smooth_sigma if smooth_sigma is not None else _smooth_sigma_default(
+        "OE_SIM_SMOOTH_SIGMA", 1.5,
+    )
+    return _smooth_seams(sim_2d, sigma=sigma, nodata_mask=nodata_2d)
 
 
-def pca_to_rgb(embedding_hwd: np.ndarray) -> np.ndarray:
+def pca_to_rgb(
+    embedding_hwd: np.ndarray, *, smooth_sigma: float | None = None,
+) -> np.ndarray:
     """Project a ``(H, W, D)`` embedding onto its top-3 principal components
     and map to uint8 RGB.
 
@@ -1090,6 +1169,14 @@ def pca_to_rgb(embedding_hwd: np.ndarray) -> np.ndarray:
     Pixels where every ``D`` dimension is exactly zero are treated as
     ``nodata`` and emit ``(0, 0, 0)`` — matches the convention used by
     ``_run_chunked_embedding_export`` for unwritten chunks.
+
+    Args:
+        embedding_hwd: ``(H, W, D)`` float32 stitched embedding tensor.
+        smooth_sigma: Gaussian sigma (in patch units) applied to the
+            top-3 PC rasters before quantizing to uint8, to mask the
+            encoder-chunk seams. ``None`` reads ``OE_PCA_SMOOTH_SIGMA``
+            env var (default 1.5). Set ``0`` to disable and recover the
+            old behaviour where chunk grid lines are visible.
 
     Returns a ``(H, W, 3)`` ``uint8`` array suitable for direct RGB tile
     rendering via the ``rgb_raster`` path in
@@ -1117,13 +1204,26 @@ def pca_to_rgb(embedding_hwd: np.ndarray) -> np.ndarray:
         pad = np.zeros((pcs.shape[0], 3 - k), dtype=pcs.dtype)
         pcs = np.concatenate([pcs, pad], axis=-1)
 
+    # Reshape PCs back into (H, W, 3) so we can smooth at chunk seams
+    # in image space. Nodata pixels stay at exact-zero so the smoother
+    # treats them as nodata-aware and doesn't bleed colour outside the
+    # AOI footprint.
+    pcs_2d = np.zeros((h, w, 3), dtype=np.float32)
+    pcs_2d.reshape(h * w, 3)[valid] = pcs.astype(np.float32)
+    nodata_2d = nodata_flat.reshape(h, w)
+    sigma = smooth_sigma if smooth_sigma is not None else _smooth_sigma_default(
+        "OE_PCA_SMOOTH_SIGMA", 1.5,
+    )
+    pcs_2d = _smooth_seams(pcs_2d, sigma=sigma, nodata_mask=nodata_2d)
+    pcs_smoothed = pcs_2d.reshape(h * w, 3)[valid]
+
     # Per-component min/max rescale to [0, 255]. Each channel spans its own
     # range so the image uses the full dynamic range even when PC variance
     # decays quickly (common for low-D embeddings).
-    lo = pcs.min(axis=0, keepdims=True)
-    hi = pcs.max(axis=0, keepdims=True)
+    lo = pcs_smoothed.min(axis=0, keepdims=True)
+    hi = pcs_smoothed.max(axis=0, keepdims=True)
     denom = np.maximum(hi - lo, 1e-9)
-    normed = (pcs - lo) / denom                              # (N_valid, 3)
+    normed = (pcs_smoothed - lo) / denom                     # (N_valid, 3)
     rgb[valid] = (np.clip(normed, 0.0, 1.0) * 255).astype(np.uint8)
     return rgb.reshape(h, w, 3)
 

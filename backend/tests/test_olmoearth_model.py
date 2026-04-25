@@ -49,6 +49,89 @@ def test_pca_to_scalar_on_trivial_embedding() -> None:
     assert float(scalar.min()) == 0.0 and float(scalar.max()) == 0.0
 
 
+def test_pca_to_rgb_smooths_chunk_seams_by_default() -> None:
+    """The default ``OE_PCA_SMOOTH_SIGMA=1.5`` makes ``pca_to_rgb``
+    smooth across chunk-boundary discontinuities introduced by the
+    encoder's per-chunk attention context. Synth a tiny 2-chunk
+    embedding with a hard discontinuity at the seam and assert the
+    smoothed RGB output diffuses the jump across a few pixels (no
+    longer a single 1-pixel-wide cliff).
+    """
+    rng = np.random.default_rng(0)
+    h, w, d = 16, 32, 8
+    emb = rng.standard_normal((h, w, d)).astype(np.float32)
+    # Synthetic chunk seam: shift every dim by +5 in the right half so
+    # the embedding has a discontinuity at column w/2.
+    emb[:, w // 2 :, :] += 5.0
+    rgb_smooth = M.pca_to_rgb(emb)               # default sigma applied
+    rgb_raw = M.pca_to_rgb(emb, smooth_sigma=0)  # legacy / disabled
+
+    assert rgb_smooth.shape == (h, w, 3)
+    assert rgb_raw.shape == (h, w, 3)
+    # The raw raster has a sharp seam: column w/2 vs column w/2 - 1
+    # differ by a large jump (most channels ~maximally separated). The
+    # smoothed raster should have a smaller jump there.
+    raw_jump = np.abs(
+        rgb_raw[:, w // 2, :].astype(int) - rgb_raw[:, w // 2 - 1, :].astype(int)
+    ).mean()
+    smooth_jump = np.abs(
+        rgb_smooth[:, w // 2, :].astype(int) - rgb_smooth[:, w // 2 - 1, :].astype(int)
+    ).mean()
+    assert smooth_jump < raw_jump, (
+        f"smoothing should reduce seam jump; raw={raw_jump:.1f} "
+        f"vs smooth={smooth_jump:.1f}"
+    )
+
+
+def test_pca_to_rgb_disable_smoothing_via_env(monkeypatch) -> None:
+    """``OE_PCA_SMOOTH_SIGMA=0`` recovers the original behaviour where
+    chunk grid lines stay visible. Useful for debugging encoder
+    boundary effects."""
+    monkeypatch.setenv("OE_PCA_SMOOTH_SIGMA", "0")
+    rng = np.random.default_rng(0)
+    emb = rng.standard_normal((8, 16, 8)).astype(np.float32)
+    emb[:, 8:, :] += 5.0
+    rgb_env_disabled = M.pca_to_rgb(emb)
+    rgb_explicit_disabled = M.pca_to_rgb(emb, smooth_sigma=0)
+    assert np.array_equal(rgb_env_disabled, rgb_explicit_disabled)
+
+
+def test_cosine_similarity_map_smooths_chunk_seams() -> None:
+    """Same chunk-seam mitigation applies to cosine_similarity_map.
+    Hard embedding discontinuity at the chunk boundary should produce
+    a smaller similarity jump after smoothing than before."""
+    rng = np.random.default_rng(7)
+    h, w, d = 16, 32, 8
+    emb = rng.standard_normal((h, w, d)).astype(np.float32)
+    emb[:, w // 2 :, :] += 5.0
+    query = emb[h // 2, 0]  # query against a left-half pixel
+
+    sim_smooth = M.cosine_similarity_map(emb, query)
+    sim_raw = M.cosine_similarity_map(emb, query, smooth_sigma=0)
+
+    raw_jump = abs(sim_raw[h // 2, w // 2] - sim_raw[h // 2, w // 2 - 1])
+    smooth_jump = abs(sim_smooth[h // 2, w // 2] - sim_smooth[h // 2, w // 2 - 1])
+    assert smooth_jump < raw_jump, (
+        f"smoothing should reduce similarity seam jump; raw={raw_jump:.4f} "
+        f"vs smooth={smooth_jump:.4f}"
+    )
+
+
+def test_smooth_seams_preserves_nodata_mask() -> None:
+    """Pixels marked nodata must stay at exact zero after smoothing —
+    otherwise the AOI footprint blurs outward and chunks that never
+    produced data leak colour from their neighbours."""
+    raster = np.full((10, 10, 3), 0.7, dtype=np.float32)
+    nodata = np.zeros((10, 10), dtype=bool)
+    nodata[:3, :] = True  # top 3 rows = nodata
+    raster[:3, :, :] = 0.0
+    out = M._smooth_seams(raster, sigma=2.0, nodata_mask=nodata)
+    assert np.allclose(out[:3, :, :], 0.0), "nodata pixels must stay zero"
+    # Valid pixels far from the boundary should still be ~0.7 (Gaussian
+    # of a constant is the same constant, modulo edge effects).
+    assert abs(float(out[8, 5, 0]) - 0.7) < 0.05
+
+
 def test_pca_to_scalar_rescales_to_unit_interval() -> None:
     rng = np.random.default_rng(0)
     emb = rng.standard_normal((6, 8, 12)).astype(np.float32)

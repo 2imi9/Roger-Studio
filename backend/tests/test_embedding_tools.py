@@ -114,12 +114,17 @@ def test_pca_to_rgb_handles_all_nodata() -> None:
 
 def test_cosine_similarity_map_identical_query_is_one() -> None:
     """A patch matched against ITS OWN embedding vector must score 1.0
-    (after the [-1, 1] → [0, 1] rescale)."""
+    (after the [-1, 1] → [0, 1] rescale).
+
+    Smoothing is disabled for this math identity test — the chunk-seam
+    Gaussian blur is a visualization concern that diffuses the exact-1
+    value across neighbours by design. See ``test_pca_to_rgb_smooths_chunk_seams``.
+    """
     rng = np.random.default_rng(0)
     emb = rng.standard_normal((6, 6, 32)).astype(np.float32)
     # Pick a specific patch as the query.
     qr, qc = 2, 3
-    sim = cosine_similarity_map(emb, emb[qr, qc])
+    sim = cosine_similarity_map(emb, emb[qr, qc], smooth_sigma=0)
     # That pixel should saturate at 1.0 (cos sim = 1, rescaled = 1).
     assert sim[qr, qc] == pytest.approx(1.0, abs=1e-5)
     # All values in [0, 1].
@@ -129,13 +134,16 @@ def test_cosine_similarity_map_identical_query_is_one() -> None:
 
 def test_cosine_similarity_map_anti_correlated_is_zero() -> None:
     """A query that's the EXACT NEGATIVE of a patch should score ~0
-    (cos = -1, rescaled = 0). Verifies the [-1, 1] → [0, 1] mapping."""
+    (cos = -1, rescaled = 0). Verifies the [-1, 1] → [0, 1] mapping.
+
+    Smoothing disabled — see ``test_cosine_similarity_map_identical_query_is_one``.
+    """
     rng = np.random.default_rng(1)
     base = rng.standard_normal(16).astype(np.float32)
     emb = np.zeros((4, 4, 16), dtype=np.float32)
     emb[1, 1] = base
     emb[2, 2] = -base   # exact negation
-    sim = cosine_similarity_map(emb, base)
+    sim = cosine_similarity_map(emb, base, smooth_sigma=0)
     assert sim[1, 1] == pytest.approx(1.0, abs=1e-5)
     assert sim[2, 2] == pytest.approx(0.0, abs=1e-5)
 
@@ -144,11 +152,17 @@ def test_cosine_similarity_map_marks_nodata_as_zero() -> None:
     """All-zero (nodata) patches must come back with similarity 0,
     NOT a spurious mid-range value from cos(zero, query) = 0/eps ≈ 0.
     The rescale would put 0 → 0.5, which would render as 'unrelated'
-    instead of clearly 'no data here'. The helper enforces 0 explicitly."""
+    instead of clearly 'no data here'. The helper enforces 0 explicitly.
+
+    Smoothing disabled so the test asserts the exact identity. The
+    smoothing path uses the nodata mask to keep nodata pixels at zero
+    after blurring (separately covered by
+    ``test_smooth_seams_preserves_nodata_mask`` in test_olmoearth_model).
+    """
     rng = np.random.default_rng(2)
     emb = np.zeros((5, 5, 16), dtype=np.float32)
     emb[2, 2] = rng.standard_normal(16)   # only one valid patch
-    sim = cosine_similarity_map(emb, emb[2, 2])
+    sim = cosine_similarity_map(emb, emb[2, 2], smooth_sigma=0)
     # Valid patch saturates at 1.
     assert sim[2, 2] == pytest.approx(1.0, abs=1e-5)
     # Every nodata patch is exactly 0 (NOT 0.5).
