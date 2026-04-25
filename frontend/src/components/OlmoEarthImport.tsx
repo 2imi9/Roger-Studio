@@ -196,6 +196,10 @@ export function OlmoEarthImport({
   selectedArea,
   onAddImageryLayer,
   onSelectArea,
+  queryPixel,
+  pickQueryActive,
+  onStartPickQuery,
+  onClearQueryPixel,
 }: {
   olmoCache?: Record<string, OlmoEarthRepoStatus>;
   /** Render without outer Panel chrome (popover usage). */
@@ -214,6 +218,15 @@ export function OlmoEarthImport({
    * ``selectedArea`` and pans the map to the demo location. Optional —
    * the button hides if not provided (e.g. read-only contexts). */
   onSelectArea?: (bbox: BBox) => void;
+  /** Embedding similarity query pixel state — picked location, whether
+   * pixel-pick mode is currently armed, and handlers to start / clear.
+   * App-lifted so the same picked pixel renders on the map AND the
+   * Similarity tool sees it on the next click. Optional — pixel-pick UI
+   * just hides when handlers aren't provided. */
+  queryPixel?: { lon: number; lat: number } | null;
+  pickQueryActive?: boolean;
+  onStartPickQuery?: () => void;
+  onClearQueryPixel?: () => void;
 }) {
   // Default selection: first FT head unless initialRepoId matched something.
   const allOptions = [...FT_HEADS, ...BASE_ENCODERS];
@@ -410,18 +423,27 @@ export function OlmoEarthImport({
     }
   };
 
-  // Embedding tool: cosine similarity heatmap. v1 uses the AOI center
-  // as the query (zero clicks, instant demo). A future iteration will
-  // expose a click-on-map pixel-pick UI for arbitrary query points.
+  // Embedding tool: cosine similarity heatmap. The query pixel is
+  // either user-picked (via the "Pick query pixel" button → map click)
+  // or defaults to the AOI center when none is picked. The picked
+  // pixel persists across runs so users can iterate on the same query
+  // location while toggling models / dates.
   const handleSimilarity = async () => {
     if (!selectedArea) return;
     if (selected.kind !== "base") return;
     setBusy("sim");
-    setStatus("Computing embedding + cosine similarity vs AOI center — bright pixels = looks like the middle of your area.");
+    const queryLabel = queryPixel
+      ? `picked pixel (${queryPixel.lat.toFixed(4)}, ${queryPixel.lon.toFixed(4)})`
+      : "AOI center";
+    setStatus(
+      `Computing embedding + cosine similarity vs ${queryLabel} — bright pixels = looks like the query.`,
+    );
     try {
       const res = await runOlmoEarthEmbeddingSimilarity({
         bbox: selectedArea,
         modelRepoId: repoId,
+        queryLon: queryPixel?.lon,
+        queryLat: queryPixel?.lat,
       });
       if (onAddImageryLayer) {
         onAddImageryLayer({
@@ -724,10 +746,91 @@ export function OlmoEarthImport({
               named classes. PCA's job is "encoder sanity check" + "where
               should I draw labels", not "the answer". */}
 
+          {/* Pixel-pick UI for the Similarity query. Three states:
+                a) idle, no pick yet — show "Pick query pixel" button
+                   (disabled until AOI is set)
+                b) picking armed — show status + Cancel; map cursor is
+                   crosshair, next click writes the pixel
+                c) pick committed — show coords + × clear
+              Hidden entirely when the App-level handlers aren't wired
+              (e.g. read-only preview contexts). */}
+          {onStartPickQuery && onClearQueryPixel && (
+            <div className="px-2 py-1.5 rounded bg-geo-bg border border-geo-border text-[10px] leading-snug">
+              <div className="text-geo-muted font-semibold uppercase tracking-wider">
+                Query pixel
+              </div>
+              {pickQueryActive ? (
+                <div className="flex items-center justify-between gap-2 mt-0.5">
+                  <span className="text-geo-accent">
+                    Click anywhere on the map to set the query pixel…
+                  </span>
+                  <button
+                    type="button"
+                    onClick={onClearQueryPixel}
+                    className="text-geo-muted hover:text-geo-text underline-offset-2 hover:underline cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              ) : queryPixel ? (
+                <div className="flex items-center justify-between gap-2 mt-0.5">
+                  <span className="text-geo-text font-mono">
+                    {queryPixel.lat.toFixed(4)}, {queryPixel.lon.toFixed(4)}
+                  </span>
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={onStartPickQuery}
+                      disabled={busy !== null || !selectedArea}
+                      className={`underline-offset-2 hover:underline ${
+                        busy !== null || !selectedArea
+                          ? "text-geo-muted cursor-not-allowed"
+                          : "text-geo-accent cursor-pointer"
+                      }`}
+                    >
+                      Re-pick
+                    </button>
+                    <button
+                      type="button"
+                      onClick={onClearQueryPixel}
+                      className="text-geo-muted hover:text-geo-danger cursor-pointer"
+                      title="Clear picked pixel — Similarity will fall back to AOI center"
+                    >
+                      × clear
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex items-center justify-between gap-2 mt-0.5">
+                  <span className="text-geo-muted">
+                    Default: AOI center
+                  </span>
+                  <button
+                    type="button"
+                    onClick={onStartPickQuery}
+                    disabled={busy !== null || !selectedArea}
+                    className={`underline-offset-2 hover:underline ${
+                      busy !== null || !selectedArea
+                        ? "text-geo-muted cursor-not-allowed"
+                        : "text-geo-accent cursor-pointer"
+                    }`}
+                    title={
+                      selectedArea
+                        ? "Click then pick a pixel on the map to set the similarity query location"
+                        : "Draw an AOI on the map first"
+                    }
+                  >
+                    Pick query pixel
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
           {/* PRIMARY: Similarity search — interpretable, query-driven, the
               most direct path from "I drew an AOI" to "show me more like
-              the centre". v1 uses AOI center as the query; click-on-map
-              pixel-pick ships in the next pass. */}
+              the query". Query is either user-picked (via the block
+              above) or AOI center when none is picked. */}
           <button
             type="button"
             onClick={handleSimilarity}
@@ -739,16 +842,20 @@ export function OlmoEarthImport({
             }`}
             title={
               selectedArea
-                ? "Compute embeddings + cosine-similarity heatmap vs the AOI center. Bright = looks like the middle of your area."
+                ? `Compute embeddings + cosine-similarity heatmap vs the ${queryPixel ? "picked query pixel" : "AOI center (default — pick a pixel above for a custom query)"}. Bright = looks like the query.`
                 : "Draw an area on the map first"
             }
           >
-            {busy === "sim" ? "Computing similarity…" : "Similarity to AOI center"}
+            {busy === "sim"
+              ? "Computing similarity…"
+              : queryPixel
+                ? "Similarity to picked pixel"
+                : "Similarity to AOI center"}
           </button>
           <div className="text-[10px] text-geo-muted leading-snug -mt-1">
-            Cosine similarity heatmap to the embedding at your AOI center.
-            Bright pixels look like the middle of your area — directly
-            interpretable. Pixel-pick UI ships next.
+            Cosine similarity heatmap to the embedding at the query
+            pixel (use the picker above) or AOI center (default).
+            Bright pixels look like the query — directly interpretable.
           </div>
 
           {/* SECONDARY: Export as COG — the science-grade exit. Once the
@@ -808,8 +915,12 @@ export function OlmoEarthImport({
                 eyeballing landscape diversity and deciding where to draw
                 labels.{" "}
                 <b>Not a classification</b> — colors aren't stable across
-                runs (per-chunk PCA basis), and visible chunk seams are
-                expected. For science output use Similarity (above) or
+                runs (PCA basis depends on the AOI's embedding
+                distribution). Chunk-grid seams are smoothed via a small
+                Gaussian blur (configurable via{" "}
+                <code className="font-mono">OE_PCA_SMOOTH_SIGMA</code>);
+                the basis itself is computed once globally on the stitched
+                tensor. For science output use Similarity (above) or
                 Export-as-COG + sklearn.
               </div>
             </div>

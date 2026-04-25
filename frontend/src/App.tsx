@@ -179,6 +179,29 @@ export function App() {
     setSelectedGeometry(null);
     setSelectedArea(null);
     setAnalysisResult(null);
+    setQueryPixel(null);
+    setPickQueryActive(false);
+  }, []);
+
+  // Embedding-tools query pixel: lifted to App so MapView can install a
+  // one-shot click capture handler AND OlmoEarthImport (in either Sidebar
+  // or MapView popover) can show / clear / use the picked location. The
+  // picked pixel becomes the cosine-similarity query when the user runs
+  // the Similarity tool; with no pick set, the backend falls back to AOI
+  // center (existing behaviour).
+  const [queryPixel, setQueryPixel] = useState<{ lon: number; lat: number } | null>(null);
+  const [pickQueryActive, setPickQueryActive] = useState(false);
+  const handleStartPickQuery = useCallback(() => setPickQueryActive(true), []);
+  const handleQueryPixelPicked = useCallback(
+    (lon: number, lat: number) => {
+      setQueryPixel({ lon, lat });
+      setPickQueryActive(false);
+    },
+    [],
+  );
+  const handleClearQueryPixel = useCallback(() => {
+    setQueryPixel(null);
+    setPickQueryActive(false);
   }, []);
 
   const handleAddImageryLayer = useCallback((layer: ImageryLayer) => {
@@ -463,6 +486,10 @@ export function App() {
         selectedGeometry={selectedGeometry}
         onSelectDemoArea={handleDemoAreaSelect}
         onClearSelection={handleClearSelection}
+        queryPixel={queryPixel}
+        pickQueryActive={pickQueryActive}
+        onStartPickQuery={handleStartPickQuery}
+        onClearQueryPixel={handleClearQueryPixel}
         imageryLayers={imageryLayers}
         onAddImageryLayer={handleAddImageryLayer}
         onRemoveImageryLayer={handleRemoveImageryLayer}
@@ -513,6 +540,11 @@ export function App() {
               onAreaSelect={handleAreaSelect}
               onGeometrySelect={handleGeometrySelect}
               onSelectDemoArea={handleDemoAreaSelect}
+              queryPixel={queryPixel}
+              pickQueryActive={pickQueryActive}
+              onQueryPixelPicked={handleQueryPixelPicked}
+              onStartPickQuery={handleStartPickQuery}
+              onClearQueryPixel={handleClearQueryPixel}
               selectedArea={selectedArea}
               selectedGeometry={selectedGeometry}
               overlayGeojson={overlayGeojson}

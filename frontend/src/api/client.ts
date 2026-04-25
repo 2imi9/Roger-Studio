@@ -917,10 +917,12 @@ export interface OlmoEarthPCARgbArgs {
   chunkSizeM?: number;
 }
 
-/** Embedding-tools workflow: cosine-similarity heatmap. The user's
- * query is currently the AOI center (no pixel-pick UI yet); a follow-up
- * iteration will let them click anywhere on the map to set a custom
- * query point. */
+/** Embedding-tools workflow: cosine-similarity heatmap. The user can
+ * either let the AOI center be the query (no extra clicks) OR pick a
+ * specific pixel via the map's "Pick query pixel" button — the click
+ * captures a lon/lat that flows back as ``queryLon`` / ``queryLat``.
+ * Window-pooling is supported so single-pixel spikes get smoothed via
+ * an N×N neighbourhood mean. */
 export interface OlmoEarthSimilarityArgs extends OlmoEarthPCARgbArgs {
   /** WGS-84 longitude of the query pixel. Defaults to AOI center on
    * the backend if omitted. */

@@ -79,6 +79,15 @@ interface MapViewProps {
   /** Set the AOI from a non-draw path (model demo button) and pan the
    * map there. Threaded to OlmoEarthImport in the popover. */
   onSelectDemoArea?: (bbox: BBox) => void;
+  /** Embedding similarity query pixel state (App-lifted). */
+  queryPixel?: { lon: number; lat: number } | null;
+  pickQueryActive?: boolean;
+  /** Called once the user clicks the map while ``pickQueryActive`` is on. */
+  onQueryPixelPicked?: (lon: number, lat: number) => void;
+  /** Forward to OlmoEarthImport so the embedding panel can request a
+   * pixel pick + clear the picked pixel. */
+  onStartPickQuery?: () => void;
+  onClearQueryPixel?: () => void;
   selectedArea: BBox | null;
   selectedGeometry?: GeoJSON.Polygon | null;
   overlayGeojson?: (GeoJSON.Feature | GeoJSON.FeatureCollection)[];
@@ -135,6 +144,11 @@ export function MapView({
   onAreaSelect,
   onGeometrySelect,
   onSelectDemoArea,
+  queryPixel,
+  pickQueryActive,
+  onQueryPixelPicked,
+  onStartPickQuery,
+  onClearQueryPixel,
   selectedArea,
   selectedGeometry,
   overlayGeojson,
@@ -779,6 +793,85 @@ export function MapView({
     else map.on("load", apply);
   }, [selectedArea, selectedGeometry]);
 
+  // Embedding-similarity query pixel: install a one-shot click capture
+  // when ``pickQueryActive`` flips on. The handler fires once, calls
+  // back into App with WGS-84 lon/lat, then auto-removes itself. We
+  // also flip the canvas cursor to a crosshair so the picking mode is
+  // visually obvious — matches how MapLibre's own draw plugins signal
+  // the active mode. Side-effect cleanup on every dep change keeps the
+  // handler / cursor pair atomic; React StrictMode double-mounts are
+  // safe because the cleanup nulls the cursor + removes the handler.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !pickQueryActive || !onQueryPixelPicked) return;
+    const canvas = map.getCanvas();
+    const prevCursor = canvas.style.cursor;
+    canvas.style.cursor = "crosshair";
+    const handler = (ev: maplibregl.MapMouseEvent) => {
+      onQueryPixelPicked(ev.lngLat.lng, ev.lngLat.lat);
+    };
+    map.once("click", handler);
+    return () => {
+      canvas.style.cursor = prevCursor;
+      map.off("click", handler);
+    };
+  }, [pickQueryActive, onQueryPixelPicked]);
+
+  // Render the picked query pixel as a small marker on the map. Lives
+  // in its own GeoJSON source so toggling on/off is just a setData
+  // call — no MapLibre layer churn. Marker style: bright magenta dot
+  // with a white halo so it reads on any basemap (OSM grey, satellite
+  // green, dark) without colliding with the amber selection outline.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const SRC = "query-pixel-src";
+    const LYR_HALO = "query-pixel-halo";
+    const LYR_DOT = "query-pixel-dot";
+    const apply = () => {
+      const data: GeoJSON.FeatureCollection<GeoJSON.Point> = queryPixel
+        ? {
+          type: "FeatureCollection",
+          features: [{
+            type: "Feature",
+            geometry: { type: "Point", coordinates: [queryPixel.lon, queryPixel.lat] },
+            properties: {},
+          }],
+        }
+        : { type: "FeatureCollection", features: [] };
+      if (!map.getSource(SRC)) {
+        map.addSource(SRC, { type: "geojson", data });
+        map.addLayer({
+          id: LYR_HALO,
+          type: "circle",
+          source: SRC,
+          paint: {
+            "circle-radius": 9,
+            "circle-color": "#ffffff",
+            "circle-opacity": 0.9,
+            "circle-stroke-width": 0,
+          },
+        });
+        map.addLayer({
+          id: LYR_DOT,
+          type: "circle",
+          source: SRC,
+          paint: {
+            "circle-radius": 5,
+            "circle-color": "#e11d48",  // rose-600 — high contrast on every basemap
+            "circle-stroke-color": "#fef2f2",
+            "circle-stroke-width": 1,
+          },
+        });
+      } else {
+        const src = map.getSource(SRC) as maplibregl.GeoJSONSource;
+        src.setData(data);
+      }
+    };
+    if (map.isStyleLoaded()) apply();
+    else map.once("load", apply);
+  }, [queryPixel]);
+
   // Build legend from overlay features
   const legend = useMemo(() => {
     if (!overlayGeojson || overlayGeojson.length === 0) return [];
@@ -893,6 +986,10 @@ export function MapView({
           onRemoveImageryLayer={onRemoveImageryLayer}
           onAddImageryLayer={onAddImageryLayer}
           onSelectDemoArea={onSelectDemoArea}
+          queryPixel={queryPixel ?? null}
+          pickQueryActive={pickQueryActive ?? false}
+          onStartPickQuery={onStartPickQuery}
+          onClearQueryPixel={onClearQueryPixel}
           datasets={datasets ?? []}
           olmoCache={olmoCache ?? {}}
           selectedArea={selectedArea}
@@ -1465,6 +1562,10 @@ function MapLayersControl({
   onRemoveImageryLayer,
   onAddImageryLayer,
   onSelectDemoArea,
+  queryPixel,
+  pickQueryActive,
+  onStartPickQuery,
+  onClearQueryPixel,
   datasets,
   olmoCache,
   selectedArea,
@@ -1477,6 +1578,10 @@ function MapLayersControl({
   onRemoveImageryLayer?: (id: string) => void;
   onAddImageryLayer?: (layer: ImageryLayer) => void;
   onSelectDemoArea?: (bbox: BBox) => void;
+  queryPixel?: { lon: number; lat: number } | null;
+  pickQueryActive?: boolean;
+  onStartPickQuery?: () => void;
+  onClearQueryPixel?: () => void;
   datasets: DatasetInfo[];
   olmoCache: Record<string, OlmoEarthRepoStatus>;
   selectedArea: BBox | null;
@@ -1824,6 +1929,10 @@ function MapLayersControl({
                   selectedArea={selectedArea}
                   onAddImageryLayer={onAddImageryLayer}
                   onSelectArea={onSelectDemoArea}
+                  queryPixel={queryPixel}
+                  pickQueryActive={pickQueryActive}
+                  onStartPickQuery={onStartPickQuery}
+                  onClearQueryPixel={onClearQueryPixel}
                 />
               </div>
             )}

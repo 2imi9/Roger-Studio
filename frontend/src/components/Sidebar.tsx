@@ -37,6 +37,13 @@ interface SidebarProps {
    * Wired to App.handleDemoAreaSelect; threaded through to OlmoEarthImport
    * so the "Use demo AOI" button in the inference panel works. */
   onSelectDemoArea?: (bbox: BBox) => void;
+  /** Embedding similarity query pixel state — App-lifted so the same
+   * picked location is shared between the Sidebar OlmoEarthImport
+   * (full panel) and the MapView popover OlmoEarthImport (compact). */
+  queryPixel?: { lon: number; lat: number } | null;
+  pickQueryActive?: boolean;
+  onStartPickQuery?: () => void;
+  onClearQueryPixel?: () => void;
   imageryLayers?: ImageryLayer[];
   onAddImageryLayer?: (l: ImageryLayer) => void;
   onRemoveImageryLayer?: (id: string) => void;
@@ -95,6 +102,10 @@ export function Sidebar({
   selectedGeometry,
   onClearSelection,
   onSelectDemoArea,
+  queryPixel,
+  pickQueryActive,
+  onStartPickQuery,
+  onClearQueryPixel,
   imageryLayers,
   onAddImageryLayer,
   onRemoveImageryLayer,
@@ -812,6 +823,10 @@ export function Sidebar({
               selectedArea={selectedArea}
               onAddImageryLayer={onAddImageryLayer}
               onSelectArea={onSelectDemoArea}
+              queryPixel={queryPixel}
+              pickQueryActive={pickQueryActive}
+              onStartPickQuery={onStartPickQuery}
+              onClearQueryPixel={onClearQueryPixel}
             />
           </>
         )}
