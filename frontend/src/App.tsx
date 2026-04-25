@@ -307,6 +307,17 @@ export function App() {
   // disambiguates: only handleUpload (or sample load) increments it.
   const [flyToTrigger, setFlyToTrigger] = useState<{ bbox: BBox; nonce: number } | null>(null);
 
+  // OlmoEarthImport's "Use demo AOI" shortcut — sets the AOI to a model-
+  // appropriate ~3 km bbox AND pans the map there, so the user immediately
+  // sees what region the demo will run over. Distinct from handleUpload
+  // because there's no dataset to register; just an AOI + map fly.
+  const handleDemoAreaSelect = useCallback((bbox: BBox) => {
+    setSelectedArea(bbox);
+    setSelectedGeometry(null);
+    setError(null);
+    setFlyToTrigger({ bbox, nonce: Date.now() });
+  }, []);
+
   const handleUpload = useCallback((ds: DatasetInfo) => {
     setDatasets((prev) => [...prev, ds]);
     const bbox = ds.raster?.bbox || ds.vector?.bbox || ds.point_cloud?.bbox || ds.multidim?.bbox;
@@ -450,6 +461,7 @@ export function App() {
         onViewChange={setViewMode}
         selectedArea={selectedArea}
         selectedGeometry={selectedGeometry}
+        onSelectDemoArea={handleDemoAreaSelect}
         onClearSelection={handleClearSelection}
         imageryLayers={imageryLayers}
         onAddImageryLayer={handleAddImageryLayer}
@@ -500,6 +512,7 @@ export function App() {
             <MapView
               onAreaSelect={handleAreaSelect}
               onGeometrySelect={handleGeometrySelect}
+              onSelectDemoArea={handleDemoAreaSelect}
               selectedArea={selectedArea}
               selectedGeometry={selectedGeometry}
               overlayGeojson={overlayGeojson}

@@ -33,6 +33,10 @@ interface SidebarProps {
   selectedArea: BBox | null;
   selectedGeometry?: GeoJSON.Polygon | null;
   onClearSelection?: () => void;
+  /** Set the AOI to a small per-model demo bbox + pan the map there.
+   * Wired to App.handleDemoAreaSelect; threaded through to OlmoEarthImport
+   * so the "Use demo AOI" button in the inference panel works. */
+  onSelectDemoArea?: (bbox: BBox) => void;
   imageryLayers?: ImageryLayer[];
   onAddImageryLayer?: (l: ImageryLayer) => void;
   onRemoveImageryLayer?: (id: string) => void;
@@ -90,6 +94,7 @@ export function Sidebar({
   selectedArea,
   selectedGeometry,
   onClearSelection,
+  onSelectDemoArea,
   imageryLayers,
   onAddImageryLayer,
   onRemoveImageryLayer,
@@ -806,6 +811,7 @@ export function Sidebar({
               olmoCache={olmoCache}
               selectedArea={selectedArea}
               onAddImageryLayer={onAddImageryLayer}
+              onSelectArea={onSelectDemoArea}
             />
           </>
         )}

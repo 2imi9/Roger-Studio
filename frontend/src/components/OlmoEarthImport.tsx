@@ -144,12 +144,58 @@ function formatApiError(e: unknown): string {
   return raw;
 }
 
+/**
+ * Per-model demo AOI registry. Each entry picks a small (~3 km × 3 km)
+ * bbox over a region where the model's training distribution actually
+ * applies, so a one-click run produces a meaningful output. The button
+ * also pans the map there, so the user immediately sees what the model
+ * was looking at.
+ *
+ * Coverage rationale:
+ *   * LFMC — Riverside County chaparral (fire-prone, dry fuel)
+ *   * Mangrove — Florida Keys (well-mapped tropical mangrove)
+ *   * AWF — Tsavo East, Kenya (head's training-distribution region)
+ *   * ForestLossDriver — Pará, Brazilian Amazon (verified end-to-end with
+ *     event_date=2022-08-15 → "agriculture" 32% / "burned" 17% softmax)
+ *   * EcosystemTypeMapping — Tunisia (head trained on north Africa group)
+ *   * Base encoders — Monterey Bay (default, works anywhere; chosen for
+ *     visual diversity in PCA false-color + similarity)
+ */
+const DEMO_AOIS: Record<string, { bbox: BBox; eventDate?: string; label: string }> = {
+  "allenai/OlmoEarth-v1-FT-LFMC-Base": {
+    bbox: { west: -117.30, south: 33.75, east: -117.27, north: 33.78 },
+    label: "Riverside chaparral",
+  },
+  "allenai/OlmoEarth-v1-FT-Mangrove-Base": {
+    bbox: { west: -81.45, south: 24.62, east: -81.42, north: 24.65 },
+    label: "Florida Keys",
+  },
+  "allenai/OlmoEarth-v1-FT-AWF-Base": {
+    bbox: { west: 38.50, south: -3.10, east: 38.53, north: -3.07 },
+    label: "Tsavo East, Kenya",
+  },
+  "allenai/OlmoEarth-v1-FT-ForestLossDriver-Base": {
+    bbox: { west: -55.05, south: -9.05, east: -55.02, north: -9.02 },
+    eventDate: "2022-08-15",
+    label: "Pará, Brazilian Amazon",
+  },
+  "allenai/OlmoEarth-v1-FT-EcosystemTypeMapping-Base": {
+    bbox: { west: 10.10, south: 35.50, east: 10.13, north: 35.53 },
+    label: "Tunisia (training region)",
+  },
+};
+const DEMO_AOI_FALLBACK: { bbox: BBox; label: string } = {
+  bbox: { west: -121.92, south: 36.60, east: -121.89, north: 36.63 },
+  label: "Monterey Bay",
+};
+
 export function OlmoEarthImport({
   olmoCache,
   compact,
   initialRepoId,
   selectedArea,
   onAddImageryLayer,
+  onSelectArea,
 }: {
   olmoCache?: Record<string, OlmoEarthRepoStatus>;
   /** Render without outer Panel chrome (popover usage). */
@@ -163,6 +209,11 @@ export function OlmoEarthImport({
   /** Attach the inference result as an ImageryLayer. Wired straight to
    * App.handleAddImageryLayer — App's imageryLayers render on MapView. */
   onAddImageryLayer?: (layer: ImageryLayer) => void;
+  /** Set the AOI from inside this component (used by the per-model demo
+   * AOI button). Wired to App.handleDemoAreaSelect which both updates
+   * ``selectedArea`` and pans the map to the demo location. Optional —
+   * the button hides if not provided (e.g. read-only contexts). */
+  onSelectArea?: (bbox: BBox) => void;
 }) {
   // Default selection: first FT head unless initialRepoId matched something.
   const allOptions = [...FT_HEADS, ...BASE_ENCODERS];
@@ -194,6 +245,24 @@ export function OlmoEarthImport({
   // ForestLossDriver fits; check by repo id rather than threading a flag
   // through ModelOption since the list is short.
   const isPrePostHead = selected.repoId === "allenai/OlmoEarth-v1-FT-ForestLossDriver-Base";
+  // Pick the demo AOI keyed off the currently selected model. Falls back
+  // to Monterey Bay for any model not in the registry (mostly base
+  // encoders, which work anywhere).
+  const demoAoi = DEMO_AOIS[selected.repoId] ?? DEMO_AOI_FALLBACK;
+
+  // One-click "set AOI to a region this model can actually predict on +
+  // pan map there + auto-set event_date for ForestLossDriver". This
+  // closes the gap where Try Demo (Kenyan Coast) gave a 44 km AOI —
+  // useful for AWF, useless for everything else and would take 10+ min
+  // to run.
+  const handlePickDemoAoi = () => {
+    if (!onSelectArea) return;
+    onSelectArea(demoAoi.bbox);
+    if (isPrePostHead && demoAoi.eventDate) {
+      setEventDate(demoAoi.eventDate);
+    }
+    setStatus(`Demo AOI set to ${demoAoi.label} — click Run to execute inference`);
+  };
 
   // Embedding tools require raw per-patch vectors, which only base encoders
   // expose. When the user switches to the Embedding tab while an FT head is
@@ -551,6 +620,27 @@ export function OlmoEarthImport({
           <div className="text-geo-danger">
             No area selected — draw a rectangle or polygon on the map first.
           </div>
+        )}
+        {/* Per-model "demo AOI" shortcut. Sets a small (~3 km) bbox over
+            a region in the model's training distribution and pans the
+            map there. For ForestLossDriver, also auto-fills event_date.
+            Hidden when the host didn't wire the callback (e.g. read-only
+            preview). Subtle styling so users know it's a shortcut, not
+            the primary path. */}
+        {onSelectArea && activeTab === "inference" && (
+          <button
+            type="button"
+            onClick={handlePickDemoAoi}
+            disabled={busy !== null}
+            className={`mt-1 text-[10px] underline-offset-2 hover:underline transition-colors ${
+              busy !== null
+                ? "text-geo-muted cursor-not-allowed"
+                : "text-geo-accent cursor-pointer"
+            }`}
+            title={`Pick a small demo AOI (~3 km × 3 km) over ${demoAoi.label} — runs in ~1-3 min instead of 10+`}
+          >
+            ↳ Use demo AOI ({demoAoi.label})
+          </button>
         )}
       </div>
 

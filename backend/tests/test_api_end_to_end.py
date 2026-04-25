@@ -142,6 +142,31 @@ async def test_infer_endpoint_falls_back_to_stub_on_bad_model(client) -> None:
     assert "stub_reason" in data
 
 
+@pytest.mark.network
+@pytest.mark.asyncio
+async def test_geojson_export_rejects_lfmc_regression_with_actionable_400(client) -> None:
+    """LFMC is a regression head — there's no class raster to vectorise.
+    The endpoint must 400 with a message that points the user at the
+    Export-as-COG path, NOT 500 or fall back to a stub. Network-marked
+    because the underlying inference must actually run for task_type
+    to land in the cached job dict.
+    """
+    from app.services import olmoearth_inference as OI  # noqa: PLC0415
+
+    OI.clear_jobs()
+
+    bbox = {"west": -122.35, "south": 47.60, "east": -122.32, "north": 47.63}
+    payload = {
+        "bbox": bbox,
+        "model_repo_id": "allenai/OlmoEarth-v1-FT-LFMC-Base",
+    }
+    r = await client.post("/api/olmoearth/ft-classification/geojson", json=payload, timeout=300.0)
+    assert r.status_code == 400, r.text
+    detail = r.json().get("detail", "")
+    assert "task_type='regression'" in detail
+    assert "Export-as-COG" in detail
+
+
 @pytest.mark.asyncio
 async def test_geojson_export_surfaces_stub_reason_when_inference_failed(client) -> None:
     """Audit finding 2026-04-25: when inference falls back to a stub, the

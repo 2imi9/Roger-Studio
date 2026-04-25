@@ -76,6 +76,9 @@ export interface ImageryLayer {
 interface MapViewProps {
   onAreaSelect: (bbox: BBox) => void;
   onGeometrySelect?: (polygon: GeoJSON.Polygon) => void;
+  /** Set the AOI from a non-draw path (model demo button) and pan the
+   * map there. Threaded to OlmoEarthImport in the popover. */
+  onSelectDemoArea?: (bbox: BBox) => void;
   selectedArea: BBox | null;
   selectedGeometry?: GeoJSON.Polygon | null;
   overlayGeojson?: (GeoJSON.Feature | GeoJSON.FeatureCollection)[];
@@ -131,6 +134,7 @@ type DrawMode = "none" | "rectangle" | "polygon";
 export function MapView({
   onAreaSelect,
   onGeometrySelect,
+  onSelectDemoArea,
   selectedArea,
   selectedGeometry,
   overlayGeojson,
@@ -888,6 +892,7 @@ export function MapView({
           onToggleHidden={toggleLayerHidden}
           onRemoveImageryLayer={onRemoveImageryLayer}
           onAddImageryLayer={onAddImageryLayer}
+          onSelectDemoArea={onSelectDemoArea}
           datasets={datasets ?? []}
           olmoCache={olmoCache ?? {}}
           selectedArea={selectedArea}
@@ -1459,6 +1464,7 @@ function MapLayersControl({
   onToggleHidden,
   onRemoveImageryLayer,
   onAddImageryLayer,
+  onSelectDemoArea,
   datasets,
   olmoCache,
   selectedArea,
@@ -1470,6 +1476,7 @@ function MapLayersControl({
   onToggleHidden: (id: string) => void;
   onRemoveImageryLayer?: (id: string) => void;
   onAddImageryLayer?: (layer: ImageryLayer) => void;
+  onSelectDemoArea?: (bbox: BBox) => void;
   datasets: DatasetInfo[];
   olmoCache: Record<string, OlmoEarthRepoStatus>;
   selectedArea: BBox | null;
@@ -1816,6 +1823,7 @@ function MapLayersControl({
                   olmoCache={olmoCache}
                   selectedArea={selectedArea}
                   onAddImageryLayer={onAddImageryLayer}
+                  onSelectArea={onSelectDemoArea}
                 />
               </div>
             )}
