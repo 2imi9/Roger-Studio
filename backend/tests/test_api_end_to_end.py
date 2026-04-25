@@ -140,3 +140,30 @@ async def test_infer_endpoint_falls_back_to_stub_on_bad_model(client) -> None:
     data = r.json()
     assert data["kind"] == "stub"
     assert "stub_reason" in data
+
+
+@pytest.mark.asyncio
+async def test_geojson_export_surfaces_stub_reason_when_inference_failed(client) -> None:
+    """Audit finding 2026-04-25: when inference falls back to a stub, the
+    GeoJSON export endpoint used to report a confusing
+    ``task_type=None, not a classification`` error. The real failure
+    (PC outage / no scenes / breaker tripped) was buried in the stub
+    reason. Now we surface that reason as a 503 with Retry-After."""
+    from app.services import olmoearth_inference as OI  # noqa: PLC0415
+
+    OI.clear_jobs()
+
+    bbox = {"west": -122.35, "south": 47.60, "east": -122.32, "north": 47.63}
+    payload = {
+        "bbox": bbox,
+        "model_repo_id": "allenai/does-not-exist-xyz",
+    }
+    r = await client.post("/api/olmoearth/ft-classification/geojson", json=payload, timeout=120.0)
+    assert r.status_code == 503, r.text
+    assert r.headers.get("Retry-After") == "60"
+    body = r.json()
+    detail = body.get("detail", "")
+    assert "fell back to a stub" in detail
+    assert "Retry when network stabilises" in detail
+    # Make sure the old confusing message is gone.
+    assert "task_type=None" not in detail

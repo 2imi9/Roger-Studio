@@ -696,7 +696,22 @@ async def olmoearth_ft_classification_geojson(
         raise HTTPException(500, f"Job {job_id} disappeared after start_inference")
 
     # Step 2: reject non-classification tasks. The vectoriser only makes
-    # sense for discrete-class outputs.
+    # sense for discrete-class outputs. Surface stub failures as 503 +
+    # the underlying reason so the user sees "PC outage / no scenes /
+    # breaker tripped" instead of a confusing "task_type=None" message
+    # when the real failure was upstream.
+    if job.get("kind") == "stub":
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Inference for {req.model_repo_id!r} failed and fell back "
+                f"to a stub — no real classification raster to vectorise. "
+                f"Underlying reason: {job.get('stub_reason') or 'unknown'}. "
+                f"Retry when network stabilises (PC outage, all chunks "
+                f"failed, or AOI had no cloud-free scenes)."
+            ),
+            headers={"Retry-After": "60"},
+        )
     task_type = job.get("task_type")
     if task_type not in ("classification", "segmentation"):
         raise HTTPException(
