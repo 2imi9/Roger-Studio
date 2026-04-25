@@ -168,6 +168,91 @@ async def test_geojson_export_rejects_lfmc_regression_with_actionable_400(client
 
 
 @pytest.mark.asyncio
+async def test_few_shot_router_returns_400_when_all_class_points_fall_outside_aoi(
+    client, monkeypatch,
+) -> None:
+    """Few-shot validation: if a class's labelled points all land outside
+    the AOI / in nodata patches, the service raises SentinelFetchError
+    with a "labelled point" message. The router must surface that as a
+    400 (user input error), not a 500. Without the disambiguating
+    catch, the same exception type covers transient infra outages
+    (which deserve 503), so the router introspects the message text.
+    """
+    from app.services import olmoearth_inference as OI  # noqa: PLC0415
+    from app.services import olmoearth_model as M  # noqa: PLC0415
+    from rasterio.transform import from_bounds  # noqa: PLC0415
+    from rasterio.crs import CRS as _CRS  # noqa: PLC0415
+    import numpy as np  # noqa: PLC0415
+
+    OI.clear_jobs()
+
+    # Synth a tiny embedding tensor over a small AOI; the second class's
+    # labelled point will be outside the AOI bbox so the service raises.
+    h_patch, w_patch, embed_dim = 8, 8, 4
+    emb = np.ones((h_patch, w_patch, embed_dim), dtype=np.float32)
+    transform = from_bounds(0.0, 0.0, 1.0, 1.0, w_patch, h_patch)
+    crs = _CRS.from_string("EPSG:4326")
+
+    async def _fake_export(**kwargs):
+        return {
+            "embedding_float32": emb,
+            "transform": transform,
+            "crs": crs,
+            "embedding_dim": embed_dim,
+            "patch_size": 4,
+            "target_gsd_m": 10.0,
+            "chunks_total": 1,
+            "chunks_processed": 1,
+            "chunks_failed": 0,
+            "scene_ids": [None],
+            "scene_datetimes": [None],
+            "n_periods": 1,
+            "period_days": 30,
+            "modality": "sentinel2_l2a",
+            "model_repo_id": "x",
+        }
+
+    monkeypatch.setattr(OI, "_run_chunked_embedding_export", _fake_export)
+    monkeypatch.setattr(M, "load_encoder", lambda repo_id: ("FAKE_MODEL", "cpu"))
+
+    payload = {
+        "bbox": {"west": 0.0, "south": 0.0, "east": 1.0, "north": 1.0},
+        "model_repo_id": "allenai/OlmoEarth-v1-Tiny",
+        "classes": [
+            {"name": "in", "color": "#ff0000", "points": [{"lon": 0.5, "lat": 0.5}]},
+            # Outside the AOI bbox → patch (row, col) round outside the
+            # raster → service raises SentinelFetchError → router returns 400.
+            {"name": "out", "color": "#00ff00", "points": [{"lon": 50.0, "lat": 50.0}]},
+        ],
+    }
+    r = await client.post("/api/olmoearth/embedding-tools/few-shot", json=payload, timeout=60.0)
+    assert r.status_code == 400, r.text
+    detail = r.json().get("detail", "")
+    assert "labelled point" in detail
+    assert "out" in detail.lower() or "outside" in detail.lower() or "nodata" in detail.lower()
+
+
+@pytest.mark.asyncio
+async def test_few_shot_router_rejects_non_base_encoder_with_400(client) -> None:
+    """FT heads (Mangrove, AWF, …) emit task-specific outputs, not raw
+    embeddings — few-shot only works on the four base encoders. The
+    router must reject FT repo ids at validation time with a 400
+    (not 500 or stub fallback)."""
+    payload = {
+        "bbox": {"west": 0.0, "south": 0.0, "east": 1.0, "north": 1.0},
+        "model_repo_id": "allenai/OlmoEarth-v1-FT-Mangrove-Base",
+        "classes": [
+            {"name": "a", "color": "#ff0000", "points": [{"lon": 0.25, "lat": 0.25}]},
+            {"name": "b", "color": "#00ff00", "points": [{"lon": 0.75, "lat": 0.75}]},
+        ],
+    }
+    r = await client.post("/api/olmoearth/embedding-tools/few-shot", json=payload, timeout=10.0)
+    assert r.status_code == 400, r.text
+    detail = r.json().get("detail", "")
+    assert "base encoder" in detail.lower() or "FT" in detail or "embedding" in detail.lower()
+
+
+@pytest.mark.asyncio
 async def test_geojson_export_surfaces_stub_reason_when_inference_failed(client) -> None:
     """Audit finding 2026-04-25: when inference falls back to a stub, the
     GeoJSON export endpoint used to report a confusing

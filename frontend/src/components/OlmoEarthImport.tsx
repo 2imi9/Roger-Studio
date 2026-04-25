@@ -1,9 +1,10 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   downloadEmbeddingExport,
   downloadFtClassificationGeoJson,
   exportOlmoEarthEmbedding,
   loadOlmoEarthRepo,
+  runOlmoEarthEmbeddingFewShot,
   runOlmoEarthEmbeddingPCARgb,
   runOlmoEarthEmbeddingSimilarity,
   startOlmoEarthInference,
@@ -235,7 +236,51 @@ export function OlmoEarthImport({
   const [repoId, setRepoId] = useState(initialOption.repoId);
   const [hfToken, setHfToken] = useState("");
   const [status, setStatus] = useState<string | null>(null);
-  const [busy, setBusy] = useState<null | "infer" | "cache" | "embed" | "pca" | "sim" | "geojson">(null);
+  const [busy, setBusy] = useState<null | "infer" | "cache" | "embed" | "pca" | "sim" | "geojson" | "fewshot">(null);
+
+  // Few-shot semantic segmentation state. Three classes pre-seeded with
+  // distinct accent colours so the user can start clicking immediately
+  // without first picking a palette. ``pickingForClass`` tracks which
+  // class's "+ point" button is currently armed; null means no
+  // few-shot pick is in progress (so we don't accidentally consume a
+  // similarity-pick committed pixel).
+  const [fewShotClasses, setFewShotClasses] = useState<{
+    name: string;
+    color: string;
+    points: { lon: number; lat: number }[];
+  }[]>([
+    { name: "Class 1", color: "#ef4444", points: [] },
+    { name: "Class 2", color: "#3b82f6", points: [] },
+    { name: "Class 3", color: "#22c55e", points: [] },
+  ]);
+  const [pickingForClass, setPickingForClass] = useState<number | null>(null);
+  // Identity-track which queryPixel objects we've already consumed so
+  // the effect below never double-appends or fires on stale state. Each
+  // fresh pick produces a new object reference from App, so a strict
+  // identity check distinguishes "new pick" from "same pick re-rendered".
+  const consumedQueryPixelRef = useRef<typeof queryPixel>(null);
+
+  useEffect(() => {
+    if (!queryPixel || pickingForClass === null) return;
+    if (consumedQueryPixelRef.current === queryPixel) return;
+    consumedQueryPixelRef.current = queryPixel;
+    setFewShotClasses((prev) => prev.map((c, i) =>
+      i === pickingForClass
+        ? { ...c, points: [...c.points, queryPixel] }
+        : c,
+    ));
+    setPickingForClass(null);
+    onClearQueryPixel?.();
+  }, [queryPixel, pickingForClass, onClearQueryPixel]);
+
+  // Reset few-shot picks when the AOI changes — labels outside the
+  // new AOI are nodata-bound and would silently no-op the prototype
+  // computation, so it's clearer to wipe the slate than carry stale
+  // points forward.
+  useEffect(() => {
+    setFewShotClasses((prev) => prev.map((c) => ({ ...c, points: [] })));
+    setPickingForClass(null);
+  }, [selectedArea]);
   // Event date for pre/post change-detection FT heads (ForestLossDriver).
   // Only surfaced when such a head is selected. Default is one year ago —
   // recent enough to have S2 coverage on both pre and post windows, old
@@ -462,6 +507,79 @@ export function OlmoEarthImport({
       }
     } catch (e) {
       setStatus(`Similarity failed: ${formatApiError(e)}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  // Few-shot: arm pick for a specific class. Clearing any in-flight
+  // similarity pick first prevents the useEffect above from picking up
+  // a stale queryPixel as the first labelled point.
+  const handlePickPointForClass = (idx: number) => {
+    if (!selectedArea) return;
+    onClearQueryPixel?.();
+    setPickingForClass(idx);
+    onStartPickQuery?.();
+  };
+
+  // Few-shot: clear all labelled points for a class. The user
+  // typically does this after seeing a noisy result and wanting to
+  // re-label more carefully.
+  const handleClearClassPoints = (idx: number) => {
+    setFewShotClasses((prev) => prev.map((c, i) =>
+      i === idx ? { ...c, points: [] } : c,
+    ));
+  };
+
+  // Few-shot: rename a class. Inline rename via prompt() — this is a
+  // dev-grade UX, not the polished version, but it lets the user move
+  // beyond "Class 1 / Class 2" without a full settings panel.
+  const handleRenameClass = (idx: number) => {
+    const current = fewShotClasses[idx]?.name ?? "";
+    const next = window.prompt("Class name:", current);
+    if (next != null && next.trim()) {
+      setFewShotClasses((prev) => prev.map((c, i) =>
+        i === idx ? { ...c, name: next.trim().slice(0, 64) } : c,
+      ));
+    }
+  };
+
+  // Few-shot: run the classification pipeline. Requires at least 2
+  // classes with at least 1 point each (matches backend validation).
+  const handleRunFewShot = async () => {
+    if (!selectedArea) return;
+    if (selected.kind !== "base") return;
+    const usable = fewShotClasses.filter((c) => c.points.length > 0);
+    if (usable.length < 2) return;
+    setBusy("fewshot");
+    setStatus(
+      `Running few-shot — ${usable.length} classes, ` +
+      `${usable.reduce((n, c) => n + c.points.length, 0)} labelled points total. ` +
+      "Same chunked encoder pass as PCA / Similarity, plus a per-class prototype + nearest-class assignment.",
+    );
+    try {
+      const res = await runOlmoEarthEmbeddingFewShot({
+        bbox: selectedArea,
+        modelRepoId: repoId,
+        classes: usable,
+      });
+      if (onAddImageryLayer) {
+        onAddImageryLayer({
+          id: `olmoearth-fewshot-${res.job_id}`,
+          tileUrl: res.tile_url,
+          label: `${selected.label} · few-shot · ${res.job_id.slice(0, 6)}`,
+          inferenceMetadata: res,
+        });
+        setStatus(
+          res.kind === "stub"
+            ? `preview stub — few-shot failed (${res.stub_reason ?? "unknown"})`
+            : "added to map — argmax cosine similarity to your labelled prototypes.",
+        );
+      } else {
+        setStatus(`done — tile URL ready (job ${res.job_id})`);
+      }
+    } catch (e) {
+      setStatus(`Few-shot failed: ${formatApiError(e)}`);
     } finally {
       setBusy(null);
     }
@@ -884,6 +1002,130 @@ export function OlmoEarthImport({
             from <code className="font-mono">olmoearth_pretrain</code> for
             similarity search, few-shot segmentation, or change detection.
           </div>
+
+          {/* Few-shot semantic segmentation — the science workflow.
+              Click N example pixels per class on the map; backend
+              computes a prototype embedding per class + argmax cosine
+              similarity per pixel = a class raster. Reuses the same
+              pixel-pick mechanic as Similarity. Result registers as a
+              classification job so the existing GeoJSON download works
+              on it.
+
+              Hidden when the App-level pick handlers aren't wired
+              (read-only contexts) — the picker is mandatory. */}
+          {onStartPickQuery && onClearQueryPixel && (
+            <details className="border border-geo-border rounded" open>
+              <summary className="px-2 py-1.5 text-[11px] cursor-pointer hover:bg-geo-bg/60">
+                Few-shot classify ({fewShotClasses.filter((c) => c.points.length > 0).length} of {fewShotClasses.length} classes labelled)
+              </summary>
+              <div className="p-2 space-y-2 border-t border-geo-border">
+                <div className="text-[10px] text-geo-muted leading-snug">
+                  Click <b>+ point</b> for a class, then click anywhere
+                  on the map to label that pixel. Repeat to add more
+                  examples per class. Run when at least 2 classes have
+                  ≥1 point each — backend computes per-class prototype
+                  embeddings + assigns each AOI pixel to its nearest
+                  prototype by cosine similarity. <b>No fine-tuning.</b>
+                </div>
+                <div className="space-y-1">
+                  {fewShotClasses.map((c, i) => {
+                    const isPicking = pickingForClass === i;
+                    return (
+                      <div
+                        key={i}
+                        className="flex items-center gap-2 px-2 py-1.5 rounded bg-geo-bg border border-geo-border"
+                      >
+                        <span
+                          className="inline-block w-3 h-3 rounded-full border border-geo-border flex-shrink-0"
+                          style={{ backgroundColor: c.color }}
+                          title={`Class ${i} colour`}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => handleRenameClass(i)}
+                          className="text-[11px] font-semibold text-geo-text hover:text-geo-accent cursor-pointer text-left flex-1 truncate"
+                          title="Click to rename"
+                          disabled={busy !== null}
+                        >
+                          {c.name}
+                        </button>
+                        <span className="text-[10px] text-geo-muted font-mono">
+                          {c.points.length} pt{c.points.length === 1 ? "" : "s"}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => handlePickPointForClass(i)}
+                          disabled={busy !== null || !selectedArea || isPicking || pickQueryActive}
+                          className={`text-[10px] underline-offset-2 hover:underline ${
+                            busy !== null || !selectedArea || isPicking || pickQueryActive
+                              ? "text-geo-muted cursor-not-allowed"
+                              : "text-geo-accent cursor-pointer"
+                          }`}
+                          title={
+                            !selectedArea
+                              ? "Draw an AOI first"
+                              : pickQueryActive && !isPicking
+                                ? "Cancel the active pick or wait for it to commit"
+                                : isPicking
+                                  ? "Click anywhere on the map to add a point to this class"
+                                  : "Arm pick mode + add the next clicked map pixel to this class"
+                          }
+                        >
+                          {isPicking ? "armed — click map" : "+ point"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleClearClassPoints(i)}
+                          disabled={busy !== null || c.points.length === 0}
+                          className={`text-[10px] ${
+                            busy !== null || c.points.length === 0
+                              ? "text-geo-muted cursor-not-allowed"
+                              : "text-geo-muted hover:text-geo-danger cursor-pointer"
+                          }`}
+                          title="Clear all labelled points for this class"
+                        >
+                          ×
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+                <button
+                  type="button"
+                  onClick={handleRunFewShot}
+                  disabled={
+                    busy !== null
+                    || !selectedArea
+                    || fewShotClasses.filter((c) => c.points.length > 0).length < 2
+                  }
+                  className={`w-full px-3 py-2 text-[12px] font-semibold rounded border transition-colors ${
+                    busy !== null
+                      || !selectedArea
+                      || fewShotClasses.filter((c) => c.points.length > 0).length < 2
+                      ? "border-geo-border text-geo-muted cursor-not-allowed"
+                      : "border-geo-accent bg-geo-accent text-white hover:bg-geo-accent-hover cursor-pointer"
+                  }`}
+                  title={
+                    !selectedArea
+                      ? "Draw an AOI first"
+                      : fewShotClasses.filter((c) => c.points.length > 0).length < 2
+                        ? "Label at least 2 classes (≥1 point each) before running"
+                        : "Compute prototypes + assign every AOI pixel to its nearest prototype"
+                  }
+                >
+                  {busy === "fewshot" ? "Running few-shot…" : "Run few-shot classification"}
+                </button>
+                <div className="text-[10px] text-geo-muted leading-snug">
+                  Output is a classification raster — same shape as
+                  Mangrove / AWF / Ecosystem FT outputs, so the
+                  GeoJSON download (Run inference tab) works on this
+                  job too. Pixels with no embedding (chunks that
+                  failed) render transparent rather than being forced
+                  into the nearest class.
+                </div>
+              </div>
+            </details>
+          )}
 
           {/* TERTIARY: PCA false-color — kept for encoder QA + label-
               picking, but collapsed by default so it doesn't crowd the

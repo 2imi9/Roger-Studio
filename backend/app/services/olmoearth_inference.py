@@ -2207,6 +2207,281 @@ async def run_embedding_tool_similarity(
         return _build_response(_jobs[job_id])
 
 
+async def run_embedding_tool_few_shot(
+    bbox: BBox,
+    model_repo_id: str,
+    classes: list[dict[str, Any]],
+    date_range: str = "2024-04-01/2024-10-01",
+    n_periods: int = 3,
+    period_days: int = 30,
+    time_offset_days: int = 0,
+    chunk_size_m: int = 5000,
+    target_gsd_m: float = 10.0,
+    patch_size: int = 4,
+    disconnect_check=None,
+) -> dict[str, Any]:
+    """Few-shot semantic segmentation via nearest-prototype classification.
+
+    Workflow:
+      1. Chunked fetch + base encoder forward over the AOI
+         (``return_float=True`` — same path as PCA / similarity)
+      2. For each user-defined class, collect the embedding vectors at
+         the user's labeled points, average → class prototype (D,)
+      3. For every pixel: cosine similarity to each prototype, argmax
+         → class index. Pixels where all similarities are low (< the
+         "unclassified" threshold) get marked as class -1 / nodata so
+         the user sees gaps for "no class is a good match" rather than
+         being forced into the nearest class.
+      4. Build a class raster + per-class colour legend and register
+         as a pytorch job — the existing tile renderer + GeoJSON export
+         work unchanged.
+
+    The "few-shot" pattern matches the OlmoEarth tutorial's
+    ``classify-from-clicks`` notebook: 1-N labelled points per class,
+    no model fine-tuning, just embedding-space prototypes.
+
+    Args:
+        classes: list of dicts ``{name, color, points}``. ``points`` is
+            ``[{lon, lat}, ...]`` in WGS-84. At least 2 classes, each
+            with at least 1 point. Colour is a hex string used in the
+            response legend.
+
+    Notes:
+      * Spec hash (job_id) deliberately includes the labelled points
+        so re-clicking the same set hits the cache; adding a single
+        point yields a fresh job.
+      * Patch coordinates outside the AOI raster are silently dropped
+        — picks near the edge that round outside the grid contribute
+        no constraint rather than crashing.
+    """
+    if model_repo_id not in {
+        "allenai/OlmoEarth-v1-Nano",
+        "allenai/OlmoEarth-v1-Tiny",
+        "allenai/OlmoEarth-v1-Base",
+        "allenai/OlmoEarth-v1-Large",
+    }:
+        raise ValueError(
+            f"Few-shot classify needs a base encoder. Got {model_repo_id!r}."
+        )
+    if len(classes) < 2:
+        raise ValueError(
+            f"Few-shot classify needs at least 2 classes; got {len(classes)}."
+        )
+    for i, c in enumerate(classes):
+        if not c.get("points"):
+            raise ValueError(
+                f"Class {i} ({c.get('name')!r}) has 0 labelled points — "
+                f"every class needs at least 1 example."
+            )
+
+    # Stable job_id: include the labelled points (rounded to 6 decimals
+    # so floating-point chatter doesn't bust the cache) so reruns of
+    # the same labelling hit the cached embedding pass.
+    spec_classes = [
+        {
+            "name": str(c.get("name", f"class_{i}")),
+            "color": str(c.get("color", "#888888")),
+            "points": [
+                {"lon": round(float(p["lon"]), 6), "lat": round(float(p["lat"]), 6)}
+                for p in c.get("points") or []
+            ],
+        }
+        for i, c in enumerate(classes)
+    ]
+    spec = {
+        "bbox": bbox.model_dump(),
+        "model_repo_id": model_repo_id,
+        "date_range": date_range,
+        "tool": "embedding_few_shot",
+        "classes": spec_classes,
+        "n_periods": n_periods,
+        "period_days": period_days,
+        "target_gsd_m": target_gsd_m,
+        "patch_size": patch_size,
+    }
+    job_id = _make_job_id(spec)
+
+    async with _jobs_lock:
+        existing = _jobs.get(job_id)
+        if existing is not None and existing.get("status") == "ready" and existing.get("kind") == "pytorch":
+            return _build_response(existing)
+        if existing is not None and existing.get("status") == "running":
+            logger.warning(
+                "few-shot %s already running — returning pending stub (dedup)",
+                job_id,
+            )
+            return _build_response(existing)
+        _jobs[job_id] = {
+            "job_id": job_id,
+            "spec": spec,
+            "status": "running",
+            "kind": "pending",
+            "colormap": "few_shot",
+            "started_ts": time.time(),
+        }
+
+    model, device = await asyncio.to_thread(olmoearth_model.load_encoder, model_repo_id)
+
+    try:
+        export_result = await _run_chunked_embedding_export(
+            bbox=bbox,
+            model=model,
+            device=device,
+            model_repo_id=model_repo_id,
+            date_range=date_range,
+            n_periods=n_periods,
+            period_days=period_days,
+            time_offset_days=time_offset_days,
+            chunk_size_m=chunk_size_m,
+            target_gsd_m=target_gsd_m,
+            patch_size=patch_size,
+            return_float=True,
+            disconnect_check=disconnect_check,
+        )
+    except Exception as e:
+        async with _jobs_lock:
+            _jobs[job_id].update(
+                status="ready", kind="stub",
+                stub_reason=f"{type(e).__name__}: {e}"[:500],
+            )
+        raise
+
+    global_embedding = export_result["embedding_float32"]   # (H_patch, W_patch, D)
+    patch_transform = export_result["transform"]
+    pinned_crs = export_result["crs"]
+    h_patch, w_patch, embed_dim = global_embedding.shape
+
+    # Convert each class's labelled WGS-84 points to (row, col) in the
+    # patch grid, gather the embedding vectors, average → prototype.
+    # Points that round outside the AOI raster are silently dropped.
+    from rasterio.warp import transform as _transform_coords  # noqa: PLC0415
+    inv = ~patch_transform
+    prototypes: list[np.ndarray] = []
+    used_points_per_class: list[int] = []
+    nodata_mask = ~np.any(global_embedding != 0, axis=-1)
+    for i, c in enumerate(spec_classes):
+        lons = [p["lon"] for p in c["points"]]
+        lats = [p["lat"] for p in c["points"]]
+        xs, ys = _transform_coords(
+            CRS.from_string("EPSG:4326"), pinned_crs, lons, lats,
+        )
+        vecs: list[np.ndarray] = []
+        for x, y in zip(xs, ys):
+            col_f, row_f = inv * (float(x), float(y))
+            r = int(round(row_f))
+            ccol = int(round(col_f))
+            if r < 0 or r >= h_patch or ccol < 0 or ccol >= w_patch:
+                continue
+            if nodata_mask[r, ccol]:
+                continue
+            vecs.append(global_embedding[r, ccol].copy())
+        if not vecs:
+            raise SentinelFetchError(
+                f"few-shot: class {i} ({c['name']!r}) had {len(c['points'])} "
+                f"labelled point(s) but none landed on a valid embedding "
+                f"patch (all outside AOI or in nodata)."
+            )
+        prototypes.append(np.stack(vecs, axis=0).mean(axis=0))
+        used_points_per_class.append(len(vecs))
+
+    proto_matrix = np.stack(prototypes, axis=0)              # (K, D)
+
+    # Cosine similarity between every pixel embedding and every prototype:
+    # similarity = (E·P^T) / (||E|| ||P||). Argmax across prototypes
+    # gives the class index per pixel; the max similarity itself is the
+    # confidence (used for the scalar raster + nodata threshold).
+    flat = global_embedding.reshape(h_patch * w_patch, embed_dim)
+    flat_norm = flat / (np.linalg.norm(flat, axis=-1, keepdims=True) + 1e-9)
+    proto_norm = proto_matrix / (np.linalg.norm(proto_matrix, axis=-1, keepdims=True) + 1e-9)
+    cos_all = flat_norm @ proto_norm.T                       # (N, K) in [-1, 1]
+    class_idx = cos_all.argmax(axis=-1).astype(np.int32)     # (N,)
+    confidence = cos_all.max(axis=-1).astype(np.float32)     # (N,) in [-1, 1]
+
+    # Nodata pixels: class -1 + confidence 0 so the tile renderer
+    # paints them transparent / dark instead of forcing them into the
+    # nearest class.
+    nodata_flat = nodata_mask.reshape(-1)
+    class_idx[nodata_flat] = -1
+    confidence[nodata_flat] = 0.0
+
+    # Rescale confidence to [0, 1] for the existing scalar tile path.
+    scalar = ((confidence + 1.0) / 2.0).astype(np.float32)
+    scalar[nodata_flat] = 0.0
+    scalar_raster = scalar.reshape(h_patch, w_patch)
+    class_raster = class_idx.reshape(h_patch, w_patch)
+
+    class_names = [c["name"] for c in spec_classes]
+    class_colors = [c["color"] for c in spec_classes]
+    legend = {
+        "kind": "classification",
+        "label": "Few-shot classification",
+        "classes": [
+            {"index": i, "name": n, "color": col, "points_used": used_points_per_class[i]}
+            for i, (n, col) in enumerate(zip(class_names, class_colors))
+        ],
+        "names_tentative": False,
+        "colors_source": "user",
+        "note": (
+            "Each class's prototype is the mean embedding of the user's "
+            "labelled clicks; per-pixel class is argmax cosine similarity "
+            "to those prototypes. No fine-tuning involved — this is "
+            "embedding-space nearest-prototype matching."
+        ),
+    }
+    present_class_ids = sorted({int(v) for v in np.unique(class_raster) if int(v) >= 0})
+
+    scene_ids = export_result.get("scene_ids") or []
+    scene_datetimes = export_result.get("scene_datetimes") or []
+    recent_scene_id = next((s for s in reversed(scene_ids) if s is not None), None)
+    recent_scene_dt = next((s for s in reversed(scene_datetimes) if s is not None), None)
+
+    async with _jobs_lock:
+        _jobs[job_id].update(
+            status="ready",
+            kind="pytorch",
+            task_type="classification",
+            scalar_raster=scalar_raster,
+            class_raster=class_raster,
+            raster_transform=patch_transform,
+            raster_crs=pinned_crs,
+            raster_height=int(h_patch),
+            raster_width=int(w_patch),
+            scene_id=recent_scene_id,
+            scene_datetime=recent_scene_dt,
+            patch_size=export_result["patch_size"],
+            embedding_dim=int(embed_dim),
+            num_classes=len(spec_classes),
+            class_names=class_names,
+            class_names_tentative=False,
+            class_probs=None,
+            present_class_ids=present_class_ids,
+            decoder_key="few_shot_prototype",
+            colormap_override="few_shot",
+            legend_override=legend,
+            temporal_stack={
+                "n_periods": n_periods,
+                "chunks_total": export_result["chunks_total"],
+                "chunks_processed": export_result["chunks_processed"],
+                "chunks_failed": export_result["chunks_failed"],
+                "scene_ids": scene_ids,
+                "scene_datetimes": scene_datetimes,
+                "target_gsd_m": target_gsd_m,
+            },
+            few_shot={
+                "classes": [
+                    {
+                        "name": n,
+                        "color": col,
+                        "points_provided": len(spec_classes[i]["points"]),
+                        "points_used": used_points_per_class[i],
+                    }
+                    for i, (n, col) in enumerate(zip(class_names, class_colors))
+                ],
+            },
+        )
+        return _build_response(_jobs[job_id])
+
+
 def build_embedding_cog_bytes(result: dict[str, Any]) -> tuple[bytes, str]:
     """Serialize a stitched embedding raster as a multi-band int8 COG.
 
@@ -2913,6 +3188,14 @@ def _colorize_classes(
 
     Uses a small lookup table so 256×256 = 65k pixels are resolved as one
     numpy ``take`` per color channel.
+
+    Negative class indices are treated as **nodata** and rendered fully
+    transparent — the few-shot pipeline uses ``class_raster = -1`` for
+    pixels where the encoder produced no embedding (chunks that failed
+    to fetch / scenes that returned 0). Without this branch, the
+    ``np.clip`` below would map -1 → 0 and paint nodata pixels in
+    class 0's colour, giving the user a false "class 0 everywhere"
+    impression on AOI edges that have no real signal.
     """
     h, w = class_raster.shape
     n_classes = len(class_colors)
@@ -2922,12 +3205,14 @@ def _colorize_classes(
     for i, hex_color in enumerate(class_colors):
         palette[i] = _hex_to_rgb(hex_color)
 
+    nodata = class_raster < 0
     idx = np.clip(class_raster, 0, n_classes - 1) if n_classes > 0 else np.zeros_like(class_raster)
     rgb = palette[idx.reshape(-1)].reshape(h, w, 3)
 
     rgba = np.zeros((h, w, 4), dtype=np.uint8)
     rgba[..., :3] = rgb
     rgba[..., 3] = 210
+    rgba[nodata] = (0, 0, 0, 0)
     rgba[outside] = (0, 0, 0, 0)
     return rgba
 

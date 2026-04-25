@@ -997,6 +997,62 @@ export function downloadEmbeddingExport(result: OlmoEarthEmbeddingExportResult):
 }
 
 
+/** Few-shot semantic segmentation over an AOI.
+ *
+ * The user labels a few example pixels per class (via the same
+ * pixel-pick UX as similarity, repeated). Backend computes one mean
+ * embedding per class = "prototype", then assigns each AOI pixel to
+ * its nearest prototype by cosine similarity. No model fine-tuning
+ * happens — purely embedding-space classification, so it works on
+ * any base encoder and any region.
+ *
+ * Response shape mirrors the FT classification output (tile_url +
+ * legend.classes + class_raster), so the existing
+ * ``downloadFtClassificationGeoJson`` works on the resulting job. */
+export interface OlmoEarthFewShotPoint {
+  lon: number;
+  lat: number;
+}
+export interface OlmoEarthFewShotClass {
+  name: string;
+  color: string;       // CSS hex
+  points: OlmoEarthFewShotPoint[];
+}
+export interface OlmoEarthFewShotArgs {
+  bbox: BBox;
+  modelRepoId?: string;        // base encoder; default "Tiny"
+  dateRange?: string;
+  classes: OlmoEarthFewShotClass[];
+  nPeriods?: number;
+  periodDays?: number;
+  timeOffsetDays?: number;
+  targetGsdM?: number;
+  patchSize?: number;
+  chunkSizeM?: number;
+}
+
+export async function runOlmoEarthEmbeddingFewShot(
+  args: OlmoEarthFewShotArgs,
+): Promise<OlmoEarthInferenceResult> {
+  return request("/olmoearth/embedding-tools/few-shot", {
+    method: "POST",
+    timeoutMs: 0,
+    body: JSON.stringify({
+      bbox: args.bbox,
+      model_repo_id: args.modelRepoId ?? "allenai/OlmoEarth-v1-Tiny",
+      date_range: args.dateRange ?? "2024-04-01/2024-10-01",
+      n_periods: args.nPeriods ?? 3,
+      period_days: args.periodDays ?? 30,
+      time_offset_days: args.timeOffsetDays ?? 0,
+      target_gsd_m: args.targetGsdM ?? 10.0,
+      patch_size: args.patchSize ?? 4,
+      chunk_size_m: args.chunkSizeM ?? 5000,
+      classes: args.classes,
+    }),
+  });
+}
+
+
 /** FT classification → GeoJSON polygon export.
  *
  * Wraps ``POST /api/olmoearth/ft-classification/geojson``. Reuses the same

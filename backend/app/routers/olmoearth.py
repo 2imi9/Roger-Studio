@@ -21,6 +21,7 @@ from app.services import (
     olmoearth_loader,
     olmoearth_model,
 )
+from app.services.sentinel2_fetch import SentinelFetchError
 from app.services.system_health import (
     AOISizeExceededError,
     CircuitBreakerTrippedError,
@@ -110,6 +111,50 @@ class EmbeddingExportRequest(BaseModel):
     )
     patch_size: int = Field(default=4, ge=1, le=8)
     chunk_size_m: int = Field(default=5000, ge=1000, le=20000)
+
+
+class EmbeddingFewShotRequest(BaseModel):
+    """Few-shot semantic segmentation via nearest-prototype matching.
+
+    The user clicks a few example points per class (the picker UI lifts
+    the same primitive used by the similarity tool). Each class's
+    embeddings are averaged → prototype; then every AOI pixel is
+    assigned its nearest prototype by cosine similarity.
+
+    No fine-tuning happens — this is purely embedding-space classification
+    + a colour map, so it works on any base encoder for any region.
+    """
+
+    class _Point(BaseModel):
+        lon: float = Field(..., ge=-180.0, le=180.0)
+        lat: float = Field(..., ge=-90.0, le=90.0)
+
+    class _Class(BaseModel):
+        name: str = Field(..., min_length=1, max_length=64)
+        color: str = Field(
+            default="#888888",
+            description="CSS hex colour (#RRGGBB) used in the response legend.",
+        )
+        points: list["EmbeddingFewShotRequest._Point"] = Field(..., min_length=1)
+
+    bbox: BBox
+    model_repo_id: str = Field(default="allenai/OlmoEarth-v1-Tiny")
+    date_range: str = Field(default="2024-04-01/2024-10-01")
+    n_periods: int = Field(default=3, ge=1, le=12)
+    period_days: int = Field(default=30, ge=7, le=90)
+    time_offset_days: int = Field(default=0)
+    target_gsd_m: float = Field(default=10.0, ge=10.0, le=80.0)
+    patch_size: int = Field(default=4, ge=1, le=8)
+    chunk_size_m: int = Field(default=5000, ge=1000, le=20000)
+    classes: list[_Class] = Field(
+        ...,
+        min_length=2,
+        description=(
+            "Two or more classes, each with a name + colour + at least one "
+            "labelled point. The class index in the response is the index "
+            "in this list; index 0 maps to the first class, etc."
+        ),
+    )
 
 
 class FtClassificationGeoJsonRequest(BaseModel):
@@ -530,6 +575,95 @@ async def olmoearth_embedding_pca_rgb(
         ) from e
     except ClientDisconnectedError as e:
         logger.info("PCA cancelled (client disconnect): %s", e)
+        raise HTTPException(status_code=499, detail=str(e)) from e
+
+
+@router.post("/olmoearth/embedding-tools/few-shot", response_model=OlmoEarthInferenceResult)
+async def olmoearth_embedding_few_shot(
+    request: Request,
+    req: EmbeddingFewShotRequest = Body(...),
+) -> dict:
+    """Few-shot semantic segmentation — user clicks examples per class,
+    backend computes nearest-prototype classification over the AOI.
+
+    Wraps :func:`olmoearth_inference.run_embedding_tool_few_shot`. The
+    response is identical in shape to /infer, so the frontend treats
+    the resulting tile_url + class legend exactly like any other FT
+    classification — including the GeoJSON export endpoint
+    (/ft-classification/geojson).
+
+    Inherits the same safety stack as /infer (RAM precheck, oversized
+    AOI, breaker, disconnect-cancel).
+    """
+    if req.model_repo_id not in _BASE_ENCODER_REPO_IDS:
+        raise HTTPException(
+            400,
+            (
+                f"Few-shot needs a base encoder. Got {req.model_repo_id!r}. "
+                f"FT heads produce task-specific outputs, not embeddings."
+            ),
+        )
+
+    # Pydantic models → plain dicts that the service layer expects
+    # (avoids leaking the inner _Class / _Point types into the service).
+    classes_payload: list[dict[str, object]] = [
+        {
+            "name": c.name,
+            "color": c.color,
+            "points": [
+                {"lon": float(p.lon), "lat": float(p.lat)} for p in c.points
+            ],
+        }
+        for c in req.classes
+    ]
+    try:
+        return await olmoearth_inference.run_embedding_tool_few_shot(
+            bbox=req.bbox,
+            model_repo_id=req.model_repo_id,
+            classes=classes_payload,
+            date_range=req.date_range,
+            n_periods=req.n_periods,
+            period_days=req.period_days,
+            time_offset_days=req.time_offset_days,
+            chunk_size_m=req.chunk_size_m,
+            target_gsd_m=req.target_gsd_m,
+            patch_size=req.patch_size,
+            disconnect_check=request.is_disconnected,
+        )
+    except ValueError as e:
+        # Validation failure inside the service (fewer than 2 classes
+        # in the request, non-base encoder slipping through) → 400.
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except SentinelFetchError as e:
+        # Two distinct failure modes share this exception type:
+        # (a) the chunked encoder pass returned 0 valid pixels (PC
+        #     outage / cloud-locked AOI) → 503 + Retry-After
+        # (b) the user clicked points that all fell outside the AOI
+        #     or in nodata regions → 400 with the precise message
+        # The two are easy to disambiguate: (b)'s message contains
+        # "labelled point(s) but none landed on a valid embedding
+        # patch", which is a user-input error. Anything else is
+        # transient infra and should hint at retry.
+        msg = str(e)
+        if "labelled point" in msg or "no valid pixels in embedding" in msg:
+            raise HTTPException(status_code=400, detail=msg) from e
+        raise HTTPException(
+            status_code=503, detail=msg, headers={"Retry-After": "30"},
+        ) from e
+    except AOISizeExceededError as e:
+        raise HTTPException(status_code=413, detail=str(e)) from e
+    except InsufficientMemoryError as e:
+        raise HTTPException(
+            status_code=503, detail=str(e),
+            headers={"Retry-After": "30"},
+        ) from e
+    except CircuitBreakerTrippedError as e:
+        raise HTTPException(
+            status_code=503, detail=str(e),
+            headers={"Retry-After": "60"},
+        ) from e
+    except ClientDisconnectedError as e:
+        logger.info("few-shot cancelled (client disconnect): %s", e)
         raise HTTPException(status_code=499, detail=str(e)) from e
 
 

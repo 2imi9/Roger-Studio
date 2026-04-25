@@ -170,6 +170,163 @@ def test_cosine_similarity_map_marks_nodata_as_zero() -> None:
     assert (sim[nodata_mask] == 0.0).all()
 
 
+@pytest.mark.asyncio
+async def test_run_embedding_tool_few_shot_assigns_nearest_prototype(monkeypatch) -> None:
+    """The few-shot pipeline must:
+
+      * call ``_run_chunked_embedding_export(return_float=True)`` once
+      * extract user-labelled points from the stitched embedding
+      * average per class → prototype
+      * argmax cosine similarity per pixel against the prototypes
+      * mark nodata pixels (all-zero embeddings) as class -1 in the
+        class raster
+
+    We synth a 2-class embedding where left half is "vector A" and right
+    half is "vector B", drop a labelled point in each half, run the
+    pipeline, and assert the resulting class raster splits along the
+    expected boundary.
+    """
+    import asyncio  # noqa: PLC0415
+    from app.services import olmoearth_inference as OI  # noqa: PLC0415
+    from app.services import olmoearth_model as M  # noqa: PLC0415
+    from rasterio.transform import from_bounds  # noqa: PLC0415
+    from rasterio.crs import CRS as _CRS  # noqa: PLC0415
+
+    OI.clear_jobs()
+
+    # Synthetic AOI: 100×100 patches at ~10 m patch-GSD (small bbox in WGS84).
+    h_patch, w_patch, embed_dim = 16, 16, 8
+    emb = np.zeros((h_patch, w_patch, embed_dim), dtype=np.float32)
+    vec_a = np.eye(embed_dim, dtype=np.float32)[0]   # axis 0
+    vec_b = np.eye(embed_dim, dtype=np.float32)[1]   # axis 1
+    emb[:, : w_patch // 2] = vec_a + 0.01            # left half = A
+    emb[:, w_patch // 2 :] = vec_b + 0.01            # right half = B
+    # Patch grid in WGS-84 — pretend the AOI spans 0..1 degrees.
+    transform = from_bounds(0.0, 0.0, 1.0, 1.0, w_patch, h_patch)
+    crs = _CRS.from_string("EPSG:4326")
+
+    async def _fake_export(**kwargs):
+        return {
+            "embedding_float32": emb,
+            "transform": transform,
+            "crs": crs,
+            "embedding_dim": embed_dim,
+            "patch_size": 4,
+            "target_gsd_m": 10.0,
+            "chunks_total": 1,
+            "chunks_processed": 1,
+            "chunks_failed": 0,
+            "scene_ids": ["S2_FAKE"],
+            "scene_datetimes": ["2024-06-15T10:00:00Z"],
+            "n_periods": 3,
+            "period_days": 30,
+            "modality": "sentinel2_l2a",
+            "model_repo_id": kwargs.get("model_repo_id", "x"),
+        }
+
+    async def _fake_load(repo_id):
+        # M.load_encoder is sync; the route uses asyncio.to_thread so a
+        # plain object works fine here. Tuple shape mirrors the real
+        # signature (model, device).
+        return ("FAKE_MODEL", "cpu")
+
+    monkeypatch.setattr(OI, "_run_chunked_embedding_export", _fake_export)
+    monkeypatch.setattr(M, "load_encoder", lambda repo_id: ("FAKE_MODEL", "cpu"))
+
+    bbox = BBox(west=0.0, south=0.0, east=1.0, north=1.0)
+    classes = [
+        # class A: a labelled point on the left half (lon ≈ 0.25)
+        {"name": "left", "color": "#ff0000", "points": [{"lon": 0.25, "lat": 0.5}]},
+        # class B: a labelled point on the right half (lon ≈ 0.75)
+        {"name": "right", "color": "#00ff00", "points": [{"lon": 0.75, "lat": 0.5}]},
+    ]
+
+    resp = await OI.run_embedding_tool_few_shot(
+        bbox=bbox,
+        model_repo_id="allenai/OlmoEarth-v1-Tiny",
+        classes=classes,
+    )
+
+    job = OI._jobs[resp["job_id"]]
+    assert resp["kind"] == "pytorch"
+    assert resp["task_type"] == "classification"
+    class_raster = job["class_raster"]
+    assert class_raster.shape == (h_patch, w_patch)
+    # Left half should be class 0 (A), right half class 1 (B). Allow
+    # a handful of misclassifications at the boundary.
+    left = class_raster[:, : w_patch // 2]
+    right = class_raster[:, w_patch // 2 :]
+    assert (left == 0).mean() > 0.95, f"left half wasn't class 0: {(left==0).mean():.2f}"
+    assert (right == 1).mean() > 0.95, f"right half wasn't class 1: {(right==1).mean():.2f}"
+    # Legend carries user-supplied names + colors.
+    legend = job["legend_override"]
+    assert [c["name"] for c in legend["classes"]] == ["left", "right"]
+    assert [c["color"] for c in legend["classes"]] == ["#ff0000", "#00ff00"]
+    assert legend["colors_source"] == "user"
+
+
+@pytest.mark.asyncio
+async def test_run_embedding_tool_few_shot_marks_nodata_pixels_as_negative_one(monkeypatch) -> None:
+    """Pixels where the embedding is all-zero (untouched chunk) must
+    come back as class index -1 in the raster, with confidence 0 in the
+    scalar — so the tile renderer paints them transparent rather than
+    forcing them into the nearest class."""
+    from app.services import olmoearth_inference as OI  # noqa: PLC0415
+    from app.services import olmoearth_model as M  # noqa: PLC0415
+    from rasterio.transform import from_bounds  # noqa: PLC0415
+    from rasterio.crs import CRS as _CRS  # noqa: PLC0415
+
+    OI.clear_jobs()
+
+    h_patch, w_patch, embed_dim = 8, 8, 4
+    emb = np.zeros((h_patch, w_patch, embed_dim), dtype=np.float32)
+    # Top half: class A; bottom half: class B; rightmost column nodata.
+    emb[: h_patch // 2, : w_patch - 1] = np.array([1.0, 0, 0, 0], dtype=np.float32)
+    emb[h_patch // 2 :, : w_patch - 1] = np.array([0, 1.0, 0, 0], dtype=np.float32)
+    # Last column stays at zero (nodata).
+    transform = from_bounds(0.0, 0.0, 1.0, 1.0, w_patch, h_patch)
+    crs = _CRS.from_string("EPSG:4326")
+
+    async def _fake_export(**kwargs):
+        return {
+            "embedding_float32": emb,
+            "transform": transform,
+            "crs": crs,
+            "embedding_dim": embed_dim,
+            "patch_size": 4,
+            "target_gsd_m": 10.0,
+            "chunks_total": 1,
+            "chunks_processed": 1,
+            "chunks_failed": 0,
+            "scene_ids": [None],
+            "scene_datetimes": [None],
+            "n_periods": 1,
+            "period_days": 30,
+            "modality": "sentinel2_l2a",
+            "model_repo_id": "x",
+        }
+
+    monkeypatch.setattr(OI, "_run_chunked_embedding_export", _fake_export)
+    monkeypatch.setattr(M, "load_encoder", lambda repo_id: ("FAKE_MODEL", "cpu"))
+
+    resp = await OI.run_embedding_tool_few_shot(
+        bbox=BBox(west=0.0, south=0.0, east=1.0, north=1.0),
+        model_repo_id="allenai/OlmoEarth-v1-Tiny",
+        classes=[
+            {"name": "top", "color": "#ff0000", "points": [{"lon": 0.5, "lat": 0.75}]},
+            {"name": "bottom", "color": "#00ff00", "points": [{"lon": 0.5, "lat": 0.25}]},
+        ],
+    )
+
+    job = OI._jobs[resp["job_id"]]
+    class_raster = job["class_raster"]
+    scalar = job["scalar_raster"]
+    # Last column = nodata everywhere → -1.
+    assert (class_raster[:, -1] == -1).all(), "last column should be nodata (-1)"
+    # Confidence at nodata = 0 so transparent renders cleanly.
+    assert (scalar[:, -1] == 0.0).all()
+
+
 def test_cosine_similarity_map_rejects_dim_mismatch() -> None:
     """Wrong-shape query → ValueError (not silently broadcast)."""
     emb = np.zeros((3, 3, 16), dtype=np.float32)
