@@ -21,7 +21,8 @@ import { PolygonStats } from "./PolygonStats";
 import { StacImagery } from "./StacImagery";
 import { OlmoEarthPanel } from "./OlmoEarthPanel";
 import { OlmoEarthImport } from "./OlmoEarthImport";
-import { InferenceLegendPanel } from "./InferenceLegendPanel";
+// InferenceLegendPanel is now rendered in App.tsx as a floating overlay on
+// top of MapView (closer to the actual pixels) — Sidebar no longer hosts it.
 import type { ImageryLayer } from "./MapView";
 import { RasterResultsAccordion } from "./MapView";
 import { OlmoEarthDemoPairsList } from "./OlmoEarthDemoPairsList";
@@ -1106,16 +1107,10 @@ export function Sidebar({
 
         {/* ============ OLMOEARTH TAB — live HF catalog ============ */}
         {viewMode === "olmoearth" && (
-          <>
-            <OlmoEarthPanel
-              selectedArea={selectedArea}
-              onAddImageryLayer={onAddImageryLayer}
-            />
-            <InferenceLegendPanel
-              imageryLayers={imageryLayers ?? []}
-              onRemove={onRemoveImageryLayer}
-            />
-          </>
+          <OlmoEarthPanel
+            selectedArea={selectedArea}
+            onAddImageryLayer={onAddImageryLayer}
+          />
         )}
       </div>
       )}

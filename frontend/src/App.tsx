@@ -5,6 +5,7 @@ import { DEFAULT_CONFIG } from "./components/DataSourcePicker";
 import { MapView, type ImageryLayer } from "./components/MapView";
 import { Sidebar } from "./components/Sidebar";
 import { SplitMap } from "./components/SplitMap";
+import { InferenceLegendPanel } from "./components/InferenceLegendPanel";
 import { colorForTag, type LabelFeature, type LabelMode } from "./components/LabelPanel";
 import { analyze, getEnvData, getOlmoEarthCacheStatus, type OlmoEarthRepoStatus } from "./api/client";
 import { DATASET_COVERAGE } from "./constants/olmoEarthCoverage";
@@ -597,6 +598,14 @@ export function App() {
                   )}
                 </button>
               }
+            />
+            {/* Floating inference legend popovers (one per active layer) —
+                anchored top-right inside <main>'s relative box, sitting on
+                top of MapView. Shipped in place of the prior Sidebar inline
+                legend so the user sees the legend WHERE THE PIXELS ARE. */}
+            <InferenceLegendPanel
+              imageryLayers={imageryLayers}
+              onRemove={handleRemoveImageryLayer}
             />
           </>
         )}

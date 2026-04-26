@@ -99,6 +99,7 @@
   /* Fonts */
   --font-mono: "JetBrains Mono", Menlo, Consolas, monospace;
   --font-sans: "Inter", "Helvetica Neue", system-ui, sans-serif;
+  --font-display: "Fraunces", "Iowan Old Style", Georgia, serif;
 }
 
 html, body, #root { height: 100%; margin: 0; padding: 0; }
