@@ -12,7 +12,7 @@ locally-hosted web workbench.
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![Node 20+](https://img.shields.io/badge/node-20+-green.svg)](https://nodejs.org/)
-[![Tests: 221 passing](https://img.shields.io/badge/tests-221%20passing-brightgreen.svg)](#testing)
+[![Tests: 223 passing](https://img.shields.io/badge/tests-223%20passing-brightgreen.svg)](#testing)
 [![Built on OlmoEarth](https://img.shields.io/badge/built%20on-OlmoEarth-orange.svg)](https://huggingface.co/allenai)
 
 [Quick start](#quick-start) · [Architecture](#architecture) · [Features](#features) · [Documentation](#documentation) · [Contributing](#contributing)
@@ -185,6 +185,27 @@ encoder feature dim (768 + 768 → 1536). See
 [`docs/FOREST_LOSS_DRIVER.md`](docs/FOREST_LOSS_DRIVER.md) for the
 event-date contract and class list.
 
+#### Sliding-window inference (`sliding_window: true`)
+
+Every classification head also accepts a **sliding-window** mode that
+runs the head per ``predict_window_px`` window inside each chunk
+instead of once per chunk. For ForestLossDriver this turns "one
+driver class per ~25 km² chunk" into "one class per ~64 px window"
+— **16× finer spatial granularity**. The window size is chosen
+automatically from each head's rslearn metadata
+(`predict_window_px`); fall back is the request's `window_size`
+parameter (default 64).
+
+The OlmoEarthImport panel toggles this on by default for any FT head.
+Trade-off is wall time: a 5 km chunk emits ~49 windowed forwards
+instead of 1, so total runtime roughly doubles. For pre/post heads
+(ForestLossDriver) it triples — pre + post are encoded per window.
+
+When sliding-window is on, classification heads' `task_type` is
+reported as `segmentation` since the output now varies spatially —
+the existing GeoJSON export and tile renderer paths handle this
+uniformly.
+
 ### Embedding tools (no fine-tuning needed)
 
 When no FT head fits the AOI or task, run a base encoder (Nano / Tiny /
@@ -269,6 +290,15 @@ ForestLossDriver runs ~2× slower than single-stack FT heads because
 each chunk fetches pre + post stacks separately (parallelised inside
 the chunk).
 
+**Sliding-window inference** (default ON for FT heads in the UI) adds
+~50× more forward passes per chunk vs. one scene-level forward, so
+wall time roughly doubles for single-stack heads and triples for
+ForestLossDriver. The trade-off buys 16× finer spatial granularity
+on classification outputs — without it, ForestLossDriver emits one
+class for the entire 5 km chunk. Toggle off in the OlmoEarthImport
+panel to recover the faster scene-level path when you only need a
+single dominant class per chunk.
+
 ---
 
 ## Documentation
@@ -299,7 +329,7 @@ Roger-Studio/
 │   │   ├── services/                # inference orchestration + S2 fetch + LLM clients
 │   │   ├── models/                  # pydantic schemas
 │   │   └── mcp_server.py            # standalone MCP wrapper for external agents
-│   ├── tests/                       # 221 pytest tests (offline) + 12 marked @network
+│   ├── tests/                       # 223 pytest tests (offline) + 12 marked @network
 │   └── run.py                       # uvicorn entry
 ├── frontend/
 │   ├── src/
@@ -319,7 +349,7 @@ Roger-Studio/
 
 ```bash
 cd backend
-pytest -m "not network"               # 221 offline tests, ~15 s
+pytest -m "not network"               # 223 offline tests, ~15 s
 pytest -m network                     # 12 network tests (PC STAC, HF) — gated
 pytest backend/tests/test_olmoearth_inference.py -v   # one suite verbose
 ```
@@ -398,6 +428,6 @@ classes of bug — please honour them in PRs:
 ---
 
 Made with care by [Ziming Qi](https://github.com/2imi9) at Northeastern University.<br/>
-OlmoEarth partner · Sentinel-2 L2A · 221 tests passing · MIT.
+OlmoEarth partner · Sentinel-2 L2A · 223 tests passing · MIT.
 
 </div>
