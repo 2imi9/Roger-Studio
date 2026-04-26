@@ -14,6 +14,7 @@ import {
 import type { BBox } from "../types";
 import type { ImageryLayer } from "./MapView";
 import { OffDistributionBanner } from "./OffDistributionBanner";
+import { ResultPanel } from "./ResultPanel";
 
 /**
  * Shared OlmoEarth / OlmoEarth-FT import + run-to-layer form.
@@ -242,6 +243,15 @@ export function OlmoEarthImport({
   // "Pick a different head" button can scroll/focus it.
   const modelSelectRef = useRef<HTMLSelectElement | null>(null);
 
+  // The most-recent inference run from THIS OlmoEarthImport instance —
+  // surfaced via the ResultPanel which collapses the form. Cleared by
+  // the panel's "← Back to input" affordance. Tracked in component state
+  // (not a prop) so a sidebar instance and popover instance maintain
+  // their own panels and don't fight each other.
+  const [recentResult, setRecentResult] = useState<OlmoEarthInferenceResult | null>(null);
+  const [recentRanAt, setRecentRanAt] = useState<number>(0);
+  const [recentTookMs, setRecentTookMs] = useState<number>(0);
+
   // Few-shot semantic segmentation state. Three classes pre-seeded with
   // distinct accent colours so the user can start clicking immediately
   // without first picking a palette. ``pickingForClass`` tracks which
@@ -355,6 +365,7 @@ export function OlmoEarthImport({
     if (isPrePostHead && !eventDate) return;
     setBusy("infer");
     setStatus(null);
+    const t0 = Date.now();
     try {
       const res: OlmoEarthInferenceResult = await startOlmoEarthInference({
         bbox: selectedArea,
@@ -366,6 +377,14 @@ export function OlmoEarthImport({
         // encoder's /infer call is silently ignored by the dispatcher.
         slidingWindow: selected.kind === "ft" ? slidingWindow : undefined,
       });
+      const tookMs = Date.now() - t0;
+      // Surface the result through ResultPanel — replaces the input form
+      // in this OlmoEarthImport instance with a class-summary +
+      // confidence + provenance interpretation panel until the user
+      // clicks "← Back to input".
+      setRecentResult(res);
+      setRecentRanAt(Date.now());
+      setRecentTookMs(tookMs);
       if (onAddImageryLayer) {
         onAddImageryLayer({
           id: `olmoearth-${res.job_id}`,
@@ -621,7 +640,7 @@ export function OlmoEarthImport({
     }
   };
 
-  const body = (
+  const formBody = (
     <div className="space-y-3 text-[12px]">
       <div>
         <div className="font-semibold text-geo-text mb-1">
@@ -1320,6 +1339,24 @@ export function OlmoEarthImport({
         </div>
       )}
     </div>
+  );
+
+  // When the most-recent inference run from THIS instance still has a
+  // result on hand, render the ResultPanel in place of the input form
+  // (matches Claude Design v2 component1 behavior: input collapses,
+  // result takes its slot). The "← Back to input" affordance inside the
+  // panel sets recentResult back to null, restoring the form.
+  const body = recentResult ? (
+    <div className="h-full min-h-[480px]">
+      <ResultPanel
+        result={recentResult}
+        onBackToInput={() => setRecentResult(null)}
+        ranAt={recentRanAt}
+        tookMs={recentTookMs}
+      />
+    </div>
+  ) : (
+    formBody
   );
 
   if (compact) return body;
