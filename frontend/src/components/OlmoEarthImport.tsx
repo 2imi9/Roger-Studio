@@ -870,10 +870,40 @@ export function OlmoEarthImport({
           Area of interest
         </div>
         {selectedArea ? (
-          <div className="text-geo-text font-mono">
-            {selectedArea.west.toFixed(3)}, {selectedArea.south.toFixed(3)} → {selectedArea.east.toFixed(3)},{" "}
-            {selectedArea.north.toFixed(3)}
-          </div>
+          <>
+            <div className="text-geo-text font-mono">
+              {selectedArea.west.toFixed(3)}, {selectedArea.south.toFixed(3)} → {selectedArea.east.toFixed(3)},{" "}
+              {selectedArea.north.toFixed(3)}
+            </div>
+            {/* Pre-flight runtime estimate — pure client-side math
+                derived from the AOI bbox area + chunking heuristics
+                that match the backend orchestrator (5 km chunks, 4-wide
+                concurrency). Numbers are calibrated against observed
+                cold/warm wall times: Mangrove FL Keys 3 km × 3 km cold
+                ~265 s, warm ~18 s. Pre/post heads (ForestLossDriver)
+                fetch two scene groups so wall time roughly doubles. */}
+            {activeTab === "inference" && (() => {
+              const midLat = (selectedArea.south + selectedArea.north) / 2.0;
+              const ewKm = Math.abs(selectedArea.east - selectedArea.west)
+                * 111 * Math.cos((midLat * Math.PI) / 180);
+              const nsKm = Math.abs(selectedArea.north - selectedArea.south) * 111;
+              const areaKm2 = ewKm * nsKm;
+              const chunks = Math.max(1, Math.ceil(areaKm2 / 25));
+              const groups = Math.ceil(chunks / 4);
+              const prePostMul = isPrePostHead ? 2 : 1;
+              const coldS = Math.round(groups * 270 * prePostMul);
+              const warmS = Math.round(groups * 20 * prePostMul);
+              const fmt = (s: number) =>
+                s < 60 ? `${s} s`
+                : s < 600 ? `${Math.round(s / 60)} min ${s % 60 ? `${s % 60} s` : ""}`.trim()
+                : `${Math.round(s / 60)} min`;
+              return (
+                <div className="mt-1 text-geo-muted font-mono">
+                  ≈ {chunks} chunk{chunks === 1 ? "" : "s"} · cold {fmt(coldS)} / warm {fmt(warmS)}
+                </div>
+              );
+            })()}
+          </>
         ) : (
           <div className="text-geo-danger">
             No area selected — draw a rectangle or polygon on the map first.
@@ -1422,6 +1452,14 @@ export function OlmoEarthImport({
           onBackToInput={() => setRecentResult(null)}
           ranAt={recentRanAt}
           tookMs={recentTookMs}
+          onRetry={() => {
+            // Clear the prior result so the panel unmounts cleanly,
+            // then re-fire the same spec. handleRun reads selectedArea
+            // + repoId + slidingWindow + eventDate, all of which are
+            // still in component state from the original run.
+            setRecentResult(null);
+            void handleRun();
+          }}
         />
       </div>
     );

@@ -1,30 +1,75 @@
+# Roger Studio — quick-start compose.
+#
+# Brings the FastAPI backend + Vite frontend up with a single command:
+#     docker compose up
+#
+# Then open http://localhost:3000.
+#
+# Notes
+# -----
+# * The backend image is CPU-only by default. Real OlmoEarth inference
+#   needs CUDA; without it the orchestrator returns ``kind: "stub"``
+#   (the stub-mode ResultPanel renders correctly, useful for UI work).
+#   See backend/Dockerfile for the GPU upgrade path.
+# * Sentinel-2 scenes are cached to ./backend/data/s2_cache via the
+#   bind mount below so cold-runs become warm forever after the first
+#   successful fetch — even across `docker compose down/up` cycles.
+# * Cloud LLM keys (Anthropic, Gemini, OpenAI, NVIDIA NIM) and HF_TOKEN
+#   are read from the host's environment; set them in your shell or a
+#   .env file alongside this compose file. Local Gemma (vLLM) is out
+#   of scope for the dockerised quickstart — run it natively.
 services:
+  api:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persist the Sentinel-2 + project DB cache across container
+      # rebuilds. Path matches the backend's hard-coded ``data/`` and
+      # ``S2_CACHE_DIR=data/s2_cache`` defaults.
+      - ./backend/data:/app/data
+    environment:
+      - ENV=development
+      - OE_MAX_CONCURRENT_JOBS=1
+      - OE_MAX_CHUNKS=100
+      # Cloud LLM keys (optional). Pass-through from host env so nothing
+      # is baked into the image.
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY:-}
+      - HF_TOKEN=${HF_TOKEN:-}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
   frontend:
     build: ./frontend
     ports:
       - "3000:3000"
     depends_on:
-      - api
+      api:
+        condition: service_healthy
     environment:
+      # Vite proxies /api/* to this URL. ``api`` is the docker network
+      # alias; from inside the bridge net the backend is reachable as
+      # http://api:8000 even when the host has nothing on :8000.
       - VITE_API_URL=http://api:8000
 
-  api:
-    build: ./backend
-    ports:
-      - "8000:8000"
-    environment:
-      - ENV=development
-
-  # Phase 2+: GPU services
-  # olmoearth:
-  #   build: ./services/olmoearth
-  #   profiles: ["ml"]
-  #   deploy:
-  #     resources:
-  #       reservations:
-  #         devices:
-  #           - capabilities: [gpu]
-
-  # env-data:
-  #   build: ./services/env-data
-  #   profiles: ["env"]
+# Phase 2+: GPU-enabled inference profile. Once nvidia-container-toolkit
+# is set up on the host, run with:
+#     docker compose --profile gpu up
+# and switch the api `image` / `build` to a CUDA base (see
+# backend/Dockerfile for the upgrade path).
+#
+#   gpu-api:
+#     extends: api
+#     profiles: ["gpu"]
+#     deploy:
+#       resources:
+#         reservations:
+#           devices:
+#             - driver: nvidia
+#               capabilities: [gpu]

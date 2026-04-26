@@ -54,9 +54,41 @@ remote-sensing PhD.
 ## Quick start
 
 Roger Studio is a two-process app: a Python FastAPI backend (the
-inference orchestrator) and a Vite/React frontend (the workbench).
+inference orchestrator) and a Vite/React frontend (the workbench). Two
+ways to get it running — pick one:
 
-### Prerequisites
+### Option A — Docker (one command)
+
+If you have [Docker Desktop](https://www.docker.com/products/docker-desktop/)
+installed:
+
+```bash
+git clone https://github.com/2imi9/Roger-Studio.git
+cd Roger-Studio
+docker compose up
+```
+
+Then open <http://localhost:3000>. The first run pulls images + installs
+deps inside the containers (~5–10 min); every subsequent `up` is fast.
+The Sentinel-2 scene cache persists at `./backend/data/s2_cache` so warm
+inferences stay fast across restarts.
+
+> **CPU-only by default.** The default container has no CUDA, so real
+> OlmoEarth inference falls back to `kind: "stub"` — useful for UI /
+> design work, the ResultPanel renders the stub state correctly. For
+> real inference, either follow Option B below or wire the GPU profile
+> documented in `backend/Dockerfile` and `docker-compose.yml`.
+
+Optional API keys (cloud LLMs + gated HF models) are read from your
+shell environment via `${ANTHROPIC_API_KEY:-}` etc. — set them before
+`docker compose up` or drop a `.env` next to the compose file.
+
+### Option B — Native install (full GPU inference)
+
+Best for: real OlmoEarth runs on a CUDA box, contributing to the
+orchestrator code, or running the Local Gemma vLLM stack.
+
+#### Prerequisites
 
 - **Python 3.11+** with `pip`
 - **Node 20+** with `pnpm` (or `npm`)
@@ -65,14 +97,14 @@ inference orchestrator) and a Vite/React frontend (the workbench).
 - **~16 GB RAM** for the smallest configuration; **24 GB VRAM** GPU
   recommended for real inference (CPU works for testing)
 
-### 1. Clone
+#### 1. Clone
 
 ```bash
 git clone https://github.com/2imi9/Roger-Studio.git
 cd Roger-Studio
 ```
 
-### 2. Backend
+#### 2. Backend
 
 ```bash
 cd backend
@@ -88,7 +120,7 @@ export OE_MAX_CHUNKS=100
 python run.py                         # serves http://localhost:8000
 ```
 
-### 3. Frontend
+#### 3. Frontend
 
 ```bash
 cd frontend
@@ -96,7 +128,7 @@ pnpm install                          # or: npm install
 pnpm dev                              # serves http://localhost:3000
 ```
 
-### 4. Open http://localhost:3000
+#### 4. Open http://localhost:3000
 
 The **Introduction Doc** button next to the Project menu launches a
 guided tour of every tab. The fastest path to a real result:

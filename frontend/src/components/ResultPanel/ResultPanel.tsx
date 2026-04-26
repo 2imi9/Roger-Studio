@@ -53,6 +53,11 @@ interface Props {
   ranAt: number;
   /** Wall time spent in the run, in ms. */
   tookMs: number;
+  /** Re-fire the same inference. Wired from OlmoEarthImport's
+   *  handleRun so the user can retry a stub fallback in one click
+   *  (the prior recovery path was ← Back → Run again). Optional —
+   *  the retry button just hides if the parent doesn't supply it. */
+  onRetry?: () => void;
 }
 
 interface ClassRow {
@@ -245,7 +250,7 @@ function ConfidenceBar({ value, label }: { value: number; label?: string }) {
   );
 }
 
-function StubBlock({ result }: { result: OlmoEarthInferenceResult }) {
+function StubBlock({ result, onRetry }: { result: OlmoEarthInferenceResult; onRetry?: () => void }) {
   return (
     <div className="px-4 space-y-3">
       <div className="rounded-md border border-geo-danger/35 bg-geo-danger-soft p-3 space-y-1.5">
@@ -264,7 +269,18 @@ function StubBlock({ result }: { result: OlmoEarthInferenceResult }) {
         <span className="text-geo-muted">stub_reason: </span>
         <span className="text-geo-danger">"{result.stub_reason ?? "unknown"}"</span>
       </div>
+      {onRetry && (
+        <button
+          type="button"
+          onClick={onRetry}
+          className="w-full h-9 inline-flex items-center justify-center gap-2 text-[13px] font-medium rounded bg-geo-accent text-white hover:bg-geo-accent-deep transition-colors shadow-geo-button"
+        >
+          Retry inference
+        </button>
+      )}
       <p className="text-[11.5px] text-geo-muted leading-snug">
+        Cached chunks (if any) will skip re-fetch. The progress monitor will
+        show whether the retry is working before the breaker can trip again.
         Class summary, confidence, and export are unavailable for stub results.
       </p>
     </div>
@@ -421,7 +437,7 @@ function topClass(rows: ClassRow[]): { name: string; prob: number } | null {
   return { name: t.name, prob: t.prob };
 }
 
-export function ResultPanel({ result, onBackToInput, ranAt, tookMs }: Props) {
+export function ResultPanel({ result, onBackToInput, ranAt, tookMs, onRetry }: Props) {
   const now = Date.now();
   const isStub = result.kind === "stub";
 
@@ -488,7 +504,7 @@ export function ResultPanel({ result, onBackToInput, ranAt, tookMs }: Props) {
 
       {/* Body */}
       <div className="flex-1 overflow-y-auto py-3 space-y-4">
-        {isStub && <StubBlock result={result} />}
+        {isStub && <StubBlock result={result} onRetry={onRetry} />}
 
         {isPartial && partialNote && <PartialCoverageBanner note={partialNote} />}
 
