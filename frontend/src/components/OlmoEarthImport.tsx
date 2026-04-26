@@ -290,6 +290,16 @@ export function OlmoEarthImport({
     d.setFullYear(d.getFullYear() - 1);
     return d.toISOString().slice(0, 10);
   });
+  // Sliding-window inference toggle. When ON, the chunked orchestrator
+  // runs the FT head over a grid of ``window_size``-pixel windows per
+  // chunk instead of one scene-level forward — turns ForestLossDriver's
+  // "one driver class per 5 km chunk" into "one class per ~64 px
+  // window" (16× finer for FLD's predict_window_px=64). Default ON for
+  // classification heads where it matters; off for segmentation /
+  // regression where the head already produces per-pixel output. Window
+  // size is chosen by the backend from the head's metadata
+  // (``predict_window_px``) when this is on.
+  const [slidingWindow, setSlidingWindow] = useState<boolean>(true);
   // Subtab split: Run inference vs. Embedding tools. The panel had grown to
   // 1 inference action + 3 embedding actions + 1 advanced action in a flat
   // list, which pushed the primary Run button below the fold on short
@@ -346,6 +356,11 @@ export function OlmoEarthImport({
         bbox: selectedArea,
         modelRepoId: repoId,
         eventDate: isPrePostHead ? eventDate : undefined,
+        // Only request sliding-window for FT heads — base encoders
+        // run via the embedding-tools endpoints, not /infer, so
+        // sliding_window has no effect there. Sending it on a base
+        // encoder's /infer call is silently ignored by the dispatcher.
+        slidingWindow: selected.kind === "ft" ? slidingWindow : undefined,
       });
       if (onAddImageryLayer) {
         onAddImageryLayer({
@@ -742,6 +757,38 @@ export function OlmoEarthImport({
             S2 has coverage on both sides — late 2017 onward is safe.
           </div>
         </div>
+      )}
+
+      {/* Sliding-window toggle — only for FT heads. When ON, the
+          backend runs the head over a grid of ~64 px windows per chunk
+          instead of one scene-level forward. Turns ForestLossDriver's
+          "one class per 5 km chunk" into "one class per ~64 px window"
+          (16× finer); for already-segmentation heads (Mangrove, AWF,
+          Ecosystem) it gives finer per-window confidence variation.
+          Adds wall time roughly proportional to (chunk_size_px /
+          window_size)² extra forward passes per chunk; for the default
+          5 km / 64 px ratio that's ~49 forwards per chunk vs 1. */}
+      {activeTab === "inference" && selected.kind === "ft" && (
+        <label className="flex items-start gap-2 px-2 py-1.5 rounded bg-geo-bg border border-geo-border cursor-pointer">
+          <input
+            type="checkbox"
+            checked={slidingWindow}
+            onChange={(e) => setSlidingWindow(e.target.checked)}
+            disabled={busy !== null}
+            className="mt-0.5 cursor-pointer"
+          />
+          <div className="flex-1 text-[10px] leading-snug">
+            <div className="font-semibold text-geo-text">
+              Sliding-window inference
+            </div>
+            <div className="text-geo-muted">
+              Run the head per ~64 px window instead of once per chunk.
+              Turns scene-level outputs (ForestLossDriver, classification
+              FTs) into a real per-window class map; ~50× more forward
+              passes per chunk so wall time roughly doubles.
+            </div>
+          </div>
+        </label>
       )}
 
       {/* AOI status — the Run button needs a selected area. Surfacing this

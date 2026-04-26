@@ -482,6 +482,8 @@ async def _run_chunked_aoi_inference(
     date_range: str,
     chunk_size_m: int = 5000,
     target_gsd_m: float = 10.0,
+    sliding_window: bool = False,
+    window_size: int = 64,
     disconnect_check=None,
 ) -> dict[str, Any]:
     """Native-resolution chunked inference for FT heads with ``input_spec``.
@@ -683,14 +685,36 @@ async def _run_chunked_aoi_inference(
             # Forward releases GIL during CUDA dispatch; multiple chunks
             # may queue here concurrently but PyTorch serializes on the
             # GPU stream — concurrency above is fetch-bound, not compute.
-            chunk_result = await asyncio.to_thread(
-                olmoearth_model.run_ft_inference,
-                model,
-                chunk_image,
-                stack_result.timestamps,
-                effective_patch,
-                device,
-            )
+            #
+            # When sliding_window is on, each chunk runs the head over a
+            # grid of ``window_size``-pixel windows instead of one
+            # scene-level forward pass. For classification heads this
+            # turns a chunk's "one class everywhere" output into one
+            # class per ~64 px window — matches the head's training-time
+            # ``predict_window_px`` and gives meaningful spatial detail
+            # within each chunk. The output shape contract is identical
+            # (FTInferenceResult with patch-resolution scalar +
+            # class_raster) so the stitch + upsample paths below need
+            # no changes.
+            if sliding_window:
+                chunk_result = await asyncio.to_thread(
+                    olmoearth_model.run_ft_tiled_inference,
+                    model,
+                    chunk_image,
+                    stack_result.timestamps,
+                    window_size,
+                    effective_patch,
+                    device,
+                )
+            else:
+                chunk_result = await asyncio.to_thread(
+                    olmoearth_model.run_ft_inference,
+                    model,
+                    chunk_image,
+                    stack_result.timestamps,
+                    effective_patch,
+                    device,
+                )
         except Exception as e:
             logger.warning("chunk %d/%d inference failed: %s", ch_idx + 1, len(chunks), e)
             return _CHUNK_FAIL
@@ -717,8 +741,15 @@ async def _run_chunked_aoi_inference(
                 ch_idx + 1, len(chunks), row_offset, col_offset,
             )
             return _CHUNK_FAIL
-        h_to_paste = min(ch4, global_h - row_offset)
-        w_to_paste = min(cw4, global_w - col_offset)
+        # Paste-window dimensions come from the actual produced chunk
+        # raster, not from ch4/cw4 — sliding-window inference trims
+        # edge windows that don't fit a full ``window_size``, so the
+        # tiled output may be SMALLER than the chunk's native footprint
+        # (e.g. a 500-px chunk with window=64 emits 7×16=112 patches
+        # = 448 native px; the bottom + right 52 px get dropped).
+        chunk_native_h, chunk_native_w = chunk_scalar_hi.shape[:2]
+        h_to_paste = min(chunk_native_h, global_h - row_offset)
+        w_to_paste = min(chunk_native_w, global_w - col_offset)
         if h_to_paste <= 0 or w_to_paste <= 0:
             logger.warning(
                 "chunk %d/%d zero-sized paste window — skipping",
@@ -998,6 +1029,8 @@ async def _run_chunked_pre_post_inference(
     event_date: str,
     chunk_size_m: int = 5000,
     target_gsd_m: float = 10.0,
+    sliding_window: bool = False,
+    window_size: int = 64,
     disconnect_check=None,
 ) -> dict[str, Any]:
     """Native-resolution chunked inference for pre/post change-detection FT heads.
@@ -1161,16 +1194,35 @@ async def _run_chunked_pre_post_inference(
         post_image = stack_to_bhwtc(post_stack.stack[:ch4, :cw4, :, :])
 
         try:
-            chunk_result = await asyncio.to_thread(
-                olmoearth_model.run_ft_pre_post_inference,
-                model,
-                pre_image,
-                post_image,
-                pre_stack.timestamps,
-                post_stack.timestamps,
-                effective_patch,
-                device,
-            )
+            # Sliding-window mode: tile the pre+post pair into
+            # ``window_size`` chunks and run the conv-pool-fc head per
+            # window. Turns ForestLossDriver's "one driver class per
+            # 5km chunk" into "one class per ~64 px window" — matches
+            # the head's training-time predict_window_px and gives
+            # users meaningful spatial detail across the AOI.
+            if sliding_window:
+                chunk_result = await asyncio.to_thread(
+                    olmoearth_model.run_ft_pre_post_tiled_inference,
+                    model,
+                    pre_image,
+                    post_image,
+                    pre_stack.timestamps,
+                    post_stack.timestamps,
+                    window_size,
+                    effective_patch,
+                    device,
+                )
+            else:
+                chunk_result = await asyncio.to_thread(
+                    olmoearth_model.run_ft_pre_post_inference,
+                    model,
+                    pre_image,
+                    post_image,
+                    pre_stack.timestamps,
+                    post_stack.timestamps,
+                    effective_patch,
+                    device,
+                )
         except Exception as e:
             logger.warning("pre/post chunk %d/%d inference failed: %s", ch_idx + 1, len(chunks), e)
             return _CHUNK_FAIL
@@ -1197,8 +1249,12 @@ async def _run_chunked_pre_post_inference(
                 ch_idx + 1, len(chunks), row_offset, col_offset,
             )
             return _CHUNK_FAIL
-        h_to_paste = min(ch4, global_h - row_offset)
-        w_to_paste = min(cw4, global_w - col_offset)
+        # Same paste-window adjustment as the single-stack chunked path:
+        # sliding-window may emit a smaller class raster than the chunk's
+        # native footprint when window_size doesn't divide the chunk evenly.
+        chunk_native_h, chunk_native_w = chunk_scalar_hi.shape[:2]
+        h_to_paste = min(chunk_native_h, global_h - row_offset)
+        w_to_paste = min(chunk_native_w, global_w - col_offset)
         if h_to_paste <= 0 or w_to_paste <= 0:
             return _CHUNK_FAIL
 
@@ -2637,6 +2693,17 @@ async def _run_real_inference(
             model_repo_id,
         )
 
+    # Determine the per-chunk sliding-window size. The FT head's metadata
+    # carries ``predict_window_px`` from its rslearn run config (e.g. 64
+    # for ForestLossDriver, 32 for Ecosystem). When ``sliding_window`` is
+    # turned on but the head doesn't declare a window size, we fall back
+    # to the caller's ``window_size`` parameter (default 64). When the
+    # head DOES declare one, use it — it's what the head was trained on.
+    declared_window_px = None
+    if isinstance(model, olmoearth_ft.FTModel):
+        declared_window_px = (input_spec or {}).get("predict_window_px")
+    effective_window_size = int(declared_window_px or window_size)
+
     if use_pre_post:
         assert isinstance(model, olmoearth_ft.FTModel)
         return await _run_chunked_pre_post_inference(
@@ -2646,6 +2713,8 @@ async def _run_real_inference(
             input_spec=input_spec,
             effective_patch=effective_patch,
             event_date=event_date,
+            sliding_window=sliding_window,
+            window_size=effective_window_size,
             disconnect_check=disconnect_check,
         )
 
@@ -2665,6 +2734,8 @@ async def _run_real_inference(
             input_spec=input_spec,
             effective_patch=effective_patch,
             date_range=date_range,
+            sliding_window=sliding_window,
+            window_size=effective_window_size,
             disconnect_check=disconnect_check,
         )
 

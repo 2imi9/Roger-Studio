@@ -860,6 +860,136 @@ def run_ft_pre_post_inference(
     )
 
 
+def run_ft_pre_post_tiled_inference(
+    model: FTModel,
+    pre_image_bhwtc: np.ndarray,
+    post_image_bhwtc: np.ndarray,
+    pre_timestamp_dmy: tuple[int, int, int] | list[tuple[int, int, int]],
+    post_timestamp_dmy: tuple[int, int, int] | list[tuple[int, int, int]],
+    window_size: int = 64,
+    patch_size: int = 4,
+    device: torch.device | None = None,
+    normalize: bool = True,
+) -> FTInferenceResult:
+    """Sliding-window pre/post inference for ForestLossDriver-style heads.
+
+    The conv-pool-fc head was trained on ~64 × 64 px windows; running it
+    on a single 500-px chunk emits ONE scene-level class for the whole
+    chunk. This tiled variant runs the head over a grid of non-
+    overlapping ``window_size``-pixel windows, each encoded as a
+    pre/post pair → 1536-channel concat → single class label.
+
+    Output is a (n_rows × win_patches, n_cols × win_patches) class
+    raster at patch resolution — same convention as
+    :func:`run_ft_tiled_inference` so the chunked orchestrator's stitch
+    and upsample paths work unchanged.
+
+    Edge windows that don't fit a full ``window_size`` get dropped on
+    the bottom + right; output is trimmed to the largest aligned grid.
+    """
+    for name, arr in (("pre", pre_image_bhwtc), ("post", post_image_bhwtc)):
+        if arr.ndim != 5 or arr.shape[0] != 1:
+            raise ValueError(f"{name}: expected BHWTC with B=1, got shape {arr.shape}")
+        if arr.shape[-1] != 12:
+            raise ValueError(f"{name}: S2 needs 12 bands, got C={arr.shape[-1]}")
+    if pre_image_bhwtc.shape[1:3] != post_image_bhwtc.shape[1:3]:
+        raise ValueError(
+            f"pre H/W {pre_image_bhwtc.shape[1:3]} must equal post H/W "
+            f"{post_image_bhwtc.shape[1:3]}"
+        )
+    _, H, W, _, _ = pre_image_bhwtc.shape
+    if window_size % patch_size != 0:
+        raise ValueError(
+            f"window_size={window_size} must be divisible by patch_size={patch_size}"
+        )
+
+    n_rows = H // window_size
+    n_cols = W // window_size
+    if n_rows < 1 or n_cols < 1:
+        # Bbox too small for windowing — single-window path is identical
+        # to the existing non-tiled pre/post inference, just on the trimmed
+        # tensor that fits one window.
+        h_trim = max(patch_size, (H // patch_size) * patch_size)
+        w_trim = max(patch_size, (W // patch_size) * patch_size)
+        return run_ft_pre_post_inference(
+            model,
+            pre_image_bhwtc[:, :h_trim, :w_trim, :, :],
+            post_image_bhwtc[:, :h_trim, :w_trim, :, :],
+            pre_timestamp_dmy,
+            post_timestamp_dmy,
+            patch_size=patch_size,
+            device=device,
+            normalize=normalize,
+        )
+
+    H_trim = n_rows * window_size
+    W_trim = n_cols * window_size
+    pre_image = pre_image_bhwtc[:, :H_trim, :W_trim, :, :]
+    post_image = post_image_bhwtc[:, :H_trim, :W_trim, :, :]
+
+    win_patches = window_size // patch_size
+    out_h = n_rows * win_patches
+    out_w = n_cols * win_patches
+
+    class_raster = np.zeros((out_h, out_w), dtype=np.int32)
+    scalar_raster = np.zeros((out_h, out_w), dtype=np.float32)
+    any_class_output = False
+    skipped = 0
+
+    for i in range(n_rows):
+        for j in range(n_cols):
+            y0 = i * window_size
+            x0 = j * window_size
+            pre_w = pre_image[:, y0 : y0 + window_size, x0 : x0 + window_size, :, :]
+            post_w = post_image[:, y0 : y0 + window_size, x0 : x0 + window_size, :, :]
+            # Skip all-zero windows (S2 off-footprint or empty composite).
+            # Either side empty is enough to flag it — the encoder needs
+            # both halves of the pre/post pair to produce a real prediction.
+            if float(pre_w.max()) < 1e-3 or float(post_w.max()) < 1e-3:
+                skipped += 1
+                continue
+            res = run_ft_pre_post_inference(
+                model, pre_w, post_w,
+                pre_timestamp_dmy, post_timestamp_dmy,
+                patch_size=patch_size, device=device, normalize=normalize,
+            )
+            y0p = i * win_patches
+            x0p = j * win_patches
+            scalar_raster[y0p : y0p + win_patches, x0p : x0p + win_patches] = res.scalar
+            if res.class_raster is not None:
+                class_raster[y0p : y0p + win_patches, x0p : x0p + win_patches] = res.class_raster
+                any_class_output = True
+
+    if skipped == n_rows * n_cols:
+        raise ValueError(
+            f"pre/post tiled: every {n_rows * n_cols} window was empty — "
+            f"the AOI may be entirely ocean / off-footprint, or one of the "
+            f"pre/post groups returned no usable scenes."
+        )
+
+    md = model.metadata or {}
+    class_names, tentative = olmoearth_ft.class_names_for(model.repo_id, model.spec.num_classes)
+    class_colors = olmoearth_ft.class_colors_for(model.repo_id, model.spec.num_classes)
+    src_task = model.spec.task_type
+    effective_task = "segmentation" if src_task == "classification" else src_task
+    return FTInferenceResult(
+        task_type=effective_task,
+        scalar=scalar_raster,
+        class_raster=class_raster if any_class_output else None,
+        class_probs=None,
+        class_names=class_names,
+        class_names_tentative=tentative,
+        class_colors=class_colors,
+        colormap=md.get("colormap", "embedding"),
+        units=md.get("units"),
+        prediction_value=None,
+        num_classes=model.spec.num_classes,
+        patch_size=patch_size,
+        repo_id=model.repo_id,
+        decoder_key=model.spec.decoder_key,
+    )
+
+
 def run_ft_tiled_inference(
     model: FTModel,
     image_bhwtc: np.ndarray,

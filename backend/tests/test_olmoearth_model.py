@@ -273,6 +273,175 @@ def test_pre_post_inference_concatenates_768_to_1536() -> None:
     assert result.class_raster.shape == (h // patch_size, w // patch_size)
 
 
+def test_run_ft_pre_post_tiled_inference_emits_per_window_class_raster() -> None:
+    """Sliding-window pre/post inference produces ONE class per window
+    instead of one class for the whole input. Synth a 128×128 input,
+    window=64 → 2×2 = 4 windows; the head returns deterministic outputs
+    so each window gets a distinct class label and the stitched raster
+    is non-uniform.
+    """
+    import torch
+    import torch.nn as nn
+    from app.services import olmoearth_ft as FT
+
+    embed_dim = 8
+    num_classes = 4
+    patch_size = 4
+    window_size = 64
+    H = W = 128  # 2 windows wide
+
+    # Counter so each window's forward pass returns a different class.
+    forward_count = {"n": 0}
+
+    class _FakeEncoder(nn.Module):
+        def forward(self, sample, fast_pass=True, patch_size=4):
+            t = sample.timestamps.shape[1]
+            tokens = torch.randn(1, H // patch_size, W // patch_size, t, 3, embed_dim)
+
+            class _TM:
+                pass
+
+            tm = _TM()
+            tm.sentinel2_l2a = tokens
+
+            class _Holder(dict):
+                pass
+
+            return _Holder({"tokens_and_masks": tm})
+
+    class _FakeEncoderParent(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = _FakeEncoder()
+
+    class _FakeHead(nn.Module):
+        def forward(self, tokens_bhwtsd):
+            # Each call returns a one-hot at a different class index so
+            # the stitched raster has all 4 distinct classes by the end.
+            idx = forward_count["n"] % num_classes
+            forward_count["n"] += 1
+            logits = torch.full((tokens_bhwtsd.shape[0], num_classes), -10.0)
+            logits[0, idx] = 10.0
+            return logits
+
+    spec = FT.FTHeadSpec(
+        task_type="classification",
+        num_classes=num_classes,
+        decoder_key="conv_pool_fc_classification",
+        weight_shape=(num_classes, 2 * embed_dim),
+        head_prefix="model.decoder",
+    )
+    fake_model = FT.FTModel(
+        encoder_parent=_FakeEncoderParent(),
+        head=_FakeHead(),
+        repo_id="allenai/OlmoEarth-v1-FT-ForestLossDriver-Base",
+        spec=spec,
+        metadata={"colormap": "forestloss", "patch_size": patch_size},
+    )
+
+    rng = np.random.default_rng(0)
+    pre = (rng.random((1, H, W, 4, 12)) * 5000).astype(np.float32)
+    post = (rng.random((1, H, W, 4, 12)) * 5000).astype(np.float32)
+
+    result = M.run_ft_pre_post_tiled_inference(
+        model=fake_model,
+        pre_image_bhwtc=pre,
+        post_image_bhwtc=post,
+        pre_timestamp_dmy=(15, 7, 2022),
+        post_timestamp_dmy=(22, 8, 2022),
+        window_size=window_size,
+        patch_size=patch_size,
+        device=torch.device("cpu"),
+        normalize=False,
+    )
+
+    # 2x2 windows × 16 patches per window = 32x32 patch output
+    expected_patches = (H // patch_size, W // patch_size)
+    assert result.class_raster is not None
+    assert result.class_raster.shape == expected_patches
+    # Distinct classes per window: 4 forwards × 4 distinct argmaxes = all
+    # 4 classes should be present in the stitched raster.
+    unique_classes = np.unique(result.class_raster).tolist()
+    assert sorted(unique_classes) == list(range(num_classes)), (
+        f"expected all {num_classes} classes present, got {unique_classes}"
+    )
+    # Source task was classification; tiled output is reported as
+    # segmentation since it now varies spatially.
+    assert result.task_type == "segmentation"
+
+
+def test_run_ft_pre_post_tiled_inference_falls_back_to_single_window_when_too_small() -> None:
+    """Bbox smaller than one window → falls back to the non-tiled
+    pre/post inference (which emits a uniform class). Avoids a
+    confusing "0 windows = empty output" failure for tiny AOIs."""
+    import torch
+    import torch.nn as nn
+    from app.services import olmoearth_ft as FT
+
+    embed_dim = 8
+    H = W = 32  # smaller than window_size=64
+
+    class _FakeEncoder(nn.Module):
+        def forward(self, sample, fast_pass=True, patch_size=4):
+            t = sample.timestamps.shape[1]
+            tokens = torch.randn(1, H // patch_size, W // patch_size, t, 3, embed_dim)
+
+            class _TM:
+                pass
+
+            tm = _TM()
+            tm.sentinel2_l2a = tokens
+
+            class _Holder(dict):
+                pass
+
+            return _Holder({"tokens_and_masks": tm})
+
+    class _FakeEncoderParent(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = _FakeEncoder()
+
+    class _FakeHead(nn.Module):
+        def forward(self, tokens):
+            return torch.zeros(tokens.shape[0], 4)
+
+    spec = FT.FTHeadSpec(
+        task_type="classification",
+        num_classes=4,
+        decoder_key="conv_pool_fc_classification",
+        weight_shape=(4, 16),
+        head_prefix="model.decoder",
+    )
+    fake_model = FT.FTModel(
+        encoder_parent=_FakeEncoderParent(),
+        head=_FakeHead(),
+        repo_id="x",
+        spec=spec,
+        metadata={"patch_size": 4},
+    )
+
+    pre = np.zeros((1, H, W, 4, 12), dtype=np.float32) + 1
+    post = np.zeros((1, H, W, 4, 12), dtype=np.float32) + 1
+
+    result = M.run_ft_pre_post_tiled_inference(
+        model=fake_model,
+        pre_image_bhwtc=pre,
+        post_image_bhwtc=post,
+        pre_timestamp_dmy=(15, 7, 2022),
+        post_timestamp_dmy=(22, 8, 2022),
+        window_size=64,
+        patch_size=4,
+        device=torch.device("cpu"),
+        normalize=False,
+    )
+    # Single uniform class raster (the fallback path's output).
+    assert result.class_raster is not None
+    assert result.class_raster.shape == (H // 4, W // 4)
+    assert result.task_type == "classification"
+    assert len(set(result.class_raster.flatten().tolist())) == 1
+
+
 def test_run_ft_pre_post_inference_rejects_mismatched_spatial_dims() -> None:
     """Pre and post stacks must share H/W; if they don't, the concatenation
     contract breaks. Surface a ValueError before the encoder runs."""
