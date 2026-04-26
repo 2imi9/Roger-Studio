@@ -59,8 +59,18 @@ interface ClassRow {
   index: number;
   name: string;
   color: string;
-  /** softmax score, when available */
+  /** Softmax score from class_probs, when available. May be null even
+   *  for present classes if the head doesn't expose scene-level
+   *  scores (segmentation heads run per-pixel argmax — there's no
+   *  single "Mangrove score" for the AOI). */
   prob: number | null;
+  /** Whether this class actually appears in the rendered raster.
+   *  Drives the present-vs-empty split in the summary table. Derived
+   *  from result.present_class_ids when the backend supplies it;
+   *  otherwise falls back to (prob > 0) for classification heads with
+   *  scene-level probs. When neither is available, every class is
+   *  treated as present so the user at least sees the legend table. */
+  present: boolean;
 }
 
 function isClassLegend(
@@ -136,11 +146,11 @@ function ClassSummary({ rows, hasMutedTreatment = false }: { rows: ClassRow[]; h
   const [emptyOpen, setEmptyOpen] = useState(false);
   const [sort, setSort] = useState<"pct" | "name">("pct");
 
-  const present = rows.filter((r) => (r.prob ?? 0) > 0);
-  const empty = rows.filter((r) => !((r.prob ?? 0) > 0));
+  const present = rows.filter((r) => r.present);
+  const empty = rows.filter((r) => !r.present);
   const sorted = [...present].sort((a, b) =>
     sort === "pct"
-      ? (b.prob ?? 0) - (a.prob ?? 0)
+      ? (b.prob ?? -1) - (a.prob ?? -1)
       : a.name.localeCompare(b.name),
   );
 
@@ -160,6 +170,9 @@ function ClassSummary({ rows, hasMutedTreatment = false }: { rows: ClassRow[]; h
         {row.prob != null ? row.prob.toFixed(3) : "—"}
       </span>
       <span className="text-right font-mono tabular-nums text-[12px] text-geo-text">
+        {/* Per-pixel segmentation heads have no scene-level % — show an
+            em-dash rather than a misleading "0.0%". Classification heads
+            with scene-level class_probs render the real percent. */}
         {row.prob != null ? `${(row.prob * 100).toFixed(1)}%` : "—"}
       </span>
     </div>
@@ -374,15 +387,29 @@ function ExportRow({ result }: { result: OlmoEarthInferenceResult }) {
 function buildClassRows(result: OlmoEarthInferenceResult): ClassRow[] {
   if (!isClassLegend(result.legend)) return [];
   const probs = result.class_probs;
-  const present = result.present_class_ids ?? null;
+  const presentIds = result.present_class_ids ?? null;
   return result.legend.classes.map((c) => {
     const prob = probs && probs[c.index] != null ? probs[c.index] : null;
-    const isPresent = !present || present.includes(c.index);
+    let isPresent: boolean;
+    if (presentIds != null) {
+      // Backend told us which class indices actually appear in the
+      // rendered raster — trust that and ignore the prob value (which
+      // may be null for segmentation heads with no scene-level probs).
+      isPresent = presentIds.includes(c.index);
+    } else if (prob != null) {
+      // Classification head with scene-level probs but no present-list.
+      isPresent = prob > 0;
+    } else {
+      // Neither hint available — show every class so the user sees the
+      // legend even when present-detection is absent.
+      isPresent = true;
+    }
     return {
       index: c.index,
       name: c.name,
       color: c.color,
-      prob: isPresent ? prob : null,
+      prob,
+      present: isPresent,
     };
   });
 }
