@@ -30,11 +30,11 @@ Earth-observation models on user-drawn bounding boxes. It pairs
 drivers) with **[Microsoft Planetary Computer](https://planetarycomputer.microsoft.com/)**
 imagery and a chat surface that drives every tool in the app via
 function calling — the local LLM is any
-[**Gemma**](https://ai.google.dev/gemma) family model
-([tech report](https://arxiv.org/abs/2503.19786) — sizes from
-~2B to ~27B, instruction-tuned variants, Google or Unsloth
-quantizations all work) served via Ollama or vLLM, plus **Claude**,
-**Gemini**, **GPT**, and **NVIDIA NIM** as cloud alternatives.
+[**Gemma 4**](https://deepmind.google/models/gemma/gemma-4/) family
+variant (instruction-tuned, sizes from ~2B to ~26B A4B, Google or
+Unsloth quantizations all work) served via Ollama or vLLM, plus
+**Claude**, **Gemini**, **GPT**, and **NVIDIA NIM** as cloud
+alternatives.
 
 It is built for one job: getting a researcher from "I have a question
 about this patch of Earth" to "I have a defensible classified raster +
@@ -234,7 +234,7 @@ five chat backends:
 
 | Backend | Provider | Tool calling |
 |---|---|---|
-| **Local Gemma** ([family / tech report](https://arxiv.org/abs/2503.19786)) | Ollama or vLLM, any size from 2B → 27B (24 GB GPU recommended for 27B) | ✅ via OpenAI-shape function-calling |
+| **Local Gemma 4** ([model page](https://deepmind.google/models/gemma/gemma-4/)) | Ollama or vLLM, any variant from E2B / E4B → 26B-A4B (24 GB GPU recommended for 26B) | ✅ via OpenAI-shape function-calling |
 | **NVIDIA NIM** | Cloud, NIM-hosted models | ✅ |
 | **Claude** | Anthropic API | ✅ |
 | **Gemini** | Google AI Studio | ✅ |
@@ -418,11 +418,10 @@ classes of bug — please honour them in PRs:
   and base encoders from Allen AI
 * **[Microsoft Planetary Computer](https://planetarycomputer.microsoft.com/)**
   — Sentinel-2 L2A and ESA WorldCover data
-* **[Google DeepMind Gemma family](https://ai.google.dev/gemma)** — local
-  LLM backbone, any instruction-tuned size from 2B to 27B works
-  (see the [Gemma 3 Technical Report](https://arxiv.org/abs/2503.19786)
-  for architecture + benchmarks; we don't pin a specific variant — the
-  model selector in the LLM Settings pane defers to whatever Ollama / vLLM
+* **[Google DeepMind Gemma 4](https://deepmind.google/models/gemma/gemma-4/)**
+  — local LLM backbone, any instruction-tuned variant from E2B / E4B
+  through 26B A4B works (we don't pin a specific SKU — the model
+  selector in the LLM Settings pane defers to whatever Ollama / vLLM
   is currently serving)
 * **[MapLibre GL JS](https://maplibre.org/)**, **[terra-draw](https://terradraw.io/)**,
   **[rasterio](https://rasterio.readthedocs.io/)**,
