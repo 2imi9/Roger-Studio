@@ -787,6 +787,75 @@ export async function startOlmoEarthInference(args: {
   });
 }
 
+/** Per-run progress snapshot polled by InferenceProgressMonitor. The
+ *  backend updates the underlying state from inside the chunked
+ *  orchestrator as each chunk completes, so a 1 s poll cadence catches
+ *  every transition without missing intermediate states. */
+export interface InferenceProgress {
+  job_id: string;
+  /** "running" | "ready" — once "ready" the monitor should stop polling. */
+  status: string;
+  /** "pending" | "pytorch" | "stub" — flips to "stub" if the job fell
+   *  back; "pytorch" on real-result success. Use this to decide whether
+   *  to flash a success vs danger tone on completion. */
+  kind: string;
+  /** "queued" | "resolving_scenes" | "processing_chunks" | "stitching" */
+  stage: string;
+  /** Human-readable one-line status, e.g. "Fetching Sentinel-2 bands · 2 / 4 chunks". */
+  message: string;
+  chunks_total: number;
+  chunks_done: number;
+  chunks_failed: number;
+  elapsed_ms: number;
+  /** Null until the first chunk completes (no rate to extrapolate yet). */
+  est_remaining_ms: number | null;
+  /** Set only when the job stubbed out — surfaces the same string the
+   *  ResultPanel's stub branch already shows. */
+  stub_reason: string | null;
+}
+
+/** Resolve the deterministic ``job_id`` for a spec WITHOUT triggering
+ *  inference. Lets the frontend monitor know the job_id immediately so
+ *  it can poll progress while the long-running ``/infer`` POST is still
+ *  in flight. Mirror of ``startOlmoEarthInference``'s body shape so the
+ *  hash on both sides matches exactly. */
+export async function previewInferenceJobId(args: {
+  bbox: BBox;
+  modelRepoId: string;
+  dateRange?: string;
+  slidingWindow?: boolean;
+  windowSize?: number;
+  eventDate?: string;
+}): Promise<string> {
+  const res = await request<{ job_id: string }>("/olmoearth/infer/preview-id", {
+    method: "POST",
+    body: JSON.stringify({
+      bbox: args.bbox,
+      model_repo_id: args.modelRepoId,
+      date_range: args.dateRange,
+      sliding_window: args.slidingWindow,
+      window_size: args.windowSize,
+      event_date: args.eventDate,
+    }),
+  });
+  return res.job_id;
+}
+
+/** Snapshot a running job's progress. Returns null on 404 (unknown
+ *  job_id — typical when the job hasn't registered yet, e.g. the very
+ *  first poll fires before the orchestrator's lock has admitted it).
+ *  Other errors (network, 5xx) propagate so the caller can decide
+ *  whether to abandon the poll. */
+export async function getInferenceProgress(jobId: string): Promise<InferenceProgress | null> {
+  try {
+    return await request<InferenceProgress>(`/olmoearth/jobs/${encodeURIComponent(jobId)}/progress`);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg.includes("API 404")) return null;
+    throw e;
+  }
+}
+
 
 /** Parameters for a custom OlmoEarth embedding export. Mirrors the
  * backend ``EmbeddingExportRequest`` schema in

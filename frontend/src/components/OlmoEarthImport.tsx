@@ -4,6 +4,7 @@ import {
   downloadFtClassificationGeoJson,
   exportOlmoEarthEmbedding,
   loadOlmoEarthRepo,
+  previewInferenceJobId,
   runOlmoEarthEmbeddingFewShot,
   runOlmoEarthEmbeddingPCARgb,
   runOlmoEarthEmbeddingSimilarity,
@@ -15,6 +16,7 @@ import type { BBox } from "../types";
 import type { ImageryLayer } from "./MapView";
 import { OffDistributionBanner } from "./OffDistributionBanner";
 import { ResultPanel } from "./ResultPanel";
+import { InferenceProgressMonitor } from "./InferenceProgressMonitor";
 
 /**
  * Shared OlmoEarth / OlmoEarth-FT import + run-to-layer form.
@@ -252,6 +254,14 @@ export function OlmoEarthImport({
   const [recentRanAt, setRecentRanAt] = useState<number>(0);
   const [recentTookMs, setRecentTookMs] = useState<number>(0);
 
+  // While an inference POST is in flight, the InferenceProgressMonitor
+  // takes the input form's slot. The monitor needs the deterministic
+  // backend job_id (resolved up-front via /infer/preview-id) so it can
+  // poll progress while the long-running /infer call is still hanging.
+  // Cleared after the POST resolves (success OR failure).
+  const [inFlightJobId, setInFlightJobId] = useState<string | null>(null);
+  const [inFlightStartedAt, setInFlightStartedAt] = useState<number>(0);
+
   // Few-shot semantic segmentation state. Three classes pre-seeded with
   // distinct accent colours so the user can start clicking immediately
   // without first picking a palette. ``pickingForClass`` tracks which
@@ -366,6 +376,26 @@ export function OlmoEarthImport({
     setBusy("infer");
     setStatus(null);
     const t0 = Date.now();
+    setInFlightStartedAt(t0);
+    // Resolve the backend job_id up-front so the InferenceProgressMonitor
+    // can start polling /jobs/{id}/progress immediately — otherwise the
+    // user stares at a "Starting…" placeholder for the full POST round-
+    // trip. This call is cheap (sha256 of the spec) so the extra round
+    // trip is invisible. If it fails for any reason, we fall back to
+    // running without progress (the form just stays disabled like
+    // before).
+    try {
+      const previewedId = await previewInferenceJobId({
+        bbox: selectedArea,
+        modelRepoId: repoId,
+        eventDate: isPrePostHead ? eventDate : undefined,
+        slidingWindow: selected.kind === "ft" ? slidingWindow : undefined,
+      });
+      setInFlightJobId(previewedId);
+    } catch {
+      // Best-effort — never block inference on the preview call failing.
+      setInFlightJobId(null);
+    }
     try {
       const res: OlmoEarthInferenceResult = await startOlmoEarthInference({
         bbox: selectedArea,
@@ -403,6 +433,11 @@ export function OlmoEarthImport({
     } catch (e) {
       setStatus(`failed: ${formatApiError(e)}`);
     } finally {
+      // Clear the in-flight job_id so the InferenceProgressMonitor
+      // unmounts. The monitor doesn't need to know whether the run
+      // succeeded — recentResult is what drives the next render
+      // (ResultPanel for success, form-with-error for failure).
+      setInFlightJobId(null);
       setBusy(null);
     }
   };
@@ -1341,23 +1376,58 @@ export function OlmoEarthImport({
     </div>
   );
 
-  // When the most-recent inference run from THIS instance still has a
-  // result on hand, render the ResultPanel in place of the input form
-  // (matches Claude Design v2 component1 behavior: input collapses,
-  // result takes its slot). The "← Back to input" affordance inside the
-  // panel sets recentResult back to null, restoring the form.
-  const body = recentResult ? (
-    <div className="h-full min-h-[480px]">
-      <ResultPanel
-        result={recentResult}
-        onBackToInput={() => setRecentResult(null)}
-        ranAt={recentRanAt}
-        tookMs={recentTookMs}
-      />
-    </div>
-  ) : (
-    formBody
-  );
+  // Three render states for the slot, in priority order:
+  //   1. In-flight inference  → InferenceProgressMonitor (live progress)
+  //   2. Recent completed run → ResultPanel (class summary, etc.)
+  //   3. Otherwise            → the input form
+  //
+  // The monitor takes precedence over the result panel so a user
+  // re-running the same head doesn't see a stale result while the new
+  // job is still chunking. The result panel takes precedence over the
+  // form so completed runs aren't drowned by the input form below.
+  let body: React.ReactNode;
+  if (inFlightJobId && busy === "infer") {
+    // AOI is guaranteed non-null here — handleRun bails early when it's
+    // null — but the type checker doesn't know that, so guard with km
+    // computation only when present.
+    const aoiKm = selectedArea
+      ? (() => {
+          const midLat = (selectedArea.south + selectedArea.north) / 2.0;
+          const ew = Math.round(
+            Math.abs(selectedArea.east - selectedArea.west)
+              * 111 * Math.cos((midLat * Math.PI) / 180),
+          );
+          const ns = Math.round(
+            Math.abs(selectedArea.north - selectedArea.south) * 111,
+          );
+          return { ew, ns };
+        })()
+      : undefined;
+    body = (
+      <div className="h-full min-h-[280px]">
+        <InferenceProgressMonitor
+          jobId={inFlightJobId}
+          modelLabel={selected.label}
+          modelRepoId={selected.repoId}
+          startedAt={inFlightStartedAt}
+          aoiKm={aoiKm}
+        />
+      </div>
+    );
+  } else if (recentResult) {
+    body = (
+      <div className="h-full min-h-[480px]">
+        <ResultPanel
+          result={recentResult}
+          onBackToInput={() => setRecentResult(null)}
+          ranAt={recentRanAt}
+          tookMs={recentTookMs}
+        />
+      </div>
+    );
+  } else {
+    body = formBody;
+  }
 
   if (compact) return body;
   return (

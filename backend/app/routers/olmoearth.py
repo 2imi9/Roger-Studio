@@ -371,6 +371,68 @@ async def olmoearth_infer(request: Request, payload: dict = Body(...)) -> dict:
         raise HTTPException(status_code=499, detail=str(e)) from e
 
 
+@router.post("/olmoearth/infer/preview-id")
+async def olmoearth_infer_preview_id(payload: dict = Body(...)) -> dict:
+    """Return the deterministic ``job_id`` that the same payload to
+    ``POST /olmoearth/infer`` would register.
+
+    Lets the frontend learn the job_id BEFORE firing the long-running
+    inference POST, so it can immediately start polling
+    ``GET /olmoearth/jobs/{job_id}/progress`` while ``/infer`` is in
+    flight. Cheap (sha256 of the spec) — no caching, no heavy work.
+
+    The hashing rule mirrors the one inside ``start_inference``:
+    bbox + model_repo_id + date_range + max_size_px + sliding_window
+    + window_size + event_date, json-dumped with sort_keys=True. Any
+    change to the spec shape on either side breaks the contract — keep
+    them in sync.
+    """
+    try:
+        bbox = BBox(**payload["bbox"])
+    except (KeyError, TypeError, ValueError) as e:
+        raise HTTPException(400, f"bbox is required: {e}") from e
+    model_repo_id = payload.get("model_repo_id")
+    if not model_repo_id:
+        raise HTTPException(400, "model_repo_id is required")
+    sliding_window = bool(payload.get("sliding_window", False))
+    window_size = int(payload.get("window_size", 32))
+    spec = {
+        "bbox": bbox.model_dump(),
+        "model_repo_id": model_repo_id,
+        "date_range": payload.get("date_range") or "2024-04-01/2024-10-01",
+        "max_size_px": int(payload.get("max_size_px", 256)),
+        "sliding_window": sliding_window,
+        "window_size": window_size if sliding_window else None,
+        "event_date": payload.get("event_date") or None,
+    }
+    return {"job_id": olmoearth_inference.preview_job_id(spec)}
+
+
+@router.get("/olmoearth/jobs/{job_id}/progress")
+async def olmoearth_job_progress(job_id: str) -> dict:
+    """Snapshot of a running inference job's progress.
+
+    Returns 404 when the job_id is unknown (never registered, or evicted
+    after a long idle period). Polled by the frontend's
+    InferenceProgressMonitor every 1 s while a run is in flight.
+
+    The shape is intentionally flat (no nested objects) so the React
+    component can read each field directly without descending into
+    sub-trees:
+      - status: "running" | "ready" | ...
+      - kind: "pending" | "pytorch" | "stub"
+      - stage: "queued" | "resolving_scenes" | "processing_chunks" | "stitching"
+      - message: human-readable one-line status
+      - chunks_total / chunks_done / chunks_failed
+      - elapsed_ms, est_remaining_ms (null until first chunk completes)
+      - stub_reason (null unless the run already stubbed out)
+    """
+    snapshot = olmoearth_inference.get_job_progress(job_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail=f"unknown job_id: {job_id}")
+    return snapshot
+
+
 @router.get("/olmoearth/demo-pairs", response_model=OlmoEarthDemoPairsResponse)
 async def olmoearth_demo_pairs() -> dict:
     """Return the curated compare-demo registry.

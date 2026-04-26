@@ -78,6 +78,80 @@ _jobs: dict[str, dict[str, Any]] = {}
 _jobs_lock = asyncio.Lock()
 
 
+def _set_progress(job_id: str | None, **fields: Any) -> None:
+    """Best-effort update of a running job's progress fields.
+
+    Called from within the chunked orchestrators as work proceeds so the
+    frontend's InferenceProgressMonitor (polling GET /jobs/{id}/progress)
+    can show stage + chunks_done/total + ETA in real time.
+
+    Tolerant of:
+      * job_id=None — silently no-op (some callers don't yet thread it)
+      * unknown job_id — silently no-op (job evicted or never registered)
+      * concurrent calls from multiple chunk coroutines — atomic dict
+        mutations are GIL-safe at the field level; we don't need the
+        async lock for monotonic counter bumps and the round-trip cost
+        of acquiring it on every chunk completion would dominate the
+        per-chunk overhead.
+    """
+    if job_id is None:
+        return
+    job = _jobs.get(job_id)
+    if job is None:
+        return
+    for k, v in fields.items():
+        job[k] = v
+
+
+def get_job_progress(job_id: str) -> dict[str, Any] | None:
+    """Snapshot of a job's progress for the GET /progress endpoint.
+
+    Returns None when the job_id isn't registered (404 territory). Returns
+    a flat dict with stage/chunks/timing fields suitable for direct JSON
+    serialization. Computed fields (elapsed_ms, est_remaining_ms) are
+    derived here so the frontend doesn't have to re-compute every poll.
+    """
+    job = _jobs.get(job_id)
+    if job is None:
+        return None
+    started = job.get("started_ts") or 0.0
+    elapsed_ms = int((time.time() - started) * 1000) if started else 0
+    done = int(job.get("progress_chunks_done") or 0)
+    total = int(job.get("progress_chunks_total") or 0)
+    failed = int(job.get("progress_chunks_failed") or 0)
+    # ETA: extrapolate per-chunk wall time × remaining, divided by
+    # observed chunk concurrency (4 from chunk_sem). Only meaningful
+    # once at least one chunk has completed; before that, return null.
+    est_remaining_ms: int | None = None
+    if done > 0 and total > done:
+        per_chunk_ms = elapsed_ms / done
+        remaining = total - done
+        # Match the orchestrator's eta heuristic: divide by chunk_sem
+        # capacity so 4× parallelism is reflected.
+        est_remaining_ms = int((remaining * per_chunk_ms) / 4)
+    return {
+        "job_id": job_id,
+        "status": job.get("status", "unknown"),
+        "kind": job.get("kind", "pending"),
+        "stage": job.get("progress_stage", "queued"),
+        "message": job.get("progress_message", ""),
+        "chunks_total": total,
+        "chunks_done": done,
+        "chunks_failed": failed,
+        "elapsed_ms": elapsed_ms,
+        "est_remaining_ms": est_remaining_ms,
+        "stub_reason": job.get("stub_reason"),
+    }
+
+
+def preview_job_id(spec: dict[str, Any]) -> str:
+    """Public wrapper around _make_job_id for the router's
+    /infer/preview-id endpoint. Lets the frontend learn the job_id
+    deterministically so it can poll progress while the real /infer
+    request is still in flight."""
+    return _make_job_id(spec)
+
+
 # Global concurrency cap on chunked inference jobs (AOI inference + embedding
 # export). This is the host-safety knob: chunk_sem(4) inside each orchestrator
 # caps fan-out *within* a single request, but two simultaneous PCA requests
@@ -390,6 +464,14 @@ async def start_inference(
             "kind": "pending",
             "colormap": _COLORMAPS.get(model_repo_id, "embedding"),
             "started_ts": time.time(),
+            # Progress state — live-updated by the chunked orchestrators
+            # below as work proceeds. Read by GET /jobs/{id}/progress so
+            # the frontend monitor can show "X / N chunks" + ETA.
+            "progress_stage": "queued",
+            "progress_chunks_total": 0,
+            "progress_chunks_done": 0,
+            "progress_chunks_failed": 0,
+            "progress_message": "Resolving scenes…",
         }
 
     try:
@@ -398,6 +480,7 @@ async def start_inference(
             sliding_window=sliding_window, window_size=window_size,
             event_date=event_date,
             disconnect_check=disconnect_check,
+            job_id=job_id,
         )
     except (SentinelFetchError, Exception) as e:
         logger.warning("real inference failed for %s: %s — falling back to stub", job_id, e)
@@ -485,6 +568,7 @@ async def _run_chunked_aoi_inference(
     sliding_window: bool = False,
     window_size: int = 64,
     disconnect_check=None,
+    job_id: str | None = None,
 ) -> dict[str, Any]:
     """Native-resolution chunked inference for FT heads with ``input_spec``.
 
@@ -538,6 +622,12 @@ async def _run_chunked_aoi_inference(
         "chunked inference for %s: %d chunks (%d m each), n_periods=%d",
         model.repo_id, len(chunks), chunk_size_m, n_periods,
     )
+    _set_progress(
+        job_id,
+        progress_chunks_total=len(chunks),
+        progress_stage="resolving_scenes",
+        progress_message=f"Searching Sentinel-2 scenes for {n_periods} period(s)…",
+    )
 
     period_scenes = await fetch_aoi_period_scenes(
         bbox=bbox,
@@ -555,6 +645,11 @@ async def _run_chunked_aoi_inference(
 
     pinned_crs, global_transform, global_h, global_w = await resolve_aoi_grid(
         bbox, period_scenes, target_gsd_m=target_gsd_m,
+    )
+    _set_progress(
+        job_id,
+        progress_stage="processing_chunks",
+        progress_message=f"Fetching Sentinel-2 bands · 0 / {len(chunks)} chunks",
     )
 
     # Native-pixel-res output rasters. int32 for class indices matches
@@ -611,9 +706,26 @@ async def _run_chunked_aoi_inference(
         if success:
             breaker_state["successes"] += 1
             breaker_state["consecutive_fails"] = 0
+        else:
+            breaker_state["failures"] += 1
+            breaker_state["consecutive_fails"] += 1
+        # Live-update the public progress fields the frontend monitor
+        # polls. Done count includes BOTH successes and failures so the
+        # progress bar always advances; failed count is a separate
+        # rendering hint so the UI can flag partial-coverage early.
+        _done = breaker_state["successes"] + breaker_state["failures"]
+        _total = len(chunks)
+        _set_progress(
+            job_id,
+            progress_chunks_done=_done,
+            progress_chunks_failed=breaker_state["failures"],
+            progress_message=(
+                f"Fetching Sentinel-2 bands · {_done} / {_total} chunks"
+                + (f" · {breaker_state['failures']} failed" if breaker_state["failures"] else "")
+            ),
+        )
+        if success:
             return
-        breaker_state["failures"] += 1
-        breaker_state["consecutive_fails"] += 1
         if breaker_state["tripped"]:
             return
         # Rule (a): consecutive trip.
@@ -921,6 +1033,12 @@ async def _run_chunked_aoi_inference(
             threshold=_BREAKER_THRESHOLD,
         )
 
+    _set_progress(
+        job_id,
+        progress_stage="stitching",
+        progress_message="Stitching tiles…",
+    )
+
     # Stitch: serialize the numpy paste step. Chunks are non-overlapping by
     # construction (plan_chunks) so concurrent paste would be safe in
     # principle, but doing it sequentially after gather keeps the diff
@@ -1032,6 +1150,7 @@ async def _run_chunked_pre_post_inference(
     sliding_window: bool = False,
     window_size: int = 64,
     disconnect_check=None,
+    job_id: str | None = None,
 ) -> dict[str, Any]:
     """Native-resolution chunked inference for pre/post change-detection FT heads.
 
@@ -1070,6 +1189,12 @@ async def _run_chunked_pre_post_inference(
         "chunked pre/post inference for %s: %d chunks, n_pre=%d, n_post=%d, event=%s",
         model.repo_id, len(chunks), n_pre, n_post, event_date,
     )
+    _set_progress(
+        job_id,
+        progress_chunks_total=len(chunks),
+        progress_stage="resolving_scenes",
+        progress_message=f"Searching pre/post scene pairs around {event_date}…",
+    )
 
     pre_scenes, post_scenes = await fetch_s2_pre_post_pair(
         bbox=bbox,
@@ -1098,6 +1223,11 @@ async def _run_chunked_pre_post_inference(
     pinned_crs, global_transform, global_h, global_w = await resolve_aoi_grid(
         bbox, list(pre_scenes) + list(post_scenes), target_gsd_m=target_gsd_m,
     )
+    _set_progress(
+        job_id,
+        progress_stage="processing_chunks",
+        progress_message=f"Fetching pre + post Sentinel-2 bands · 0 / {len(chunks)} chunks",
+    )
 
     global_class_raster = np.zeros((global_h, global_w), dtype=np.int32)
     global_scalar_raster = np.zeros((global_h, global_w), dtype=np.float32)
@@ -1120,9 +1250,23 @@ async def _run_chunked_pre_post_inference(
         if success:
             breaker_state["successes"] += 1
             breaker_state["consecutive_fails"] = 0
+        else:
+            breaker_state["failures"] += 1
+            breaker_state["consecutive_fails"] += 1
+        # Live-update the public progress fields the frontend monitor polls.
+        _done = breaker_state["successes"] + breaker_state["failures"]
+        _total = len(chunks)
+        _set_progress(
+            job_id,
+            progress_chunks_done=_done,
+            progress_chunks_failed=breaker_state["failures"],
+            progress_message=(
+                f"Fetching pre + post Sentinel-2 bands · {_done} / {_total} chunks"
+                + (f" · {breaker_state['failures']} failed" if breaker_state["failures"] else "")
+            ),
+        )
+        if success:
             return
-        breaker_state["failures"] += 1
-        breaker_state["consecutive_fails"] += 1
         if breaker_state["tripped"]:
             return
         if (
@@ -2629,6 +2773,7 @@ async def _run_real_inference(
     window_size: int = 32,
     event_date: str | None = None,
     disconnect_check=None,
+    job_id: str | None = None,
 ) -> dict[str, Any]:
     """Fetch S2 composite + run forward pass (encoder or full FT model).
 
@@ -2716,6 +2861,7 @@ async def _run_real_inference(
             sliding_window=sliding_window,
             window_size=effective_window_size,
             disconnect_check=disconnect_check,
+            job_id=job_id,
         )
 
     # Temporal-path FT heads route to the chunked native-resolution
@@ -2737,6 +2883,7 @@ async def _run_real_inference(
             sliding_window=sliding_window,
             window_size=effective_window_size,
             disconnect_check=disconnect_check,
+            job_id=job_id,
         )
 
     # Legacy single-scene path — base encoders + FT heads with input_spec
