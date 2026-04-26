@@ -893,10 +893,16 @@ export function OlmoEarthImport({
               const prePostMul = isPrePostHead ? 2 : 1;
               const coldS = Math.round(groups * 270 * prePostMul);
               const warmS = Math.round(groups * 20 * prePostMul);
-              const fmt = (s: number) =>
-                s < 60 ? `${s} s`
-                : s < 600 ? `${Math.round(s / 60)} min ${s % 60 ? `${s % 60} s` : ""}`.trim()
-                : `${Math.round(s / 60)} min`;
+              const fmt = (s: number) => {
+                if (s < 60) return `${s} s`;
+                // Floor the minutes so "270 s" → "4 min 30 s", not the
+                // earlier "5 min 30 s" Math.round bug (the minutes
+                // rounded up while the remainder seconds STILL rendered).
+                const m = Math.floor(s / 60);
+                const r = s % 60;
+                if (s >= 600) return `${m} min`;
+                return r ? `${m} min ${r} s` : `${m} min`;
+              };
               return (
                 <div className="mt-1 text-geo-muted font-mono">
                   ≈ {chunks} chunk{chunks === 1 ? "" : "s"} · cold {fmt(coldS)} / warm {fmt(warmS)}
