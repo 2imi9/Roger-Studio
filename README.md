@@ -28,9 +28,13 @@ Earth-observation models on user-drawn bounding boxes. It pairs
 **[OlmoEarth](https://huggingface.co/allenai)** fine-tuned heads
 (mangrove extent, land use, ecosystem type, fire fuel moisture, forest-loss
 drivers) with **[Microsoft Planetary Computer](https://planetarycomputer.microsoft.com/)**
-imagery and a **[Gemma](https://huggingface.co/google/gemma-3-27b-it) /
-Claude / Gemini / GPT / NIM** chat surface that can drive every tool
-in the app via function calling.
+imagery and a chat surface that drives every tool in the app via
+function calling — the local LLM is any
+[**Gemma**](https://ai.google.dev/gemma) family model
+([tech report](https://arxiv.org/abs/2503.19786) — sizes from
+~2B to ~27B, instruction-tuned variants, Google or Unsloth
+quantizations all work) served via Ollama or vLLM, plus **Claude**,
+**Gemini**, **GPT**, and **NVIDIA NIM** as cloud alternatives.
 
 It is built for one job: getting a researcher from "I have a question
 about this patch of Earth" to "I have a defensible classified raster +
@@ -230,7 +234,7 @@ five chat backends:
 
 | Backend | Provider | Tool calling |
 |---|---|---|
-| **Local Gemma** | Ollama or vLLM (24 GB GPU recommended) | ✅ via OpenAI-shape function-calling |
+| **Local Gemma** ([family / tech report](https://arxiv.org/abs/2503.19786)) | Ollama or vLLM, any size from 2B → 27B (24 GB GPU recommended for 27B) | ✅ via OpenAI-shape function-calling |
 | **NVIDIA NIM** | Cloud, NIM-hosted models | ✅ |
 | **Claude** | Anthropic API | ✅ |
 | **Gemini** | Google AI Studio | ✅ |
@@ -414,8 +418,12 @@ classes of bug — please honour them in PRs:
   and base encoders from Allen AI
 * **[Microsoft Planetary Computer](https://planetarycomputer.microsoft.com/)**
   — Sentinel-2 L2A and ESA WorldCover data
-* **[Google DeepMind Gemma](https://blog.google/technology/developers/gemma-open-models/)**
-  — local LLM backbone
+* **[Google DeepMind Gemma family](https://ai.google.dev/gemma)** — local
+  LLM backbone, any instruction-tuned size from 2B to 27B works
+  (see the [Gemma 3 Technical Report](https://arxiv.org/abs/2503.19786)
+  for architecture + benchmarks; we don't pin a specific variant — the
+  model selector in the LLM Settings pane defers to whatever Ollama / vLLM
+  is currently serving)
 * **[MapLibre GL JS](https://maplibre.org/)**, **[terra-draw](https://terradraw.io/)**,
   **[rasterio](https://rasterio.readthedocs.io/)**,
   **[FastAPI](https://fastapi.tiangolo.com/)** — the foundations this
