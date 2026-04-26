@@ -13,6 +13,7 @@ import {
 } from "../api/client";
 import type { BBox } from "../types";
 import type { ImageryLayer } from "./MapView";
+import { OffDistributionBanner } from "./OffDistributionBanner";
 
 /**
  * Shared OlmoEarth / OlmoEarth-FT import + run-to-layer form.
@@ -237,6 +238,9 @@ export function OlmoEarthImport({
   const [hfToken, setHfToken] = useState("");
   const [status, setStatus] = useState<string | null>(null);
   const [busy, setBusy] = useState<null | "infer" | "cache" | "embed" | "pca" | "sim" | "geojson" | "fewshot">(null);
+  // Ref to the model <select> so the off-distribution banner's
+  // "Pick a different head" button can scroll/focus it.
+  const modelSelectRef = useRef<HTMLSelectElement | null>(null);
 
   // Few-shot semantic segmentation state. Three classes pre-seeded with
   // distinct accent colours so the user can start clicking immediately
@@ -678,6 +682,7 @@ export function OlmoEarthImport({
           Model
         </span>
         <select
+          ref={modelSelectRef}
           value={repoId}
           onChange={(e) => setRepoId(e.target.value)}
           disabled={busy !== null}
@@ -717,19 +722,31 @@ export function OlmoEarthImport({
             <div>{selected.unsupportedReason}</div>
           </div>
         )}
-        {/* Coverage hint — FT heads have geographical training-distribution
-            bias even though the Sentinel-2 + encoder stack works globally.
-            Keyed off the repo id so the note reflects the SELECTED model,
-            not a generic disclaimer. */}
-        {selected.kind === "ft" && (
-          <div className="mt-1 text-[9px] text-geo-muted italic">
-            FT heads run globally on S2, but class labels / regression targets
-            reflect each head's training distribution (Mangrove → tropical
-            belt, AWF → southern Kenya, LFMC → fire-prone regions,
-            ForestLossDriver → pantropical). Interpret outputs accordingly.
-          </div>
-        )}
       </div>
+
+      {/* Off-distribution banner — replaces the prior italic gray
+          coverage hint. Renders only when:
+            (a) we're on the Inference tab (not Embedding tools),
+            (b) selected head is an FT head,
+            (c) AOI is set AND falls outside the head's training region.
+          When all three hit, the banner shows the headline, body copy
+          tailored per head, an inline world map, footer actions, and an
+          advisory that the user can still run the model. The banner is
+          internally responsible for its own conditional rendering — it
+          renders nothing for in-distribution AOIs. */}
+      {activeTab === "inference" && selected.kind === "ft" && (
+        <OffDistributionBanner
+          aoi={selectedArea}
+          modelRepoId={selected.repoId}
+          modelLabel={selected.label}
+          onPickAnotherHead={() => {
+            const el = modelSelectRef.current;
+            if (!el) return;
+            el.scrollIntoView({ behavior: "smooth", block: "center" });
+            el.focus();
+          }}
+        />
+      )}
 
       {/* Event date picker — only for pre/post change-detection heads
           (ForestLossDriver today). The backend treats this as the
