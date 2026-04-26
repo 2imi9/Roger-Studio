@@ -45,56 +45,14 @@ class EnvDataResult(BaseModel):
     error: str | None = None
 
 
-class ElevationStats(BaseModel):
-    """Summary statistics over the elevation grid.
-
-    Values are in meters above mean sea level (Open-Meteo SRTM source).
-    All four fields are always populated, even if every sample was null —
-    in that degenerate case they all read 0.0 (see ``terrain.py``).
-    """
-
-    min: float
-    max: float
-    mean: float
-    range: float
-
-
-class ElevationResult(BaseModel):
-    """Elevation grid + summary over a bbox.
-
-    Shape matches the frontend ``ElevationResult`` interface byte-for-byte
-    (``frontend/src/types/index.ts``). Added as a pydantic model so the
-    ``/api/reconstruct`` and ``/api/elevation`` routes can advertise a
-    ``response_model`` and catch drift at router-return time rather than
-    letting a crash propagate into React.
-
-    ``elevations`` cells are optional — Open-Meteo occasionally omits
-    samples for coastal / offshore bboxes. The frontend must render a
-    graceful fallback for null cells rather than assume a dense grid.
-    """
-
-    lats: list[float]
-    lons: list[float]
-    # Rows × cols of elevation samples, meters. ``None`` where Open-Meteo
-    # had no SRTM coverage (e.g. ocean interior, polar extremes).
-    elevations: list[list[float | None]]
-    stats: ElevationStats
-    resolution: int
-    bbox: BBox
-
-
-class ReconstructResponse(BaseModel):
-    """Envelope returned by ``POST /api/reconstruct`` (and now
-    ``GET /api/elevation``, aligned to the same shape).
-
-    ``status`` is currently always ``"completed"`` — reserved so we can
-    add ``"partial"`` / ``"cached"`` without breaking the contract. The
-    frontend's ``client.ts::getElevation`` unwraps to return
-    ``response.terrain`` so consumers see the raw ``ElevationResult``.
-    """
-
-    status: str
-    terrain: ElevationResult
+# Elevation grid / 3D terrain reconstruction schemas removed
+# 2026-04-26: dead-code cleanup post-Cesium drop. The
+# ``ElevationStats`` / ``ElevationResult`` / ``ReconstructResponse``
+# trio existed solely to envelope the now-deleted /reconstruct +
+# /elevation endpoints (see commit 7277539 dropping the 3D Globe
+# viewer). polygon_stats.py keeps its own elevation block via
+# Open-Meteo for the per-polygon stats workflow, which is the only
+# elevation surface that's still wired into the UI.
 
 
 # --- Data format support ---

@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.routers import analyze, artifacts, auto_label, claude_chat, cloud_chat, env_data, explain_raster, gemini_chat, olmoearth, openai_chat, polygon_stats, projects, reconstruct, stac_imagery, upload
+from app.routers import analyze, artifacts, auto_label, claude_chat, cloud_chat, env_data, explain_raster, gemini_chat, olmoearth, openai_chat, polygon_stats, projects, stac_imagery, upload
 from app.services.database import init_db
 
 
@@ -42,7 +42,6 @@ app.add_middleware(
 
 app.include_router(analyze.router, prefix="/api", tags=["analyze"])
 app.include_router(env_data.router, prefix="/api", tags=["env-data"])
-app.include_router(reconstruct.router, prefix="/api", tags=["reconstruct"])
 app.include_router(upload.router, prefix="/api", tags=["upload"])
 app.include_router(auto_label.router, prefix="/api", tags=["auto-label"])
 app.include_router(polygon_stats.router, prefix="/api", tags=["polygon-stats"])

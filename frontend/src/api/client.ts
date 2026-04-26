@@ -3,7 +3,6 @@ import type {
   AnalysisResult,
   BBox,
   EnvDataResult,
-  ElevationResult,
   DatasetInfo,
 } from "../types";
 
@@ -111,26 +110,12 @@ export async function getEnvData(
   return request(`/env-data?${params}`);
 }
 
-export async function getElevation(
-  bbox: BBox,
-  resolution: number = 20
-): Promise<ElevationResult> {
-  // ``POST /api/reconstruct`` now accepts a single body with bbox + the
-  // (optional) resolution field; before this change the route silently
-  // ignored any resolution the caller passed because it took a naked
-  // ``BBox`` as the body. Aligned in the architecture audit pass.
-  // Backend response is ``ReconstructResponse`` (pydantic-validated) —
-  // we unwrap ``terrain`` so callers see the raw grid shape they
-  // declare in the return type.
-  const resp = await request<{ status: string; terrain: ElevationResult }>(
-    `/reconstruct`,
-    {
-      method: "POST",
-      body: JSON.stringify({ ...bbox, resolution }),
-    },
-  );
-  return resp.terrain;
-}
+// getElevation() / ElevationResult removed 2026-04-26: dead code post-
+// Cesium 3D Globe drop (commit 7277539). The /api/reconstruct +
+// /api/elevation endpoints they wrapped have been deleted from the
+// backend. Per-polygon elevation is still surfaced via
+// ``/api/polygon-stats`` (Open-Meteo SRTM) — the only elevation
+// surface still wired into the UI (PolygonStats.tsx).
 
 export async function uploadFile(file: File): Promise<DatasetInfo> {
   const form = new FormData();

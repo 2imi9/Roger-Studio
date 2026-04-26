@@ -88,22 +88,10 @@ export interface EnvDataResult {
   error?: string;
 }
 
-export interface ElevationResult {
-  lats: number[];
-  lons: number[];
-  /**
-   * Row-major grid of elevation samples in meters. Cells may be
-   * ``null`` where Open-Meteo SRTM had no coverage (ocean interior,
-   * extreme polar latitudes) — consumers MUST guard against null
-   * before doing arithmetic, or the cell will coerce to 0 silently.
-   * The type was previously ``number[][]`` and would crash at runtime
-   * the first time a null cell landed (see architecture audit).
-   */
-  elevations: (number | null)[][];
-  stats: { min: number; max: number; mean: number; range: number };
-  resolution: number;
-  bbox: BBox;
-}
+// ElevationResult interface removed 2026-04-26 alongside the Cesium drop.
+// The /api/reconstruct + /api/elevation endpoints it described have been
+// deleted (commit 7277539 retired the 3D Globe; this commit cleans up
+// the orphaned schema). Per-polygon elevation lives in PolygonStats now.
 
 // "3d" was dropped — the Cesium-based globe was a heavy WebGL dependency
 // that pegged the GPU even when idle and wasn't carrying scientific value
