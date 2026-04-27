@@ -78,6 +78,19 @@ logger = logging.getLogger(__name__)
 _jobs: dict[str, dict[str, Any]] = {}
 _jobs_lock = asyncio.Lock()
 
+# GPU forward-pass serialization. The chunk_sem(4) inside each chunked
+# orchestrator caps fetch parallelism to 4-wide, but without an explicit
+# GPU lock those 4 chunks all dispatch their encoder forwards
+# concurrently — the second-onward calls allocate fresh activation tensors
+# in VRAM before the first finishes, and we observed CUDA OOM on the 5090
+# on Niger-Delta-sized chunks (~500×500 patch grid × 12 periods feeds an
+# attention matrix that grows quadratically with token count). Serializing
+# here lets fetches stay 4-wide (network-bound) while the GPU only ever
+# runs one forward at a time. Module-level so demo-pair prebake jobs +
+# embedding-tools forwards + chunked AOI inferences all share the same
+# single-forward GPU lane.
+_gpu_sem = asyncio.Semaphore(1)
+
 
 def _set_progress(job_id: str | None, **fields: Any) -> None:
     """Best-effort update of a running job's progress fields.
@@ -829,9 +842,14 @@ async def _run_chunked_aoi_inference(
 
         chunk_image = stack_to_bhwtc(stack_result.stack[:ch4, :cw4, :, :])
         try:
-            # Forward releases GIL during CUDA dispatch; multiple chunks
-            # may queue here concurrently but PyTorch serializes on the
-            # GPU stream — concurrency above is fetch-bound, not compute.
+            # Serialize the actual GPU forward via the module-level
+            # ``_gpu_sem`` so 4-wide chunk concurrency doesn't blow up
+            # VRAM (the 5090 OOM'd on Niger-Delta-sized chunks before
+            # this lock was added — cublas_status_alloc_failed at the
+            # second concurrent forward). Fetch + decode stay parallel
+            # outside the sem; only the encoder + head dispatch
+            # serializes. After each forward we ``torch.cuda.empty_cache``
+            # so the next chunk's allocation starts clean.
             #
             # When sliding_window is on, each chunk runs the head over a
             # grid of ``window_size``-pixel windows instead of one
@@ -843,25 +861,35 @@ async def _run_chunked_aoi_inference(
             # (FTInferenceResult with patch-resolution scalar +
             # class_raster) so the stitch + upsample paths below need
             # no changes.
-            if sliding_window:
-                chunk_result = await asyncio.to_thread(
-                    olmoearth_model.run_ft_tiled_inference,
-                    model,
-                    chunk_image,
-                    stack_result.timestamps,
-                    window_size,
-                    effective_patch,
-                    device,
-                )
-            else:
-                chunk_result = await asyncio.to_thread(
-                    olmoearth_model.run_ft_inference,
-                    model,
-                    chunk_image,
-                    stack_result.timestamps,
-                    effective_patch,
-                    device,
-                )
+            async with _gpu_sem:
+                if sliding_window:
+                    chunk_result = await asyncio.to_thread(
+                        olmoearth_model.run_ft_tiled_inference,
+                        model,
+                        chunk_image,
+                        stack_result.timestamps,
+                        window_size,
+                        effective_patch,
+                        device,
+                    )
+                else:
+                    chunk_result = await asyncio.to_thread(
+                        olmoearth_model.run_ft_inference,
+                        model,
+                        chunk_image,
+                        stack_result.timestamps,
+                        effective_patch,
+                        device,
+                    )
+                # Best-effort clear of cached allocator pool. CUDA-only;
+                # silently no-op on CPU. Cheap when it matters, free
+                # otherwise.
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
         except Exception as e:
             logger.warning("chunk %d/%d inference failed: %s", ch_idx + 1, len(chunks), e)
             return _CHUNK_FAIL
@@ -1379,29 +1407,42 @@ async def _run_chunked_pre_post_inference(
             # 5km chunk" into "one class per ~64 px window" — matches
             # the head's training-time predict_window_px and gives
             # users meaningful spatial detail across the AOI.
-            if sliding_window:
-                chunk_result = await asyncio.to_thread(
-                    olmoearth_model.run_ft_pre_post_tiled_inference,
-                    model,
-                    pre_image,
-                    post_image,
-                    pre_stack.timestamps,
-                    post_stack.timestamps,
-                    window_size,
-                    effective_patch,
-                    device,
-                )
-            else:
-                chunk_result = await asyncio.to_thread(
-                    olmoearth_model.run_ft_pre_post_inference,
-                    model,
-                    pre_image,
-                    post_image,
-                    pre_stack.timestamps,
-                    post_stack.timestamps,
-                    effective_patch,
-                    device,
-                )
+            #
+            # Same GPU-serialization wrapper as the single-stack path
+            # (see _gpu_sem rationale at module top). Pre/post is
+            # actually MORE memory-hungry than single-stack because it
+            # holds both pre and post token tensors before concat, so
+            # this lock matters even more here.
+            async with _gpu_sem:
+                if sliding_window:
+                    chunk_result = await asyncio.to_thread(
+                        olmoearth_model.run_ft_pre_post_tiled_inference,
+                        model,
+                        pre_image,
+                        post_image,
+                        pre_stack.timestamps,
+                        post_stack.timestamps,
+                        window_size,
+                        effective_patch,
+                        device,
+                    )
+                else:
+                    chunk_result = await asyncio.to_thread(
+                        olmoearth_model.run_ft_pre_post_inference,
+                        model,
+                        pre_image,
+                        post_image,
+                        pre_stack.timestamps,
+                        post_stack.timestamps,
+                        effective_patch,
+                        device,
+                    )
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
         except Exception as e:
             logger.warning("pre/post chunk %d/%d inference failed: %s", ch_idx + 1, len(chunks), e)
             return _CHUNK_FAIL

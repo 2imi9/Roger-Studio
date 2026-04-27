@@ -202,12 +202,25 @@ def _assert_s2_reflectance(image_bhwtc: np.ndarray) -> None:
         )
     vmin = float(image_bhwtc.min())
     vmax = float(image_bhwtc.max())
-    if vmin < -10.0 or vmax > 20000.0:
+    # Upper bound widened from 20000 → 40000 (2026-04-27): ESA's Processing
+    # Baseline 04.00+ rolled out for new Sentinel-2 scenes started landing
+    # values up to ~32000 in our chunks (specular highlights on water +
+    # the BOA_ADD_OFFSET shift), causing every fresh fetch to fail the old
+    # ceiling. The encoder's internal normalization (divide by ~10000 then
+    # standardize) handles brief overshoots past the nominal range cleanly
+    # — the original 20000 ceiling was meant to catch "wrong asset"
+    # (B*1000 metadata bands have totally different value spaces) and
+    # "already-normalized floats" (vmax < 1.5 case below), not legitimate
+    # bright pixels in modern scenes. 40000 still catches the wrong-asset
+    # mode (B*1000 metadata reaches mid-60000s) while letting current PC
+    # scenes through.
+    if vmin < -1100.0 or vmax > 40000.0:
         raise ValueError(
             f"Sentinel-2 input outside expected DN range "
             f"[min={vmin:.2f}, max={vmax:.2f}] — expected roughly "
-            f"[0, 10000]. Either the upstream fetch returned the wrong "
-            f"asset, or values got rescaled somewhere in the pipeline."
+            f"[-1000, 40000] (post-Baseline-04.00). Either the upstream "
+            f"fetch returned the wrong asset, or values got rescaled "
+            f"somewhere in the pipeline."
         )
     # Empty composite — distinct failure mode from "already normalized":
     # the fetch returned a raster that's entirely zero (or effectively so).
