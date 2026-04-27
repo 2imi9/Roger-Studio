@@ -790,6 +790,14 @@ export function OlmoEarthImport({
           renders nothing for in-distribution AOIs. */}
       {activeTab === "inference" && selected.kind === "ft" && (
         <OffDistributionBanner
+          // Keying on the repo id forces React to unmount + remount the
+          // banner whenever the user switches model, which resets the
+          // internal ``[open, setOpen]`` to its default-open value. Audit
+          // caught the surprise behavior: hiding the world map on
+          // Ecosystem then switching to Mangrove kept it hidden, even
+          // though Mangrove's training region is a totally different
+          // shape the user probably wants to see.
+          key={selected.repoId}
           aoi={selectedArea}
           modelRepoId={selected.repoId}
           modelLabel={selected.label}

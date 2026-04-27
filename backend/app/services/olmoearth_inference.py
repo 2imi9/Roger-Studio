@@ -48,6 +48,7 @@ from app.services.system_health import (
     AOISizeExceededError,
     CircuitBreakerTrippedError,
     ClientDisconnectedError,
+    InsufficientMemoryError,
     check_aoi_size_or_raise,
     check_memory_or_raise,
     chunk_ram_ok,
@@ -115,7 +116,20 @@ def get_job_progress(job_id: str) -> dict[str, Any] | None:
     if job is None:
         return None
     started = job.get("started_ts") or 0.0
-    elapsed_ms = int((time.time() - started) * 1000) if started else 0
+    # Cap elapsed_ms at the completion moment when the job is no longer
+    # running. Without this, a stale poll on a finished job keeps reading
+    # ``time.time() - started`` and the elapsed grows forever — the audit
+    # caught a job showing elapsed_ms=20948573 (~5.8 hours) when it had
+    # actually completed in ~5 minutes. Frontend never sees this in
+    # practice (the monitor stops polling on status=ready) but anyone
+    # querying the endpoint directly was seeing fake-growing elapsed.
+    completed = job.get("completed_ts") or 0.0
+    if completed and started:
+        elapsed_ms = int((completed - started) * 1000)
+    elif started:
+        elapsed_ms = int((time.time() - started) * 1000)
+    else:
+        elapsed_ms = 0
     done = int(job.get("progress_chunks_done") or 0)
     total = int(job.get("progress_chunks_total") or 0)
     failed = int(job.get("progress_chunks_failed") or 0)
@@ -482,6 +496,25 @@ async def start_inference(
             disconnect_check=disconnect_check,
             job_id=job_id,
         )
+    except (
+        AOISizeExceededError,
+        InsufficientMemoryError,
+        CircuitBreakerTrippedError,
+        ClientDisconnectedError,
+    ):
+        # Typed safety / capacity errors must propagate to the router so
+        # the user gets the right HTTP status (413 / 503 / 499) with a
+        # clear message — not a silent stub. Previously the broad
+        # ``except (SentinelFetchError, Exception)`` below swallowed
+        # these into a generic ``stub_reason: "AOISizeExceededError: ..."``
+        # which the user never saw because the response was 200, and
+        # the audit caught the bug: a 30°×30° AOI returned 200 + stub
+        # instead of 413 with a "shrink your bbox" hint. Drop the job
+        # registration before re-raising so retries on the same spec
+        # don't see a phantom "running" entry.
+        async with _jobs_lock:
+            _jobs.pop(job_id, None)
+        raise
     except (SentinelFetchError, Exception) as e:
         logger.warning("real inference failed for %s: %s — falling back to stub", job_id, e)
         async with _jobs_lock:
@@ -490,6 +523,7 @@ async def start_inference(
                 status="ready",
                 stub_reason=f"{type(e).__name__}: {e}"[:500],
                 legend=_COLORMAP_LEGEND.get(_jobs[job_id]["colormap"]),
+                completed_ts=time.time(),
             )
             stub_resp = _build_response(_jobs[job_id])
         # Auto-retry once with the first suggested retry params. Saves the
@@ -550,6 +584,7 @@ async def start_inference(
             kind="pytorch",
             status="ready",
             legend=_COLORMAP_LEGEND.get(_jobs[job_id]["colormap"]),
+            completed_ts=time.time(),
             **real,
         )
         return _build_response(_jobs[job_id])
