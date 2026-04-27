@@ -712,7 +712,7 @@ async def _run_chunked_aoi_inference(
     # a compute-bound one. Net effect for a 12-chunk job: fetches overlap
     # 4-wide so total fetch wall time ≈ ceil(12/4) × per-chunk-fetch ≈
     # 3 × 15 s instead of 12 × 15 s.
-    chunk_sem = asyncio.Semaphore(4)
+    chunk_sem = asyncio.Semaphore(2)
     # Hard timeout per chunk, measured FROM THE MOMENT the chunk actually
     # acquires a sem slot — NOT from when asyncio.gather() kicked it off.
     # The previous version wrapped ``asyncio.wait_for(_process_chunk)``
@@ -723,7 +723,7 @@ async def _run_chunked_aoi_inference(
     # trying to do network work. The fix is ``wait_for`` INSIDE the
     # semaphore in ``_process_chunk_bounded`` below. Bumping to 300 s too
     # — cached + small AOI is ~5 s, cold + large AOI can hit 120+.
-    _CHUNK_TIMEOUT_S = 300.0
+    _CHUNK_TIMEOUT_S = 900.0
     # Sentinel value carried in result tuples for failed chunks. Stitching
     # below filters them out so a single-chunk failure doesn't poison the
     # whole AOI raster.
@@ -1295,8 +1295,8 @@ async def _run_chunked_pre_post_inference(
     global_class_raster = np.zeros((global_h, global_w), dtype=np.int32)
     global_scalar_raster = np.zeros((global_h, global_w), dtype=np.float32)
 
-    chunk_sem = asyncio.Semaphore(4)
-    _CHUNK_TIMEOUT_S = 300.0
+    chunk_sem = asyncio.Semaphore(2)
+    _CHUNK_TIMEOUT_S = 900.0
     _CHUNK_FAIL = object()
 
     _BREAKER_THRESHOLD = circuit_breaker_threshold()
@@ -1806,9 +1806,9 @@ async def _run_chunked_embedding_export(
     # fetch + encoder forward. 300 s gives a real cold-start budget
     # while still bailing fast enough that the breaker can trip on
     # genuinely dead networks.
-    _CHUNK_TIMEOUT_S = 300.0
+    _CHUNK_TIMEOUT_S = 900.0
     _CHUNK_FAIL = object()
-    chunk_sem = asyncio.Semaphore(4)
+    chunk_sem = asyncio.Semaphore(2)
 
     # Circuit breaker — mirrors _run_chunked_aoi_inference. Two trip rules:
     # (a) consecutive fails (bursty drops) and (b) fractional fail rate
