@@ -366,7 +366,11 @@ async def fetch_s2_composite(
     Raises:
         SentinelFetchError: if no scene was found or all bands failed to read.
     """
-    scene = await _search_least_cloudy(bbox, datetime_range, max_cloud_cover)
+    # Route through the same fallback wrapper as the AOI-period path so
+    # OE_S2_PROVIDER=element84 takes effect on the legacy single-scene
+    # path too. Default (no override) preserves the prior behavior:
+    # PC primary, E84 fallback on PC failure.
+    scene = await _search_with_fallback(bbox, datetime_range, max_cloud_cover)
     collection = scene["collection"]
     token = await _get_sas_token(collection)
 
@@ -585,7 +589,9 @@ async def fetch_s2_temporal_stack(
     # band reads (with a bounded semaphore) is the next lever.
     async def _safe_search(dt_range: str) -> dict[str, Any] | None:
         try:
-            return await _search_least_cloudy(bbox, dt_range, max_cloud_cover)
+            # Same _search_with_fallback wrapper used by the AOI-period
+            # path so OE_S2_PROVIDER=element84 takes effect here too.
+            return await _search_with_fallback(bbox, dt_range, max_cloud_cover)
         except SentinelFetchError as e:
             logger.info("temporal_stack: period %s empty (%s)", dt_range, e)
             return None
@@ -1368,6 +1374,39 @@ async def _search_element84_least_cloudy(
     }
 
 
+def _provider_override() -> str | None:
+    """Operator-side switch to force a specific Sentinel-2 provider.
+
+    Set ``OE_S2_PROVIDER=element84`` to bypass PC entirely — search +
+    asset URLs both come from Element84's AWS-hosted catalog. Useful
+    when:
+      * PC is degraded for your network (we observed band-read crawl
+        from a North-American residential IP on 2026-04-27 even though
+        STAC reachability was fine — E84's S3 path was healthy).
+      * You're on AWS infrastructure where S3 traffic is intra-region
+        free and faster.
+
+    ``OE_S2_PROVIDER=pc`` (or unset, the default) keeps the previous
+    behavior: PC primary, E84 fallback only when PC's STAC fails.
+
+    Anything else logs a warning and falls back to default. Read fresh
+    on every call so the operator can toggle without restarting (env
+    var changes still need a uvicorn reload, but the flag itself is
+    cheap to consult).
+    """
+    raw = os.environ.get("OE_S2_PROVIDER", "").strip().lower()
+    if raw in ("element84", "e84", "aws"):
+        return "element84"
+    if raw in ("", "pc", "planetary_computer", "default"):
+        return None
+    logger.warning(
+        "OE_S2_PROVIDER=%r not recognized; valid values are 'pc' or 'element84'. "
+        "Falling back to default (PC primary, E84 fallback).",
+        raw,
+    )
+    return None
+
+
 async def _search_with_fallback(
     bbox: BBox, datetime_range: str, max_cloud_cover: float
 ) -> dict[str, Any]:
@@ -1380,7 +1419,21 @@ async def _search_with_fallback(
     URLs which are slightly faster from arbitrary IPs. Element84 is the
     safety net for the "PC is having a bad day" case observed in dev
     where ~50 % of /search calls return TLS resets.
+
+    When ``OE_S2_PROVIDER=element84`` is set, PC is skipped entirely.
+    Useful when PC's signed Azure blob band reads crawl on the user's
+    network (observed 2026-04-27) — E84 serves the same scenes from
+    public S3 URLs on a different network path.
     """
+    if _provider_override() == "element84":
+        # Skip PC. E84 indexes the same ESA catalog so the scene
+        # selection is equivalent (modulo race conditions on freshly-
+        # ingested scenes), but the asset URLs come from a public S3
+        # bucket — different network infrastructure, different
+        # reliability profile.
+        return await _search_element84_least_cloudy(
+            bbox, datetime_range, max_cloud_cover,
+        )
     try:
         return await _search_least_cloudy(bbox, datetime_range, max_cloud_cover)
     except SentinelFetchError:

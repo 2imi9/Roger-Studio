@@ -290,19 +290,99 @@ async def olmoearth_unload(payload: dict = Body(...)) -> dict:
 
 
 @router.get("/olmoearth/system-health")
-async def olmoearth_system_health() -> dict:
-    """Snapshot of host memory + whether a chunked job would be allowed
-    right now. Cheap (one syscall); frontend can poll before clicking
-    Run to show the user "free 1.2 GB before continuing" warnings
-    instead of hitting a 503 after the request."""
+async def olmoearth_system_health(probe: bool = Query(False)) -> dict:
+    """Snapshot of host memory + Sentinel-2 provider reachability.
+
+    Cheap path (default, ``probe=false``): one psutil syscall + a few
+    in-memory dict lookups. Frontend polls this every few seconds for
+    the heat-up status pill — must not block the loop.
+
+    Probing path (``probe=true``): also pings PC's STAC + SAS endpoints
+    + Element84's STAC root, returning timings + reachability flags.
+    Use this BEFORE clicking Run to know whether the upstream is
+    healthy. Adds ~200–800 ms; not safe to call on every render.
+    """
+    import os
+    import time as _time
+    import httpx
+    from app.services import sentinel2_fetch as _s2
+
     status = measure_memory()
-    return {
+    base = {
         "total_gb": round(status.total_gb, 2),
         "available_gb": round(status.available_gb, 2),
         "used_gb": round(status.used_gb, 2),
         "percent_used": round(status.percent, 1),
         "threshold_gb": round(status.threshold_gb, 2),
         "ok": status.ok(),
+        # Operator visibility into the S2 provider switch wired in
+        # FIX #2. ``"pc"`` (default) means try PC then fall back to
+        # E84; ``"element84"`` skips PC entirely. The user toggles
+        # via OE_S2_PROVIDER env var; restart required.
+        "s2_provider": os.environ.get("OE_S2_PROVIDER", "").strip().lower() or "pc",
+        # Cached job count from the persistent disk cache wired in
+        # FIX #1 — surfaces "how many real Pytorch results survived
+        # the last restart".
+        "cached_jobs_in_memory": len(olmoearth_inference._jobs),
+        # Loaded model count from the LRU cache in olmoearth_model.
+        # 0 means "model isn't in VRAM yet" (first inference will pay
+        # the cold-load cost); >0 means warmed up and ready.
+        "loaded_models": olmoearth_model.loaded_model_repo_ids(),
+    }
+
+    if not probe:
+        return base
+
+    # Probe path: fire 3 parallel HTTP HEAD/GET requests with tight
+    # timeouts. ``httpx.AsyncClient`` reuses connections across the
+    # 3 calls, so the trio costs ~max(individual timing) on a healthy
+    # network rather than the sum.
+    async def _ping(url: str, method: str = "GET", timeout: float = 5.0) -> dict:
+        t0 = _time.time()
+        try:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as c:
+                r = await c.request(method, url)
+            return {"reachable": r.status_code < 500, "status": r.status_code, "ms": int((_time.time() - t0) * 1000)}
+        except Exception as e:
+            return {"reachable": False, "error": f"{type(e).__name__}: {e}"[:120], "ms": int((_time.time() - t0) * 1000)}
+
+    pc_stac, pc_sas, e84_stac = await asyncio.gather(
+        _ping(_s2.PC_STAC_API + "/"),
+        _ping(_s2.PC_SAS_API + "/token/sentinel-2-l2a"),
+        _ping(_s2.E84_STAC_API + "/"),
+    )
+
+    # Heuristic: derive a "looks healthy from this network" verdict.
+    # PC's STAC is the load-bearing layer; if it's down or slow we
+    # tell the user up-front rather than letting them sit through a
+    # 5-minute timeout.
+    pc_ok = pc_stac.get("reachable") and pc_stac.get("ms", 99999) < 2000
+    e84_ok = e84_stac.get("reachable") and e84_stac.get("ms", 99999) < 2000
+    if pc_ok:
+        verdict = "pc_healthy"
+        recommendation = None
+    elif e84_ok:
+        verdict = "pc_degraded_e84_healthy"
+        recommendation = (
+            "PC reachability is slow or failing; set OE_S2_PROVIDER=element84 + "
+            "restart backend to bypass PC for this session."
+        )
+    else:
+        verdict = "both_unreachable"
+        recommendation = (
+            "BOTH PC and Element84 are unreachable from this network. "
+            "Check your local internet connection / DNS / firewall."
+        )
+
+    return {
+        **base,
+        "providers": {
+            "pc_stac": pc_stac,
+            "pc_sas": pc_sas,
+            "e84_stac": e84_stac,
+        },
+        "verdict": verdict,
+        "recommendation": recommendation,
     }
 
 

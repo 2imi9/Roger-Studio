@@ -103,6 +103,13 @@ _cache: collections.OrderedDict[str, tuple[_LoadedModel, torch.device]] = (
     collections.OrderedDict()
 )
 _cache_lock = threading.Lock()
+# Last-used timestamp per repo_id, keyed alongside ``_cache``. Updated on
+# every cache hit + insert. Used by ``evict_idle_models`` (FIX #4) to drop
+# models from VRAM after N minutes of no use — laptops with the model
+# loaded keep ramping the GPU fan even when nothing's running. Without
+# idle eviction, the only way to release VRAM is restart the backend.
+import time as _time_mod  # noqa: E402
+_cache_last_used: dict[str, float] = {}
 
 
 def _max_cache_entries() -> int:
@@ -130,6 +137,22 @@ def _max_cache_entries() -> int:
     return max(1, value)
 
 
+def loaded_model_repo_ids() -> list[str]:
+    """Public read-only snapshot of which repo ids are currently in the
+    encoder LRU cache. Used by the system-health endpoint to surface
+    "which models are warm in VRAM" for the heat-up status pill.
+
+    Returns the cache keys in MRU-first order (most recently used at
+    index 0). Empty list means no model is loaded — first inference
+    will pay the ~5–15 s cold-load cost.
+    """
+    with _cache_lock:
+        # collections.OrderedDict iterates in insertion order; we use
+        # move_to_end on hit so the MRU is at the end. Reverse to get
+        # MRU-first.
+        return list(reversed(_cache.keys()))
+
+
 def _evict_oldest_locked() -> None:
     """Pop the oldest cache entry. Caller must hold ``_cache_lock``.
 
@@ -142,6 +165,7 @@ def _evict_oldest_locked() -> None:
     if not _cache:
         return
     repo_id, (model, device) = _cache.popitem(last=False)
+    _cache_last_used.pop(repo_id, None)
     logger.info("evicting LRU model %s (device=%s)", repo_id, device)
     # Move to CPU first to release VRAM more aggressively. If the model
     # doesn't have .to() (shouldn't happen, but defensive), skip.
@@ -156,6 +180,56 @@ def _evict_oldest_locked() -> None:
             torch.cuda.empty_cache()
         except Exception as e:  # pragma: no cover — defensive only
             logger.warning("eviction: torch.cuda.empty_cache() failed: %s", e)
+
+
+def evict_idle_models(idle_timeout_s: float) -> int:
+    """Drop any cached models that haven't been used in the last
+    ``idle_timeout_s`` seconds.
+
+    Returns the number of models evicted. Wired to a periodic background
+    task in ``main.py`` lifespan so a long-running backend with no recent
+    inferences doesn't keep the model resident in VRAM (the 5090 fan
+    keeps spinning at idle when 20+ GB of weights are sitting on it).
+
+    Operator opt-out: set ``OE_MODEL_IDLE_TIMEOUT_S=0`` to disable, or
+    a larger value (in seconds) to keep models around longer. Default
+    is 1800 s (30 min).
+    """
+    if idle_timeout_s <= 0:
+        return 0
+    now = _time_mod.time()
+    cutoff = now - idle_timeout_s
+    evicted = 0
+    with _cache_lock:
+        # Snapshot keys first so we can safely mutate _cache below.
+        stale_repo_ids = [
+            repo_id
+            for repo_id, ts in list(_cache_last_used.items())
+            if ts < cutoff
+        ]
+        for repo_id in stale_repo_ids:
+            entry = _cache.pop(repo_id, None)
+            _cache_last_used.pop(repo_id, None)
+            if entry is None:
+                continue
+            model, device = entry
+            logger.info(
+                "evict_idle: dropping %s (idle %.0fs > %.0fs)",
+                repo_id, now - _cache_last_used.get(repo_id, now), idle_timeout_s,
+            )
+            try:
+                if hasattr(model, "to"):
+                    model.to("cpu")
+            except Exception as e:
+                logger.warning("evict_idle: model.to('cpu') failed for %s: %s", repo_id, e)
+            del model
+            evicted += 1
+        if evicted and torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception as e:
+                logger.warning("evict_idle: torch.cuda.empty_cache() failed: %s", e)
+    return evicted
 
 _normalizer = Normalizer(Strategy.COMPUTED)
 
@@ -301,8 +375,10 @@ def load_encoder(
         hit = _cache.get(repo_id)
         if hit is not None:
             # Mark as most-recently-used. Keeps the just-touched entry
-            # safe from eviction on the next insert.
+            # safe from eviction on the next insert AND resets the
+            # idle-eviction clock.
             _cache.move_to_end(repo_id)
+            _cache_last_used[repo_id] = _time_mod.time()
             return hit
 
         logger.info("loading OlmoEarth model %s to %s", repo_id, target_device)
@@ -324,6 +400,7 @@ def load_encoder(
         while len(_cache) >= max_entries:
             _evict_oldest_locked()
         _cache[repo_id] = (model, target_device)
+        _cache_last_used[repo_id] = _time_mod.time()
         return model, target_device
 
 

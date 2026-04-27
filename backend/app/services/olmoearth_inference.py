@@ -35,7 +35,9 @@ import json
 import logging
 import math
 import os
+import pickle
 import time
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -77,6 +79,86 @@ logger = logging.getLogger(__name__)
 # real work happens up-front (real path) or per tile (stub fallback).
 _jobs: dict[str, dict[str, Any]] = {}
 _jobs_lock = asyncio.Lock()
+
+# Persistent disk cache for completed Pytorch results. Without this, a
+# backend restart wipes every real raster the user has produced — we
+# observed this exact failure live (the 4 min 12 s real Mangrove + FL
+# Keys run was lost when we restarted backend for an unrelated typed-
+# error fix, and every retry afterwards failed because PC connectivity
+# went down). Pickling completed jobs to disk means a restart can
+# rehydrate the registry and the user keeps everything.
+_JOB_CACHE_DIR = Path("data/job_cache")
+_JOB_CACHE_VERSION = "v1"  # bump when the pickled shape changes
+
+
+def _persist_job_to_disk(job_id: str) -> None:
+    """Pickle a completed job's full state to disk.
+
+    Called from start_inference's success branch (kind=pytorch +
+    status=ready) so backend restarts retain real results. Stub fallbacks
+    are NOT persisted — they're cheap to regenerate and persisting them
+    would mask transient PC failures the user wants to see expire.
+
+    Atomic write via tmp + rename so a crash mid-write doesn't leave a
+    half-written pickle that fails to load on next boot.
+    """
+    job = _jobs.get(job_id)
+    if job is None:
+        return
+    if job.get("kind") != "pytorch" or job.get("status") != "ready":
+        return
+    try:
+        _JOB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        path = _JOB_CACHE_DIR / f"{_JOB_CACHE_VERSION}_{job_id}.pkl"
+        tmp = path.parent / f"{path.name}.tmp"
+        # ``protocol=4`` keeps the pickle compatible across Python 3.11+
+        # without forcing the latest. numpy arrays + rasterio CRS + Affine
+        # all serialize cleanly via this path.
+        with open(tmp, "wb") as f:
+            pickle.dump(job, f, protocol=4)
+        tmp.replace(path)
+    except Exception as e:
+        # Persistence is best-effort — never let a disk error fail the
+        # inference response. The job is still in-memory and usable; we
+        # just don't have a restart-survivable copy.
+        logger.warning("job_cache: failed to persist %s: %s", job_id, e)
+
+
+def _load_jobs_from_disk_into_memory() -> int:
+    """Scan the disk cache and rehydrate ``_jobs``.
+
+    Called once at backend startup (registered via FastAPI lifespan).
+    Returns the number of jobs successfully loaded. Failures (corrupt
+    pickles, version mismatches) are logged and skipped, never raised —
+    the goal is "best-effort restore," not "fail backend startup if
+    cache is dirty."
+    """
+    if not _JOB_CACHE_DIR.exists():
+        return 0
+    n_loaded = 0
+    n_skipped = 0
+    for path in _JOB_CACHE_DIR.glob(f"{_JOB_CACHE_VERSION}_*.pkl"):
+        try:
+            with open(path, "rb") as f:
+                # Pickle load is safe here ONLY because we wrote these
+                # files ourselves. Never load pickles from external
+                # sources — pickle is a code-execution surface.
+                job = pickle.load(f)
+            if not isinstance(job, dict) or "job_id" not in job:
+                logger.warning("job_cache: %s lacks job_id key — skipping", path.name)
+                n_skipped += 1
+                continue
+            _jobs[job["job_id"]] = job
+            n_loaded += 1
+        except Exception as e:
+            logger.warning("job_cache: failed to load %s: %s", path.name, e)
+            n_skipped += 1
+    if n_loaded or n_skipped:
+        logger.info(
+            "job_cache: loaded %d cached jobs from disk (%d skipped)",
+            n_loaded, n_skipped,
+        )
+    return n_loaded
 
 # GPU forward-pass serialization. The chunk_sem(4) inside each chunked
 # orchestrator caps fetch parallelism to 4-wide, but without an explicit
@@ -600,7 +682,13 @@ async def start_inference(
             completed_ts=time.time(),
             **real,
         )
-        return _build_response(_jobs[job_id])
+        resp = _build_response(_jobs[job_id])
+    # Persist outside the lock — disk I/O is slow and the lock guards
+    # in-memory state, not durability. Async-safe because pickle dump is
+    # atomic-rename and any reader either sees the previous file or the
+    # complete new one.
+    _persist_job_to_disk(job_id)
+    return resp
 
 
 @_with_global_job_lock
@@ -2281,7 +2369,9 @@ async def run_embedding_tool_pca_rgb(
                 "scene_datetimes": scene_datetimes,
             },
         )
-        return _build_response(_jobs[job_id])
+        resp = _build_response(_jobs[job_id])
+    _persist_job_to_disk(job_id)
+    return resp
 
 
 async def run_embedding_tool_similarity(
@@ -2480,7 +2570,9 @@ async def run_embedding_tool_similarity(
                 "scene_datetimes": scene_datetimes,
             },
         )
-        return _build_response(_jobs[job_id])
+        resp = _build_response(_jobs[job_id])
+    _persist_job_to_disk(job_id)
+    return resp
 
 
 async def run_embedding_tool_few_shot(
@@ -2755,7 +2847,9 @@ async def run_embedding_tool_few_shot(
                 ],
             },
         )
-        return _build_response(_jobs[job_id])
+        resp = _build_response(_jobs[job_id])
+    _persist_job_to_disk(job_id)
+    return resp
 
 
 def build_embedding_cog_bytes(result: dict[str, Any]) -> tuple[bytes, str]:
