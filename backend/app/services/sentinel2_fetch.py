@@ -1339,7 +1339,10 @@ async def _search_element84_least_cloudy(
         "datetime": rfc,
         "collections": ["sentinel-2-l2a"],
         "query": {"eo:cloud_cover": {"lt": float(max_cloud_cover)}},
-        "sortby": [{"field": "eo:cloud_cover", "direction": "asc"}],
+        # E84's STAC backend (Elasticsearch) needs the full property path
+        # for sortby; the bare key works on PC but 400s here with
+        # "No mapping found for [eo:cloud_cover] in order to sort on".
+        "sortby": [{"field": "properties.eo:cloud_cover", "direction": "asc"}],
         "limit": 5,
     }
     r = await _http_retrying_request("POST", f"{E84_STAC_API}/search", json=body)
