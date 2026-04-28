@@ -5,6 +5,8 @@ interface IconProps {
   className?: string;
 }
 
+// OlmoEarth — Earth observation foundation model. Glyph: a globe with
+// three latitude curves to read as "satellite imagery of the planet".
 export function OlmoEarthTab({ state = 'default', className = '' }: IconProps) {
   const strokeColor = state === 'active' ? '#3a6690' : state === 'disabled' ? '#9b9588' : '#2a2620';
   const opacity = state === 'disabled' ? 0.4 : 1;
@@ -21,10 +23,10 @@ export function OlmoEarthTab({ state = 'default', className = '' }: IconProps) {
       className={className}
       style={{ opacity }}
     >
-      <rect x="4" y="4" width="16" height="16" rx="2" fill={fill} fillOpacity={fillOpacity} stroke={strokeColor} strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" />
-      <line x1="12" y1="7" x2="12" y2="17" stroke={strokeColor} strokeWidth="2.5" strokeLinecap="round" />
-      <line x1="7" y1="12" x2="17" y2="12" stroke={strokeColor} strokeWidth="2.5" strokeLinecap="round" />
-      <circle cx="12" cy="12" r="2" fill={strokeColor} />
+      <circle cx="12" cy="12" r="8" fill={fill} fillOpacity={fillOpacity} stroke={strokeColor} strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M 6,8 Q 12,10 18,8" stroke={strokeColor} strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" fill="none" />
+      <path d="M 6,12 Q 12,14 18,12" stroke={strokeColor} strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" fill="none" />
+      <path d="M 6,16 Q 12,18 18,16" stroke={strokeColor} strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" fill="none" />
     </svg>
   );
 }

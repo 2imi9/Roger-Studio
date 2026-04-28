@@ -362,7 +362,7 @@ export function App() {
   }, []);
 
   const handleAutoLabelResult = useCallback(
-    (geojson: GeoJSON.FeatureCollection, _meta: Record<string, unknown>) => {
+    (geojson: GeoJSON.FeatureCollection, meta: Record<string, unknown>) => {
       // Add auto-labeled features as an overlay on the map
       setDatasets((prev) => {
         // Local timezone date+time for a readable, collision-free filename.
@@ -391,8 +391,26 @@ export function App() {
         };
         return [...prev, overlay];
       });
+
+      // TIPSv2's polygon path collapses each patch to argmax + drops the
+      // soft probabilities. The backend now ALSO writes a confidence-
+      // modulated RGB raster of the same prediction (color = class color
+      // × confidence + white × (1 - confidence)) and registers it as a
+      // regular dataset. Drop it on the map alongside the polygons so
+      // researchers can see the underlying uncertainty (faded = ambiguous)
+      // without having to re-run anything.
+      const rasterFilename = (meta as { raster_filename?: string | null })
+        ?.raster_filename;
+      if (rasterFilename && typeof rasterFilename === "string") {
+        const method = (meta as { method?: string })?.method ?? "tipsv2";
+        handleAddImageryLayer({
+          id: `auto-label-raster:${rasterFilename}`,
+          label: `${method} · ${rasterFilename}`,
+          tileUrl: `/api/datasets/${encodeURIComponent(rasterFilename)}/tiles/{z}/{x}/{y}.png`,
+        });
+      }
     },
-    []
+    [handleAddImageryLayer]
   );
 
   const handleSelectDataset = useCallback((ds: DatasetInfo) => {

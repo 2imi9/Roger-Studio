@@ -1,7 +1,10 @@
+import datetime as _dt
+import os as _os
+
 from fastapi import APIRouter, Body, HTTPException, Query
 
 from app.models.schemas import AutoLabelResponse
-from app.services.data_ingest import UPLOAD_DIR
+from app.services.data_ingest import UPLOAD_DIR, inspect_file
 from app.services import database as db
 from app.services import geo_agent, gemma_client, geo_tools
 
@@ -89,12 +92,40 @@ async def auto_label_dataset(
             elif method == "tipsv2" or (method == "auto" and TIPSV2_AVAILABLE):
                 if not TIPSV2_AVAILABLE:
                     raise HTTPException(422, "TIPSv2 not available. Install: pip install transformers torch")
+                # Stage the raster output alongside the source so the
+                # existing ``/api/datasets/{filename}/tiles/...`` pipeline
+                # serves it. Filename includes the source stem + timestamp
+                # so multiple runs on the same input don't collide.
+                stem = _os.path.splitext(filename)[0]
+                stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+                raster_filename = f"tipsv2-label-{stem}-{stamp}.tif"
+                raster_path = UPLOAD_DIR / raster_filename
                 result = auto_label_geotiff_tipsv2(
                     str(filepath),
                     classes=classes,
                     model_name=model,
                     sliding_window=sliding_window,
+                    raster_out_path=str(raster_path),
                 )
+                # Register the raster as a regular dataset so the frontend
+                # can drop it on the map via the same imagery-layer path
+                # OlmoEarth + STAC composites use. ``inspect_file`` reads
+                # back the bbox / size / band count we need to display.
+                if raster_path.exists():
+                    try:
+                        info = inspect_file(str(raster_path), raster_filename)
+                        db.save_dataset(info, str(raster_path))
+                    except Exception as exc:  # noqa: BLE001
+                        import logging
+                        logging.getLogger(__name__).warning(
+                            "tipsv2: failed to register raster %s: %s",
+                            raster_filename, exc,
+                        )
+                        # Drop the filename from the response so the
+                        # frontend doesn't try to render a dataset that
+                        # never made it into the registry.
+                        if isinstance(result, dict):
+                            result.setdefault("properties", {})["raster_filename"] = None
             else:
                 result = auto_label_raster(str(filepath), n_classes=n_classes, min_segment_pixels=min_segment_pixels)
 

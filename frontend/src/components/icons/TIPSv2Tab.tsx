@@ -5,8 +5,10 @@ interface IconProps {
   className?: string;
 }
 
-// TIPSv2 — image+text dual encoder. Glyph: a tile (raster) bracketed by
-// quote marks (text) to suggest "label-by-prompt".
+// TIPSv2 — image+text dual encoder for zero-shot segmentation.
+// Glyph: a camera viewfinder on the left half capturing the image,
+// "En" text on the right half representing the language prompt.
+// Reads as "capture imagery, segment by text".
 export function TIPSv2Tab({ state = 'default', className = '' }: IconProps) {
   const strokeColor = state === 'active' ? '#3a6690' : state === 'disabled' ? '#9b9588' : '#2a2620';
   const opacity = state === 'disabled' ? 0.4 : 1;
@@ -23,21 +25,25 @@ export function TIPSv2Tab({ state = 'default', className = '' }: IconProps) {
       className={className}
       style={{ opacity }}
     >
-      {/* Raster tile in the middle */}
-      <rect x="7" y="7" width="10" height="10" rx="1.5" fill={fill} fillOpacity={fillOpacity} stroke={strokeColor} strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" />
-      {/* Patch grid hints */}
-      <line x1="10.3" y1="7" x2="10.3" y2="17" stroke={strokeColor} strokeWidth="0.9" strokeLinecap="round" opacity="0.55" />
-      <line x1="13.7" y1="7" x2="13.7" y2="17" stroke={strokeColor} strokeWidth="0.9" strokeLinecap="round" opacity="0.55" />
-      <line x1="7" y1="10.3" x2="17" y2="10.3" stroke={strokeColor} strokeWidth="0.9" strokeLinecap="round" opacity="0.55" />
-      <line x1="7" y1="13.7" x2="17" y2="13.7" stroke={strokeColor} strokeWidth="0.9" strokeLinecap="round" opacity="0.55" />
-      {/* Left text-bracket (quote-style) */}
-      <path d="M4 9 L4 15" stroke={strokeColor} strokeWidth="2" strokeLinecap="round" />
-      <path d="M4 9 L5.5 9" stroke={strokeColor} strokeWidth="2" strokeLinecap="round" />
-      <path d="M4 15 L5.5 15" stroke={strokeColor} strokeWidth="2" strokeLinecap="round" />
-      {/* Right text-bracket */}
-      <path d="M20 9 L20 15" stroke={strokeColor} strokeWidth="2" strokeLinecap="round" />
-      <path d="M20 9 L18.5 9" stroke={strokeColor} strokeWidth="2" strokeLinecap="round" />
-      <path d="M20 15 L18.5 15" stroke={strokeColor} strokeWidth="2" strokeLinecap="round" />
+      {/* Outer frame */}
+      <rect x="3" y="6" width="18" height="12" rx="2" fill={fill} fillOpacity={fillOpacity} stroke={strokeColor} strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" />
+      {/* Vertical divider between camera half and text half */}
+      <line x1="12" y1="7" x2="12" y2="17" stroke={strokeColor} strokeWidth="1" strokeDasharray="1.5 1.5" opacity="0.7" />
+      {/* Left half: camera viewfinder lens */}
+      <circle cx="7.5" cy="12" r="2.6" stroke={strokeColor} strokeWidth="1.5" fill="none" />
+      <circle cx="7.5" cy="12" r="0.9" fill={strokeColor} />
+      {/* Right half: "En" text glyph — capital E + lowercase n */}
+      <text
+        x="14"
+        y="15.2"
+        fontFamily="ui-sans-serif, system-ui, -apple-system, sans-serif"
+        fontSize="6.8"
+        fontWeight="700"
+        fill={strokeColor}
+        letterSpacing="-0.4"
+      >
+        En
+      </text>
     </svg>
   );
 }

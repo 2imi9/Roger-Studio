@@ -17,6 +17,7 @@ Models (Apache 2.0):
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 import numpy as np
@@ -272,12 +273,64 @@ def _sliding_window_classify(
     return label_full, conf_full
 
 
+def _write_label_raster(
+    src_path: str,
+    label_full: "np.ndarray",
+    conf_full: "np.ndarray",
+    classes: list[dict],
+    out_path: str,
+) -> None:
+    """Render the per-pixel TIPSv2 zero-shot result as a 3-band RGB GeoTIFF.
+
+    The polygon vectorization throws away soft probabilities (each patch
+    just becomes its argmax class). The raster preserves both the class
+    decision AND the confidence behind it: each pixel is rendered as the
+    user's class color, blended toward white by ``1 - confidence`` so
+    ambiguous regions visually fade. Researchers reading the map can see
+    where the model was sure vs uncertain at a glance — something the
+    polygons can't show.
+
+    Output is georeferenced with the same CRS / transform as the source
+    so the existing ``render_geotiff_tile`` path serves it directly via
+    ``/api/datasets/{filename}/tiles/{z}/{x}/{y}.png``.
+    """
+    import rasterio  # noqa: PLC0415
+
+    # Hex color palette → uint8 triples
+    palette = np.full((max(len(classes), 1), 3), 200, dtype=np.float32)
+    for i, c in enumerate(classes):
+        h = (c.get("color") or "#888888").lstrip("#")
+        try:
+            palette[i] = (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+        except (ValueError, IndexError):
+            palette[i] = (136, 136, 136)
+
+    # Look up each pixel's class color, then blend toward white by confidence
+    safe_labels = np.clip(label_full.astype(np.int64), 0, len(classes) - 1)
+    color_per_pixel = palette[safe_labels]  # (H, W, 3)
+    conf3 = np.clip(conf_full, 0.0, 1.0)[..., None].astype(np.float32)  # (H, W, 1)
+    rgb_pixels = color_per_pixel * conf3 + 255.0 * (1.0 - conf3)
+    rgb_pixels = np.clip(rgb_pixels, 0, 255).astype(np.uint8)
+    rgb_chw = rgb_pixels.transpose(2, 0, 1)  # (3, H, W)
+
+    with rasterio.open(src_path) as src:
+        profile = src.profile.copy()
+    profile.update(count=3, dtype="uint8", nodata=None, photometric="rgb")
+    # Drop any compression/predictor that conflicts with uint8 RGB.
+    for k in ("predictor",):
+        profile.pop(k, None)
+
+    with rasterio.open(out_path, "w", **profile) as dst:
+        dst.write(rgb_chw)
+
+
 def auto_label_geotiff_tipsv2(
     filepath: str,
     classes: list[dict] | None = None,
     model_name: str = "google/tipsv2-b14",
     tile_size: int = 448,
     sliding_window: bool = True,
+    raster_out_path: str | None = None,
 ) -> dict:
     """
     Auto-label a GeoTIFF using TIPSv2 zero-shot classification.
@@ -286,6 +339,12 @@ def auto_label_geotiff_tipsv2(
         sliding_window: When True (default), uses overlapping tile inference for
                         accurate pixel-level boundaries. When False, single-shot
                         32x32 grid (fast but blocky).
+        raster_out_path: When provided, also writes a 3-band RGB GeoTIFF where
+                        pixel color = class color × confidence + white × (1 -
+                        confidence). The router registers it as a dataset so
+                        the frontend can drop it on the map alongside the
+                        polygons. Polygons throw away soft probabilities;
+                        the raster preserves the uncertainty.
 
     Returns labeled GeoJSON polygons with confidence scores.
     """
@@ -419,6 +478,19 @@ def auto_label_geotiff_tipsv2(
     for s in class_summary.values():
         s["percentage"] = round(s["area_m2"] / max(total_area, 1) * 100, 1)
 
+    # Write the per-pixel raster (confidence-modulated class colors) to
+    # the path the caller chose. Failure here is non-fatal: polygons are
+    # still returned. Researchers asked for a raster overlay because the
+    # polygon argmax loses soft probabilities, so the raster preserves
+    # uncertainty as fading-toward-white at low-confidence pixels.
+    raster_filename: str | None = None
+    if raster_out_path:
+        try:
+            _write_label_raster(filepath, label_full, conf_full, classes, raster_out_path)
+            raster_filename = os.path.basename(raster_out_path)
+        except Exception as e:
+            logger.warning("tipsv2: raster write failed (%s) — polygons only", e)
+
     return {
         "type": "FeatureCollection",
         "features": features_list,
@@ -433,5 +505,6 @@ def auto_label_geotiff_tipsv2(
             "global_confidence": result["global_confidence"],
             "method": "tipsv2_zeroshot",
             "model_version": model_name,
+            "raster_filename": raster_filename,
         },
     }
