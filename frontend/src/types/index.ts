@@ -97,7 +97,7 @@ export interface EnvDataResult {
 // that pegged the GPU even when idle and wasn't carrying scientific value
 // the Map tab couldn't already provide. Removed cleanly: type, tab pill,
 // App-level render branch, icon, package.json dep.
-export type ViewMode = "map" | "analysis" | "olmoearth" | "gemma";
+export type ViewMode = "map" | "analysis" | "olmoearth" | "tipsv2" | "gemma";
 export type BasemapStyle = "osm" | "satellite" | "dark";
 
 // --- Dataset upload types ---

@@ -15,6 +15,7 @@ export { LayerToggleOn } from './LayerToggleOn';
 export { MapTab } from './MapTab';
 export { Measure } from './Measure';
 export { OlmoEarthTab } from './OlmoEarthTab';
+export { TIPSv2Tab } from './TIPSv2Tab';
 export { Pan } from './Pan';
 export { Refresh } from './Refresh';
 export { ResetView } from './ResetView';

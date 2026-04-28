@@ -37,6 +37,44 @@ const PRESETS: Record<string, LabelClass[]> = {
     { name: "Green Space", prompt: "park garden or green open space", color: "#22c55e" },
     { name: "Road/Infrastructure", prompt: "road highway or transportation infrastructure", color: "#a3a3a3" },
   ],
+  // Showcases TIPSv2's strength on diverse intra-city semantics that
+  // pure spectral methods can't separate — flat roof vs pitched roof
+  // vs concrete plaza all share spectral signatures but differ visually.
+  "City Detail": [
+    { name: "Residential Roof", prompt: "pitched residential rooftop with shingles", color: "#f59e0b" },
+    { name: "Flat Industrial Roof", prompt: "flat industrial or warehouse rooftop", color: "#6b7280" },
+    { name: "Parking Lot", prompt: "asphalt parking lot with parked cars", color: "#525252" },
+    { name: "Road Surface", prompt: "paved road or highway surface", color: "#a3a3a3" },
+    { name: "Plaza / Sidewalk", prompt: "concrete plaza pedestrian walkway or sidewalk", color: "#d4d4d8" },
+    { name: "Construction Site", prompt: "active construction site with bare earth and equipment", color: "#a16207" },
+    { name: "Urban Tree", prompt: "isolated urban tree or street tree", color: "#16a34a" },
+    { name: "Yard / Lawn", prompt: "residential yard or lawn grass", color: "#84cc16" },
+  ],
+  // Trees are a notoriously hard zero-shot category — coniferous vs
+  // deciduous vs palm vs mangrove vs urban-tree all look "green" to
+  // pixel-level methods. TIPSv2's text tower lets researchers test
+  // how far semantic separation actually goes.
+  "Tree Types": [
+    { name: "Deciduous Forest", prompt: "deciduous broadleaf forest with mixed canopy", color: "#16a34a" },
+    { name: "Coniferous Forest", prompt: "coniferous evergreen forest with pine or spruce trees", color: "#166534" },
+    { name: "Palm / Tropical", prompt: "palm trees or tropical vegetation", color: "#65a30d" },
+    { name: "Mangrove", prompt: "mangrove forest along coastal water", color: "#15803d" },
+    { name: "Urban Tree Canopy", prompt: "tree canopy along city streets and yards", color: "#22c55e" },
+    { name: "Sparse / Shrub", prompt: "sparse shrubland or scattered low vegetation", color: "#a3e635" },
+    { name: "Dead / Stressed", prompt: "dead or drought-stressed brown vegetation", color: "#b45309" },
+  ],
+  // The user's "diverse labeling on coastal city + trees" example —
+  // exactly the FL Keys area (mangrove + water + highway + residential)
+  // that's been driving the demo. Mixed scope on purpose.
+  "City + Trees Mix": [
+    { name: "Mangrove", prompt: "mangrove forest along coastal water", color: "#15803d" },
+    { name: "Urban Tree Canopy", prompt: "tree canopy in residential neighborhood", color: "#22c55e" },
+    { name: "Residential", prompt: "residential housing with rooftops and yards", color: "#f59e0b" },
+    { name: "Highway / Road", prompt: "highway or major road surface", color: "#a3a3a3" },
+    { name: "Open Water", prompt: "open coastal water or ocean", color: "#1e90ff" },
+    { name: "Beach / Sand", prompt: "sandy beach or bare coastal sand", color: "#fef3c7" },
+    { name: "Wetland / Marsh", prompt: "wetland marsh or shallow vegetated water", color: "#5f9ea0" },
+  ],
 };
 
 const PALETTE = ["#ef4444", "#f59e0b", "#22c55e", "#3b82f6", "#a855f7", "#ec4899", "#6b7280", "#78716c", "#1e90ff", "#228b22", "#f0e68c", "#d2b48c"];

@@ -557,6 +557,12 @@ export function App() {
               labelMode={labelMode}
               onLabelDrawn={handleLabelDrawn}
               flyToTrigger={flyToTrigger}
+              // TIPSv2 polygons need real imagery underneath to be readable
+              // (an OSM cartographic basemap shows roads + labels but no
+              // landcover signal). Snap to satellite when the user lands on
+              // the TIPSv2 tab; they can still flip back via the basemap
+              // picker if they want.
+              preferredBasemap={viewMode === "tipsv2" ? "satellite" : undefined}
               // Capture camera state into a ref (not useState) so React
               // doesn't re-render every component downstream on every
               // map pan. Read at compare-mode entry to seed SplitMap.

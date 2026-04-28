@@ -333,7 +333,7 @@ export function GemmaChat({
   };
 
   return (
-    <div className="flex flex-col h-full min-h-0">
+    <div ref={scrollRef} className="flex flex-col h-full min-h-0 overflow-y-auto pr-1">
       {/* Header */}
       <div className="flex items-center justify-between mb-3 flex-shrink-0">
         <div>
@@ -779,10 +779,7 @@ export function GemmaChat({
           is null, renders inline in the sidebar like a normal chat. */}
       {(() => { const chatBody = (<>
       {/* Messages */}
-      <div
-        ref={scrollRef}
-        className="flex-1 min-h-0 overflow-y-auto space-y-3 pr-1"
-      >
+      <div className="space-y-3">
         {messages.length === 0 && (
           <div className="text-[12px] text-geo-muted">
             <div className="mb-2">

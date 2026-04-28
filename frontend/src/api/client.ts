@@ -152,6 +152,40 @@ export async function autoLabel(
   });
 }
 
+export type TIPSv2Model = "google/tipsv2-b14" | "google/tipsv2-l14" | "google/tipsv2-g14";
+
+export interface TIPSv2Class {
+  name: string;
+  prompt: string;
+  color: string;
+}
+
+/** Run TIPSv2 zero-shot label on an uploaded GeoTIFF. The dedicated TIPSv2
+ *  tab calls this so it can pass the extra ``model`` / ``sliding_window``
+ *  params the lightweight ``autoLabel`` helper doesn't expose, and — most
+ *  importantly — the user's custom ``classes`` (name + prompt + color).
+ *  Without ``classes``, the backend falls back to its built-in
+ *  ``DEFAULT_CLASSES`` 8-class land-cover preset. */
+export async function tipsv2Label(
+  filename: string,
+  opts: {
+    model?: TIPSv2Model;
+    slidingWindow?: boolean;
+    classes?: TIPSv2Class[];
+  } = {}
+): Promise<GeoJSON.FeatureCollection & { properties?: Record<string, unknown> }> {
+  const params = new URLSearchParams({
+    method: "tipsv2",
+    model: opts.model ?? "google/tipsv2-l14",
+    sliding_window: String(opts.slidingWindow ?? true),
+  });
+  return request(`/auto-label/${encodeURIComponent(filename)}?${params}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ classes: opts.classes ?? null }),
+  });
+}
+
 export async function validateLabels(
   filename: string,
   geojson: GeoJSON.FeatureCollection,

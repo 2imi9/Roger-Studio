@@ -120,6 +120,12 @@ interface MapViewProps {
    * the same row as the basemap picker instead of stacking awkwardly
    * against MapLibre's native zoom/compass column. */
   leadingBasemapControl?: React.ReactNode;
+  /** One-shot basemap preference. When this prop changes to a defined
+   * BasemapStyle, MapView snaps to that basemap (the user can still
+   * override afterwards via the basemap picker). Used by the TIPSv2
+   * tab to default the view to satellite imagery so polygon overlays
+   * sit on top of real imagery instead of an OSM cartographic basemap. */
+  preferredBasemap?: BasemapStyle;
   // Labeling MVP — when labelMode.active is true, terra-draw stays in the
   // requested mode (point/polygon/line) and each finished draw is forwarded
   // to onLabelDrawn instead of onGeometrySelect. The selection-singleton
@@ -161,6 +167,7 @@ export function MapView({
   onLabelDrawn,
   flyToTrigger,
   leadingBasemapControl,
+  preferredBasemap,
   onCameraChange,
 }: MapViewProps) {
   // Keep the latest ``onCameraChange`` callback in a ref so the moveend
@@ -173,7 +180,18 @@ export function MapView({
   const mapRef = useRef<maplibregl.Map | null>(null);
   const terraDrawRef = useRef<TerraDraw | null>(null);
   const [drawMode, setDrawMode] = useState<DrawMode>("none");
-  const [basemap, setBasemap] = useState<BasemapStyle>("osm");
+  const [basemap, setBasemap] = useState<BasemapStyle>(preferredBasemap ?? "osm");
+  // Tabs that need a specific basemap (e.g. the TIPSv2 tab wants satellite
+  // so polygon overlays sit on top of real imagery rather than the OSM
+  // cartographic basemap) push it through ``preferredBasemap``. We snap
+  // to that value whenever the prop changes; the user can still flip the
+  // basemap manually afterwards.
+  useEffect(() => {
+    if (preferredBasemap && preferredBasemap !== basemap) {
+      setBasemap(preferredBasemap);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [preferredBasemap]);
   // Per-layer visibility toggles driven by the Added Layer panel. We hide
   // by id-set rather than mutating the upstream imageryLayers prop so App
   // retains authoritative state — toggling a layer off on the map shouldn't
@@ -222,6 +240,10 @@ export function MapView({
     });
 
     map.addControl(new maplibregl.NavigationControl(), "top-right");
+    map.addControl(
+      new maplibregl.ScaleControl({ maxWidth: 120, unit: "metric" }),
+      "bottom-left",
+    );
     mapRef.current = map;
 
     // Report camera state to parent on move-end. Coalesced to

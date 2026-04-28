@@ -317,6 +317,14 @@ export function SplitMap({ selectedArea, imageryLayers, initialCamera: seedCamer
       center: camera.center,
       zoom: camera.zoom,
     });
+    left.addControl(
+      new maplibregl.ScaleControl({ maxWidth: 120, unit: "metric" }),
+      "bottom-left",
+    );
+    right.addControl(
+      new maplibregl.ScaleControl({ maxWidth: 120, unit: "metric" }),
+      "bottom-right",
+    );
     leftMapRef.current = left;
     rightMapRef.current = right;
     const compare = new MaplibreCompare(left, right, wrapperRef.current, {

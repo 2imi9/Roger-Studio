@@ -16,7 +16,8 @@ import { LLMExamples } from "./LLMExamples";
 import { DraggablePanel } from "./DraggablePanel";
 import { LabelPanel, type LabelFeature, type LabelMode } from "./LabelPanel";
 import { RogerLogo } from "./ui/RogerLogo";
-import { MapTab, AnalysisTab, OlmoEarthTab, LLMTab } from "./icons";
+import { MapTab, AnalysisTab, OlmoEarthTab, LLMTab, TIPSv2Tab } from "./icons";
+import { TIPSv2Panel } from "./TIPSv2Panel";
 import { PolygonStats } from "./PolygonStats";
 import { StacImagery } from "./StacImagery";
 import { OlmoEarthPanel } from "./OlmoEarthPanel";
@@ -313,8 +314,8 @@ export function Sidebar({
 
   return (
     <aside
-      className={`relative bg-gradient-sidebar text-geo-text flex flex-col border-r border-geo-border h-full transition-[width] duration-200 ease-out ${
-        sidebarCollapsed ? "w-[16px] overflow-visible" : "w-[480px] overflow-hidden"
+      className={`relative bg-gradient-sidebar text-geo-text flex flex-col border-r border-geo-border h-full transition-[width] duration-200 ease-out overflow-visible ${
+        sidebarCollapsed ? "w-[16px]" : "w-[480px]"
       }`}
     >
       {/* Collapse / expand chip — sits half-over the right border so it
@@ -324,7 +325,7 @@ export function Sidebar({
         title={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
         aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
         aria-expanded={!sidebarCollapsed}
-        className="absolute top-1/2 -translate-y-1/2 -right-3 z-40 w-6 h-12 rounded-r-md bg-geo-surface border border-geo-border border-l-0 flex items-center justify-center text-geo-muted hover:text-geo-text hover:bg-geo-elevated transition-colors cursor-pointer shadow-sm font-mono text-[10px]"
+        className="absolute top-1/2 -translate-y-1/2 left-full z-40 w-7 h-20 rounded-r-md bg-geo-surface border border-geo-border flex items-center justify-center text-geo-muted hover:text-geo-text hover:bg-geo-elevated transition-colors cursor-pointer shadow-sm font-mono text-[12px]"
       >
         {sidebarCollapsed ? "▶" : "◀"}
       </button>
@@ -332,7 +333,7 @@ export function Sidebar({
           collapsed-state class can hide everything at once. Display
           (not visibility) so the hidden content doesn't take up any
           layout / scroll space. */}
-      <div className={`flex-1 flex flex-col min-h-0 ${sidebarCollapsed ? "hidden" : ""}`}>
+      <div className={`flex-1 flex flex-col min-h-0 overflow-hidden ${sidebarCollapsed ? "hidden" : ""}`}>
       {/* Header — pinned top. Compact variant: every vertical dimension
           halved from the earlier hero lockup — padding pt-10→pt-5 /
           pb-8→pb-4, wordmark 48→24 px, logo 200→100 px, tag margin 4→2.
@@ -410,7 +411,7 @@ export function Sidebar({
           spacing look uneven because variable-width labels centered in
           equal slots produce variable inter-label gaps. */}
       <div className="flex-shrink-0 flex border-b border-geo-border px-4 bg-geo-surface justify-evenly">
-        {(["map", "analysis", "olmoearth", "gemma"] as ViewMode[]).map((mode) => {
+        {(["map", "analysis", "olmoearth", "tipsv2", "gemma"] as ViewMode[]).map((mode) => {
           if (mode === "map") {
             return (
               <div key={mode} className="relative group" data-testid="tab-map">
@@ -530,6 +531,26 @@ export function Sidebar({
                   </div>
                 </div>
               </div>
+            );
+          }
+          if (mode === "tipsv2") {
+            // TIPSv2 — sits between OlmoEarth and LLM. No submenu (single
+            // workflow surface — pick raster, prompts, run). Branded as
+            // the model name to mirror OlmoEarth's tab.
+            return (
+              <button
+                key={mode}
+                onClick={() => onViewChange(mode)}
+                data-testid="tab-tipsv2"
+                className={`px-2 py-4 text-[12px] font-medium border-b-2 cursor-pointer transition-all inline-flex items-center justify-center gap-1 whitespace-nowrap ${
+                  viewMode === mode
+                    ? "text-geo-accent border-geo-accent"
+                    : "text-geo-muted border-transparent hover:text-geo-text hover:border-geo-border hover:bg-geo-bg/60"
+                }`}
+              >
+                <TIPSv2Tab state={viewMode === mode ? "active" : "default"} className="w-4 h-4" />
+                TIPSv2
+              </button>
             );
           }
           // Plain Analysis tab — no submenu yet, awaiting future features.
@@ -1111,6 +1132,15 @@ export function Sidebar({
             selectedArea={selectedArea}
             onAddImageryLayer={onAddImageryLayer}
           />
+        )}
+
+        {/* ============ TIPSv2 TAB — zero-shot semantic labeling ============
+            Standalone from OlmoEarth (the encoder is locked to 12-band S2 so
+            fusion isn't feasible on uploaded high-res rasters). Researchers
+            overlay this tab's polygon output with the OlmoEarth raster
+            output on the map and ask the LLM tab to interpret each one. */}
+        {viewMode === "tipsv2" && (
+          <TIPSv2Panel datasets={datasets} onResult={onAutoLabelResult} />
         )}
       </div>
       )}

@@ -35,6 +35,15 @@ async def auto_label_dataset(
     method: str = Query("auto", description="Method: 'auto', 'tipsv2', 'spectral', or 'samgeo'"),
     model: str = Query("google/tipsv2-b14", description="TIPSv2 model name"),
     sliding_window: bool = Query(True, description="Use overlapping-tile inference for pixel-accurate boundaries (TIPSv2 only)"),
+    # User-supplied label classes for TIPSv2 zero-shot. Each item is
+    # ``{"name": str, "prompt": str, "color": "#RRGGBB"}``. When omitted,
+    # ``tipsv2_labeler.DEFAULT_CLASSES`` is used. The audit caught this:
+    # the LabelClassEditor in the UI was a no-op because the prompts
+    # never reached the backend — TIPSv2 always classified against the
+    # built-in 8-class land-cover prompt set regardless of what the user
+    # typed. Sending them through the body lets the user actually steer
+    # the classifier.
+    classes: list[dict] | None = Body(None, embed=True),
 ) -> dict:
     """Auto-label an uploaded dataset.
 
@@ -80,7 +89,12 @@ async def auto_label_dataset(
             elif method == "tipsv2" or (method == "auto" and TIPSV2_AVAILABLE):
                 if not TIPSV2_AVAILABLE:
                     raise HTTPException(422, "TIPSv2 not available. Install: pip install transformers torch")
-                result = auto_label_geotiff_tipsv2(str(filepath), model_name=model, sliding_window=sliding_window)
+                result = auto_label_geotiff_tipsv2(
+                    str(filepath),
+                    classes=classes,
+                    model_name=model,
+                    sliding_window=sliding_window,
+                )
             else:
                 result = auto_label_raster(str(filepath), n_classes=n_classes, min_segment_pixels=min_segment_pixels)
 

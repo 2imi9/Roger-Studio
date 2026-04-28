@@ -58,9 +58,7 @@
      Existing classes (bg-gradient-sidebar etc.) use --gradient-*
      vars; new patterns can reach for the geo-* names. */
   --gradient-sidebar: linear-gradient(180deg, #fbf9f5 0%, #f6f3ee 50%, #ede8df 100%);
-  --gradient-header: radial-gradient(120% 80% at 92% 4%, rgba(58,102,144,0.14), transparent 55%),
-                     radial-gradient(140% 100% at 6% 104%, rgba(166,108,74,0.11), transparent 60%),
-                     linear-gradient(180deg, #fbf9f5 0%, #f6f3ee 100%);
+  --gradient-header: #f6f3ee;
   --gradient-panel: linear-gradient(145deg, #fbf9f5 0%, #f6f3ee 100%);
   --gradient-primary: linear-gradient(180deg, #5b8bb5 0%, #3a6690 100%);
   --gradient-accent-soft: linear-gradient(135deg, #e2ebf3 0%, #c8d8e8 100%);
