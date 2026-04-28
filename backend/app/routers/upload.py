@@ -65,8 +65,8 @@ async def upload_file(file: UploadFile) -> DatasetInfo:
         raise HTTPException(
             400,
             f"Unsupported format: {file.filename}. "
-            "Supported: GeoTIFF, NetCDF, Zarr, GeoPackage, GeoJSON, Shapefile(.zip), "
-            "LAS/LAZ, GeoParquet, CSV",
+            "Supported: GeoTIFF, NetCDF, GeoPackage, GeoJSON, Shapefile(.zip), "
+            "GeoParquet, CSV",
         )
 
     # Save to temp — _safe_upload_path rejects any filename that resolves

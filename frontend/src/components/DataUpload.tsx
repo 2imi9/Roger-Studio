@@ -17,7 +17,7 @@ const FORMAT_LABELS: Record<string, { label: string; color: string }> = {
   csv: { label: "CSV", color: "#6b7280" },
 };
 
-const ACCEPTED = ".tif,.tiff,.nc,.nc4,.zarr,.gpkg,.geojson,.json,.shp,.zip,.las,.laz,.parquet,.csv";
+const ACCEPTED = ".tif,.tiff,.nc,.nc4,.gpkg,.geojson,.json,.shp,.zip,.parquet,.geoparquet,.csv";
 
 interface DataUploadProps {
   datasets: DatasetInfo[];
@@ -134,7 +134,7 @@ export function DataUpload({ datasets, onUpload, onDelete, onSelect }: DataUploa
           {uploading ? "Uploading..." : "Drop files or click to upload"}
         </div>
         <div className="text-[10px] text-geo-dim mt-1">
-          GeoTIFF, NetCDF, Zarr, GPKG, GeoJSON, Shapefile(.zip), LAS/LAZ, Parquet, CSV
+          GeoTIFF, NetCDF, GeoPackage, GeoJSON, Shapefile(.zip), GeoParquet, CSV
         </div>
       </div>
 
