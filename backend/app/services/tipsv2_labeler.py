@@ -45,6 +45,24 @@ _model = None
 _model_name = None
 _device = None
 
+# 9-template prompt set used for zero-shot ADE20K eval in the official
+# TIPSv2 release (`pytorch/TIPS_zeroshot_segmentation.ipynb`,
+# ``_TCL_PROMPTS`` constant). Averaging text embeddings across these
+# templates is worth ~2–5 mIoU on dense seg vs a single prompt — the
+# templates probe complementary slices of the joint image-text space and
+# the average is a more stable class anchor than any one prompt.
+PROMPT_TEMPLATES = (
+    "itap of a {}.",
+    "a bad photo of a {}.",
+    "a origami {}.",
+    "a photo of the large {}.",
+    "a {} in a video game.",
+    "art of the {}.",
+    "a photo of the small {}.",
+    "a photo of many {}.",
+    "a photo of {}s.",
+)
+
 # Default land cover classes for geospatial auto-labeling
 DEFAULT_CLASSES = [
     {"name": "Forest", "prompt": "dense forest or woodland with trees", "color": "#228b22"},
@@ -64,6 +82,128 @@ def _preprocess_image(image: "Image.Image") -> "torch.Tensor":
     arr = np.array(img, dtype=np.float32) / 255.0  # (H, W, 3) in [0,1]
     tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)  # (1, 3, 448, 448)
     return tensor
+
+
+def encode_text_with_templates(model, class_terms: list[str]) -> "torch.Tensor":
+    """Encode each class term across ``PROMPT_TEMPLATES`` and average the
+    embeddings (L2-normalised before averaging). Returns a (C, D) tensor of
+    L2-normalised class anchors.
+
+    The averaging is done in the L2-normalised embedding space — that's
+    what the official TIPSv2 release does for its zero-shot eval and
+    matches the standard CLIP-style template-ensembling pattern. Averaging
+    raw embeddings would let a single template with large magnitude
+    dominate the others; normalising first gives every template equal say.
+    """
+    _ensure_imports()
+    device = next(model.parameters()).device
+    out = torch.zeros((len(class_terms), model.config.embed_dim), device=device)
+    for tpl in PROMPT_TEMPLATES:
+        prompts = [tpl.format(t) for t in class_terms]
+        emb = model.encode_text(prompts).to(device)
+        emb = F.normalize(emb, dim=-1)
+        out += emb
+    out = out / len(PROMPT_TEMPLATES)
+    return F.normalize(out, dim=-1)
+
+
+def _encode_image_dense(
+    model,
+    pixel_values,
+    *,
+    attn_mode: str = "default",
+    cls_subtract: float = 0.0,
+    drop_residual: bool = False,
+):
+    """Run the vision encoder for dense readout, with optional MaskCLIP /
+    SegEarth-OV style modifications on the last block + CLS-bias removal.
+
+    Args:
+        attn_mode:
+          ``"default"``  — unchanged (model's own forward).
+          ``"values"``   — MaskCLIP / TIPSv2 official ``encode_image_value_attention``.
+                            Replace last attention with ``ls1(proj(v))`` and skip MLP.
+          ``"msa"``      — SegEarth-OV's "modulated self-attention" (CVPR'25):
+                            sum of q·q, k·k, v·v softmax-attentions, applied to v.
+                            Outperformed plain values on RS imagery in their ablations.
+        cls_subtract:
+          λ in SegEarth-OV's Eq. 9 — subtracts ``λ · cls_token`` from each
+          patch token to remove the global-context bias the [CLS] token
+          contaminates patch tokens with during contrastive pretraining.
+          Recommended λ=0.3 (paper default). 0.0 disables.
+
+    Returns ``(cls_token: (B, 1, D), patch_tokens: (B, N, D))``.
+    """
+    _ensure_imports()
+    if attn_mode == "default":
+        # Fast path: use the model's own forward unchanged.
+        out = model.encode_image(pixel_values)
+        cls_token, patch_tokens = out.cls_token, out.patch_tokens
+    elif attn_mode in ("values", "msa"):
+        cls_token, patch_tokens = _encode_image_modified_last_block(
+            model, pixel_values, attn_mode, drop_residual=drop_residual,
+        )
+    else:
+        raise ValueError(f"unknown attn_mode={attn_mode!r}")
+
+    if cls_subtract != 0.0:
+        # SegEarth-OV Eq. 9: Ô = O[1:hw+1] − λ · O[0], where O[0] is the
+        # CLS token broadcast over the patch positions. Trims the global-
+        # context bias the contrastive [CLS] objective bakes into every
+        # patch — gain on dense seg without cost.
+        patch_tokens = patch_tokens - cls_subtract * cls_token
+
+    return cls_token, patch_tokens
+
+
+def _encode_image_modified_last_block(
+    model, pixel_values, attn_mode: str, *, drop_residual: bool = False,
+):
+    """Forward through the vision encoder with a modified last attention
+    block. Helper for ``_encode_image_dense``.
+
+    When ``drop_residual`` is True, the residual connection on the last
+    block is also removed (ClearCLIP ECCV'24, modification #1) — only the
+    modulated attention output passes through ``last.ls1``, no addition
+    of the input ``x``. Empirically worth ~1–2 mIoU on dense seg in
+    addition to the values/M-SA + no-FFN modifications.
+    """
+    vit = model.vision_encoder
+    pixel_values = pixel_values.to(model.device)
+    with torch.no_grad():
+        x = vit.prepare_tokens_with_masks(pixel_values)
+        for blk in vit.blocks[:-1]:
+            x = blk(x)
+        last = vit.blocks[-1]
+        x_n1 = last.norm1(x)
+        attn = last.attn
+        b_dim, n_dim, c_dim = x_n1.shape
+        qkv = (
+            attn.qkv(x_n1)
+            .reshape(b_dim, n_dim, 3, attn.num_heads, c_dim // attn.num_heads)
+            .permute(2, 0, 3, 1, 4)
+        )
+        q, k, v = qkv[0], qkv[1], qkv[2]  # each (b, num_heads, n, head_dim)
+
+        if attn_mode == "values":
+            x_attn = v.transpose(1, 2).reshape(b_dim, n_dim, c_dim)
+        else:  # "msa" — SegEarth-OV Eq. 10
+            scale = attn.scale  # head_dim**-0.5
+            attn_qq = (q * scale @ q.transpose(-2, -1)).softmax(dim=-1)
+            attn_kk = (k * scale @ k.transpose(-2, -1)).softmax(dim=-1)
+            attn_vv = (v * scale @ v.transpose(-2, -1)).softmax(dim=-1)
+            attn_sum = attn_qq + attn_kk + attn_vv
+            x_attn = (attn_sum @ v).transpose(1, 2).reshape(b_dim, n_dim, c_dim)
+
+        x_attn = attn.proj(x_attn)
+        x_attn = last.ls1(x_attn)
+        # MLP residual intentionally skipped — matches MaskCLIP / SegEarth-OV.
+        # Optional: also drop the attention residual (ClearCLIP ECCV'24).
+        x = x_attn if drop_residual else x + x_attn
+        x_norm = vit.norm(x)
+        cls_token = x_norm[:, :1]
+        patch_tokens = x_norm[:, 1 + vit.num_register_tokens :]
+        return cls_token, patch_tokens
 
 
 def _get_model(model_name: str = "google/tipsv2-b14"):
@@ -110,16 +250,24 @@ def classify_image_zeroshot(
         prompts = [c["prompt"] for c in classes]
         text_emb = model.encode_text(prompts)  # (num_classes, D)
 
-    # Global classification (cls token)
+    # Global classification (cls token).
+    # ``temperature`` comes from the model config (~0.005 for B/14, similar
+    # for L/14 and g/14). Earlier code hardcoded ``* 10`` which produced
+    # near-uniform softmax (8-class avg confidence ~0.15 — barely above the
+    # 0.125 random baseline). The trained logit scale is ~1/0.005 ≈ 200,
+    # which is what calibrates the cosine similarities into a peaky
+    # distribution. Use the model's own value so each model size gets the
+    # scale it was trained with.
+    logit_scale = 1.0 / float(model.config.temperature)
     cls = F.normalize(out.cls_token[:, 0, :], dim=-1)  # (1, D)
     text_norm = F.normalize(text_emb, dim=-1)  # (C, D)
     global_sim = (cls @ text_norm.T).squeeze(0)  # (C,)
-    global_probs = F.softmax(global_sim * 10, dim=0).cpu().numpy()
+    global_probs = F.softmax(global_sim * logit_scale, dim=0).cpu().numpy()
 
     # Per-patch classification (spatial map)
     patch_tokens = F.normalize(out.patch_tokens, dim=-1)  # (1, N, D)
     patch_sim = (patch_tokens @ text_norm.T).squeeze(0)  # (N, C)
-    patch_probs = F.softmax(patch_sim * 10, dim=-1).cpu().numpy()  # (N, C)
+    patch_probs = F.softmax(patch_sim * logit_scale, dim=-1).cpu().numpy()  # (N, C)
     patch_labels = patch_probs.argmax(axis=-1)  # (N,)
     patch_confidence = patch_probs.max(axis=-1)  # (N,)
 
@@ -189,6 +337,8 @@ def _sliding_window_classify(
     with torch.no_grad():
         text_emb = model.encode_text(prompts)
         text_norm = F.normalize(text_emb, dim=-1)
+    # Use the model's trained logit scale (see classify_image_zeroshot).
+    logit_scale = 1.0 / float(model.config.temperature)
 
     # Accumulate per-class probability × confidence, and confidence weights
     # Shape: (H, W, n_classes) for probs, (H, W) for weight sum
@@ -236,7 +386,7 @@ def _sliding_window_classify(
                 out = model.encode_image(pixel_values)
                 patch_tokens = F.normalize(out.patch_tokens, dim=-1)
                 patch_sim = (patch_tokens @ text_norm.T).squeeze(0)  # (N, C)
-                patch_probs = F.softmax(patch_sim * 10, dim=-1).cpu().numpy()  # (N, C)
+                patch_probs = F.softmax(patch_sim * logit_scale, dim=-1).cpu().numpy()  # (N, C)
 
             n_patches = patch_probs.shape[0]
             grid = int(np.sqrt(n_patches))
@@ -418,6 +568,23 @@ def auto_label_geotiff_tipsv2(
         except Exception:
             pass
 
+    # Geodesic area in m² for the WGS84 polygon. Earlier code did ``poly.area``
+    # AFTER reprojection, which returned degrees² (~1e-10 of the real m²),
+    # collapsing every feature's reported area to 0 and breaking the
+    # percentage roll-up in the class summary. Geod gives ellipsoidal area
+    # that's correct regardless of source CRS.
+    from pyproj import Geod  # noqa: PLC0415
+    _geod = Geod(ellps="WGS84")
+
+    def _area_m2(p) -> float:
+        if p is None or p.is_empty:
+            return 0.0
+        if p.geom_type == "Polygon":
+            return abs(_geod.geometry_area_perimeter(p)[0])
+        if p.geom_type == "MultiPolygon":
+            return sum(abs(_geod.geometry_area_perimeter(g)[0]) for g in p.geoms)
+        return 0.0
+
     # Vectorize to GeoJSON polygons
     features_list = []
     for geom, value in shapes(label_full.astype(np.int32), transform=transform):
@@ -458,7 +625,7 @@ def auto_label_geotiff_tipsv2(
                 "class_name": cls_def["name"],
                 "color": cls_def["color"],
                 "confidence": round(seg_conf, 3),
-                "area_m2": round(poly.area, 1),
+                "area_m2": round(_area_m2(poly), 1),
                 "needs_review": seg_conf < 0.3,
             },
         })
