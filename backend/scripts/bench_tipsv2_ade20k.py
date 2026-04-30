@@ -161,6 +161,126 @@ def _tile_positions(dim: int, tile: int, stride: int) -> list[int]:
 
 
 @torch.no_grad()
+def _predict_slide_soft(
+    model,
+    text_norm: torch.Tensor,
+    logit_scale: float,
+    image: Image.Image,
+    device: torch.device,
+    stride: int,
+    attn_mode: str = "default",
+    cls_subtract: float = 0.0,
+    drop_residual: bool = False,
+) -> torch.Tensor:
+    """Sliding-window forward pass returning soft probabilities. Same as
+    ``_predict_slide`` but returns ``(C, H, W)`` softmax tensor instead of
+    argmax labels — used by the multi-scale path that averages soft preds
+    across resizes before final argmax."""
+    img = image.convert("RGB")
+    W, H = img.size
+    rgb = np.asarray(img, dtype=np.uint8)
+
+    pad_h = max(0, TILE_SIZE - H)
+    pad_w = max(0, TILE_SIZE - W)
+    if pad_h or pad_w:
+        rgb = np.pad(rgb, ((0, pad_h), (0, pad_w), (0, 0)), mode="constant")
+    Hp, Wp = rgb.shape[:2]
+
+    n_classes = text_norm.shape[0]
+    prob_sum = torch.zeros((n_classes, Hp, Wp), dtype=torch.float32, device=device)
+    weight_sum = torch.zeros((Hp, Wp), dtype=torch.float32, device=device)
+
+    yy, xx = torch.meshgrid(
+        torch.linspace(-1, 1, TILE_SIZE, device=device),
+        torch.linspace(-1, 1, TILE_SIZE, device=device),
+        indexing="ij",
+    )
+    weight_mask = (torch.cos(yy * np.pi / 2) * torch.cos(xx * np.pi / 2)).clamp(0.1, 1.0)
+
+    y_positions = _tile_positions(Hp, TILE_SIZE, stride)
+    x_positions = _tile_positions(Wp, TILE_SIZE, stride)
+
+    for y0 in y_positions:
+        for x0 in x_positions:
+            tile_np = rgb[y0:y0 + TILE_SIZE, x0:x0 + TILE_SIZE]
+            tile_pil = Image.fromarray(tile_np)
+            pixel_values = _preprocess_image(tile_pil).to(device)
+            _, patch_tokens = _encode_image_dense(
+                model, pixel_values,
+                attn_mode=attn_mode,
+                cls_subtract=cls_subtract,
+                drop_residual=drop_residual,
+            )
+            patch = F.normalize(patch_tokens, dim=-1)
+            sim = (patch @ text_norm.T).squeeze(0)
+            probs = F.softmax(sim * logit_scale, dim=-1)
+
+            P = probs.shape[0]
+            grid = int(round(P ** 0.5))
+            assert grid * grid == P, f"non-square patch grid: {P}"
+            probs = probs.view(grid, grid, n_classes).permute(2, 0, 1).unsqueeze(0)
+            probs_full = F.interpolate(
+                probs, size=(TILE_SIZE, TILE_SIZE), mode="bilinear", align_corners=False
+            ).squeeze(0)
+
+            prob_sum[:, y0:y0 + TILE_SIZE, x0:x0 + TILE_SIZE] += probs_full * weight_mask
+            weight_sum[y0:y0 + TILE_SIZE, x0:x0 + TILE_SIZE] += weight_mask
+
+    weight_sum = weight_sum.clamp(min=1e-6)
+    prob_final = prob_sum / weight_sum.unsqueeze(0)
+    return prob_final[:, :H, :W]
+
+
+@torch.no_grad()
+def _predict_multiscale(
+    model,
+    text_norm: torch.Tensor,
+    logit_scale: float,
+    image: Image.Image,
+    device: torch.device,
+    stride: int,
+    scales: tuple[float, ...],
+    attn_mode: str = "default",
+    cls_subtract: float = 0.0,
+    drop_residual: bool = False,
+) -> np.ndarray:
+    """Predict at each scale (resize image short-side accordingly), upsample
+    softmax back to the original resolution, average, argmax. Single-scale
+    via ``scales=(1.0,)`` reproduces the legacy single-scale behaviour."""
+    W, H = image.convert("RGB").size
+    if scales == (1.0,) or len(scales) == 1 and abs(scales[0] - 1.0) < 1e-6:
+        soft = _predict_slide_soft(
+            model, text_norm, logit_scale, image, device,
+            stride=stride, attn_mode=attn_mode,
+            cls_subtract=cls_subtract, drop_residual=drop_residual,
+        )
+        return soft.argmax(dim=0).to(torch.int32).cpu().numpy()
+
+    n_classes = text_norm.shape[0]
+    acc = torch.zeros((n_classes, H, W), dtype=torch.float32, device=device)
+    for s in scales:
+        if abs(s - 1.0) < 1e-6:
+            scaled = image
+        else:
+            sH = max(TILE_SIZE // 2, int(round(H * s)))
+            sW = max(TILE_SIZE // 2, int(round(W * s)))
+            scaled = image.resize((sW, sH), Image.BICUBIC)
+        soft = _predict_slide_soft(
+            model, text_norm, logit_scale, scaled, device,
+            stride=stride, attn_mode=attn_mode,
+            cls_subtract=cls_subtract, drop_residual=drop_residual,
+        )
+        if soft.shape[-2:] != (H, W):
+            soft = F.interpolate(
+                soft.unsqueeze(0), size=(H, W),
+                mode="bilinear", align_corners=False,
+            ).squeeze(0)
+        acc += soft
+    acc /= len(scales)
+    return acc.argmax(dim=0).to(torch.int32).cpu().numpy()
+
+
+@torch.no_grad()
 def _predict_slide(
     model,
     text_norm: torch.Tensor,
@@ -284,7 +404,14 @@ def main() -> int:
         "--drop-residual", action="store_true",
         help="ClearCLIP modification #1 — drop the attention residual on the last block.",
     )
+    ap.add_argument(
+        "--scales", default="1.0",
+        help="comma-separated list of scale factors for multi-scale inference. "
+             "e.g. '1.0,0.75' runs at original + 0.75x and averages soft predictions. "
+             "Default '1.0' is single-scale (existing behaviour).",
+    )
     args = ap.parse_args()
+    args.scales = tuple(float(s) for s in args.scales.split(",") if s.strip())
     if args.attn_mode is None:
         args.attn_mode = "values" if args.values_trick else "default"
 
@@ -331,13 +458,22 @@ def main() -> int:
         if gt.ndim == 3:
             gt = gt[:, :, 0]
 
-        pred = _predict_slide(
-            model, text_norm, logit_scale, image, device,
-            stride=args.stride,
-            attn_mode=args.attn_mode,
-            cls_subtract=args.cls_subtract,
-            drop_residual=args.drop_residual,
-        )
+        if len(args.scales) == 1 and abs(args.scales[0] - 1.0) < 1e-6:
+            pred = _predict_slide(
+                model, text_norm, logit_scale, image, device,
+                stride=args.stride,
+                attn_mode=args.attn_mode,
+                cls_subtract=args.cls_subtract,
+                drop_residual=args.drop_residual,
+            )
+        else:
+            pred = _predict_multiscale(
+                model, text_norm, logit_scale, image, device,
+                stride=args.stride, scales=args.scales,
+                attn_mode=args.attn_mode,
+                cls_subtract=args.cls_subtract,
+                drop_residual=args.drop_residual,
+            )
         if pred.shape != gt.shape:
             pred = np.asarray(
                 Image.fromarray(pred.astype(np.int32)).resize(
@@ -364,7 +500,7 @@ def main() -> int:
     print(
         f"impl notes : templates={'9-TCL' if args.templates else 'single'}, "
         f"attn_mode={args.attn_mode}, cls_subtract={args.cls_subtract}, "
-        f"BILINEAR upsample, stride={args.stride}"
+        f"scales={args.scales}, BILINEAR upsample, stride={args.stride}"
     )
 
     order = np.argsort(iou)
@@ -387,6 +523,7 @@ def main() -> int:
             "attn_mode": args.attn_mode,
             "cls_subtract": args.cls_subtract,
             "drop_residual": args.drop_residual,
+            "scales": list(args.scales),
             "values_trick": args.attn_mode == "values",
             "miou": miou,
             "pixel_acc": pix,
