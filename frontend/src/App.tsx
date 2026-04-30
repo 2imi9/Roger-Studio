@@ -456,10 +456,20 @@ export function App() {
   // off `datasets` (TIPSv2Panel, AutoLabel, OlmoEarthPanel raster picker)
   // show "no data" until the user uploads — even when the server already has
   // GeoTIFFs from prior sessions persisted on disk.
+  //
+  // The `prev.length === 0` guard is the race-condition fix: if the user
+  // uploads or deletes a dataset while this fetch is in flight, the local
+  // state already has the result of that mutation, and overwriting with the
+  // stale server response would clobber the change. Only seeding when
+  // local is still empty matches the intent (initial fill) without ever
+  // racing user actions.
   useEffect(() => {
     let cancelled = false;
     listDatasets()
-      .then((ds) => { if (!cancelled) setDatasets(ds); })
+      .then((ds) => {
+        if (cancelled) return;
+        setDatasets((prev) => (prev.length === 0 ? ds : prev));
+      })
       .catch(() => { /* offline / cold backend — leave empty, upload still works */ });
     return () => { cancelled = true; };
   }, []);

@@ -573,17 +573,27 @@ def auto_label_geotiff_tipsv2(
     # collapsing every feature's reported area to 0 and breaking the
     # percentage roll-up in the class summary. Geod gives ellipsoidal area
     # that's correct regardless of source CRS.
-    from pyproj import Geod  # noqa: PLC0415
-    _geod = Geod(ellps="WGS84")
+    #
+    # ``pyproj`` lives in the optional ``geo`` extras (see pyproject.toml).
+    # When it isn't installed, fall back to ``poly.area`` in source-CRS
+    # units — same degraded path the reprojection block above already
+    # takes on pyproj-less deployments. Better than crashing the whole
+    # auto-label endpoint.
+    try:
+        from pyproj import Geod  # noqa: PLC0415
+        _geod = Geod(ellps="WGS84")
 
-    def _area_m2(p) -> float:
-        if p is None or p.is_empty:
+        def _area_m2(p) -> float:
+            if p is None or p.is_empty:
+                return 0.0
+            if p.geom_type == "Polygon":
+                return abs(_geod.geometry_area_perimeter(p)[0])
+            if p.geom_type == "MultiPolygon":
+                return sum(abs(_geod.geometry_area_perimeter(g)[0]) for g in p.geoms)
             return 0.0
-        if p.geom_type == "Polygon":
-            return abs(_geod.geometry_area_perimeter(p)[0])
-        if p.geom_type == "MultiPolygon":
-            return sum(abs(_geod.geometry_area_perimeter(g)[0]) for g in p.geoms)
-        return 0.0
+    except Exception:
+        def _area_m2(p) -> float:
+            return float(p.area) if p is not None and not p.is_empty else 0.0
 
     # Vectorize to GeoJSON polygons
     features_list = []
