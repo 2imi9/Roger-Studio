@@ -441,7 +441,7 @@ export function Sidebar({
                         }`}
                       >
                         {sv === "sample"
-                          ? "Sample Label"
+                          ? "Sample Data"
                           : sv === "rasters"
                             ? "Sample Rasters"
                             : sv === "labeling"

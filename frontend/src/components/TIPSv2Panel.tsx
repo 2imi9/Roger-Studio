@@ -29,7 +29,12 @@ export function TIPSv2Panel({ datasets, onResult }: TIPSv2PanelProps) {
   const [selectedFile, setSelectedFile] = useState("");
   const [model, setModel] = useState<TIPSv2Model>("google/tipsv2-l14");
   const [slidingWindow, setSlidingWindow] = useState(true);
-  const [customClasses, setCustomClasses] = useState<LabelClass[]>([...PRESETS["Land Cover"]]);
+  // Start with NO label classes pre-filled. Defaulting to the 8-class
+  // Land-Cover preset made the panel feel like labels were "on" the
+  // moment a user opened the tab — and meant they were silently locked
+  // into a class set someone else picked. Empty default forces an
+  // explicit "pick a preset or add a class" gesture.
+  const [customClasses, setCustomClasses] = useState<LabelClass[]>([]);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastResult, setLastResult] = useState<{ count: number; method: string } | null>(null);
@@ -66,12 +71,19 @@ export function TIPSv2Panel({ datasets, onResult }: TIPSv2PanelProps) {
   return (
     <div>
       <h3 className="m-0 mb-1 text-sm font-semibold text-geo-text">
-        TIPSv2 Semantic Label
+        TIPSv2 Exploratory Label
       </h3>
-      <p className="m-0 mb-3 text-[11px] text-geo-dim leading-relaxed">
-        Zero-shot label any uploaded GeoTIFF with text prompts. Standalone
-        from OlmoEarth — drop both outputs on the map to overlay them, or
-        ask the LLM tab to interpret each one.
+      <p className="m-0 mb-1 text-[11px] text-geo-dim leading-relaxed">
+        <strong>TIPSv2</strong> is Google DeepMind's vision-language
+        foundation model (CVPR&nbsp;2026) that aligns image patches with
+        text descriptions. Label any uploaded GeoTIFF by writing a text
+        prompt for each class — no training needed.
+      </p>
+      <p className="m-0 mb-3 text-[11px] text-geo-muted leading-relaxed">
+        Best for <strong>rough-draft labelling on small custom class sets
+        (4–12 classes)</strong>. For ecosystem typology with many classes,
+        the <strong>OlmoEarth tab</strong> is supervised and more accurate;
+        the <strong>LLM tab</strong> can interpret outputs from either.
       </p>
 
       {eligible.length === 0 ? (
@@ -165,26 +177,46 @@ export function TIPSv2Panel({ datasets, onResult }: TIPSv2PanelProps) {
           </div>
 
           {/* Class prompts */}
+          {customClasses.length === 0 && (
+            <div className="mb-2 text-[11px] text-geo-muted bg-geo-surface border border-dashed border-geo-border rounded-lg px-3 py-2 leading-relaxed">
+              No classes yet. <strong>Click a preset above</strong> to load
+              one, or add classes manually below. Each class is a text
+              prompt TIPSv2 will try to match against image patches.
+            </div>
+          )}
           <LabelClassEditor classes={customClasses} onChange={setCustomClasses} />
 
           {/* Run */}
-          <button
-            type="button"
-            onClick={handleRun}
-            disabled={running || !selectedFile}
-            className={`mt-3 w-full py-2.5 rounded-lg text-[13px] font-semibold transition-all ${
-              running || !selectedFile
-                ? "bg-geo-border text-geo-dim cursor-not-allowed"
-                : "text-white cursor-pointer shadow-sm hover:shadow-lg hover:-translate-y-0.5 hover:brightness-110 active:translate-y-0 active:brightness-95"
-            }`}
-            style={
-              running || !selectedFile
-                ? undefined
-                : { background: "linear-gradient(135deg, #5b8bb5 0%, #3a6690 100%)" }
-            }
-          >
-            {running ? "Running TIPSv2…" : "Run + add to map"}
-          </button>
+          {(() => {
+            const noClasses = customClasses.length === 0;
+            const disabled = running || !selectedFile || noClasses;
+            const label = running
+              ? "Running TIPSv2…"
+              : noClasses
+                ? "Add classes to run"
+                : !selectedFile
+                  ? "Pick a raster to run"
+                  : "Run + add to map";
+            return (
+              <button
+                type="button"
+                onClick={handleRun}
+                disabled={disabled}
+                className={`mt-3 w-full py-2.5 rounded-lg text-[13px] font-semibold transition-all ${
+                  disabled
+                    ? "bg-geo-border text-geo-dim cursor-not-allowed"
+                    : "text-white cursor-pointer shadow-sm hover:shadow-lg hover:-translate-y-0.5 hover:brightness-110 active:translate-y-0 active:brightness-95"
+                }`}
+                style={
+                  disabled
+                    ? undefined
+                    : { background: "linear-gradient(135deg, #5b8bb5 0%, #3a6690 100%)" }
+                }
+              >
+                {label}
+              </button>
+            );
+          })()}
 
           {error && (
             <div className="mt-3 text-[11px] text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
