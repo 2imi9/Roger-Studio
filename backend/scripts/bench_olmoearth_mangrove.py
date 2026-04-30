@@ -66,12 +66,17 @@ INPUT_CSV = DATA_DIR / "mangrove_classification" / "input.csv"
 MODEL_REPO_ID = "allenai/OlmoEarth-v1-FT-Mangrove-Base"
 DATE_RANGE = "2020-01-01/2020-12-31"
 
+# FT-Mangrove emits 4 logits in the order [nodata, mangrove, water, other]
+# (per app/services/olmoearth_ft.py:139). The dataset's ref_cls uses 3 of
+# those (Mangrove / Water / Other — no "nodata" labels) so we map between
+# them for IoU. Class indices below are the model output indices, NOT
+# arbitrary names.
+MODEL_CLASS_NAMES = ("nodata", "mangrove", "water", "other")
 REF_TO_MODEL_CLASS = {
     "Mangrove": "mangrove",
     "Water": "water",
     "Other": "other",
 }
-
 CLASSES_FOR_IOU = ["mangrove", "water", "other"]
 
 
@@ -93,42 +98,68 @@ def _wgs84_to_tile_xy(lon: float, lat: float, z: int) -> tuple[int, int, float, 
     return tile_x, tile_y, px, py
 
 
-def _legend_color_to_class(
-    legend: dict | None,
-) -> dict[tuple[int, int, int], str]:
-    """Build {(r,g,b) → class_name} from the response legend so we can decode tile pixels."""
+def _build_class_anchors(
+    legend: dict | None, n_classes: int,
+) -> list[tuple[int, int, int]] | None:
+    """The mangrove / landuse colormaps are GRADIENTS, not discrete entries.
+    The tile renderer encodes class index ``c`` as ``v = c / (n_classes - 1)``
+    and interpolates that ``v`` through the gradient stops. To recover the
+    class from a tile pixel we precompute the gradient evaluation at each
+    class's ``v``, then nearest-neighbour match in RGB space.
+
+    ``legend["stops"]`` arrives over JSON as ``[[hex, value], ...]`` (sorted
+    by value 0.0..1.0, exactly as defined in olmoearth_inference._COLORMAPS).
+    """
     if not legend:
-        return {}
-    mapping: dict[tuple[int, int, int], str] = {}
-    for stop in (legend.get("stops") or []):
-        color_hex = stop.get("color")
-        label = (stop.get("label") or "").lower().strip()
-        if not color_hex or not label:
-            continue
-        try:
-            mapping[_hex_to_rgb(color_hex)] = label
-        except (ValueError, TypeError):
-            continue
-    return mapping
-
-
-def _nearest_legend_class(
-    pixel_rgb: tuple[int, int, int],
-    color_to_class: dict[tuple[int, int, int], str],
-) -> str | None:
-    """Map an arbitrary RGB to the closest legend color's class. Returns None
-    if the legend is empty."""
-    if not color_to_class:
         return None
+    raw_stops = legend.get("stops") or []
+    parsed: list[tuple[float, tuple[int, int, int]]] = []
+    for s in raw_stops:
+        try:
+            color_hex, value = s[0], float(s[1])
+            parsed.append((value, _hex_to_rgb(color_hex)))
+        except (TypeError, ValueError, IndexError):
+            continue
+    if not parsed:
+        return None
+    parsed.sort(key=lambda kv: kv[0])
+
+    def _eval_gradient(v: float) -> tuple[int, int, int]:
+        v = max(0.0, min(1.0, v))
+        if v <= parsed[0][0]:
+            return parsed[0][1]
+        if v >= parsed[-1][0]:
+            return parsed[-1][1]
+        for i in range(1, len(parsed)):
+            v0, c0 = parsed[i - 1]
+            v1, c1 = parsed[i]
+            if v <= v1:
+                t = (v - v0) / max(v1 - v0, 1e-9)
+                return (
+                    int(round(c0[0] + t * (c1[0] - c0[0]))),
+                    int(round(c0[1] + t * (c1[1] - c0[1]))),
+                    int(round(c0[2] + t * (c1[2] - c0[2]))),
+                )
+        return parsed[-1][1]
+
+    return [
+        _eval_gradient(c / max(n_classes - 1, 1)) for c in range(n_classes)
+    ]
+
+
+def _nearest_class_idx(
+    pixel_rgb: tuple[int, int, int],
+    anchors: list[tuple[int, int, int]],
+) -> int:
     pr, pg, pb = pixel_rgb
     best_dist = float("inf")
-    best_cls: str | None = None
-    for (r, g, b), cls in color_to_class.items():
+    best_idx = 0
+    for i, (r, g, b) in enumerate(anchors):
         d = (r - pr) ** 2 + (g - pg) ** 2 + (b - pb) ** 2
         if d < best_dist:
             best_dist = d
-            best_cls = cls
-    return best_cls
+            best_idx = i
+    return best_idx
 
 
 def _hash_ring(uid: str, seed: int = 0) -> int:
@@ -158,7 +189,7 @@ def _load_samples(limit: int, seed: int) -> list[dict]:
 
 
 def _request_inference(
-    backend: str, lon: float, lat: float, bbox_half: float, timeout: float = 600.0,
+    backend: str, lon: float, lat: float, bbox_half: float, timeout: float = 1800.0,
 ) -> dict[str, Any]:
     body = {
         "bbox": {
@@ -240,8 +271,13 @@ def main() -> int:
         if kind == "stub":
             n_stub += 1
         rgb = _fetch_tile_pixel(args.backend, tile_template, lon, lat, zoom=args.zoom)
-        color_map = _legend_color_to_class(legend)
-        pred_cls = _nearest_legend_class(rgb, color_map) if rgb else None
+        anchors = _build_class_anchors(legend, n_classes=len(MODEL_CLASS_NAMES))
+        pred_idx_full = (
+            _nearest_class_idx(rgb, anchors) if (rgb and anchors) else None
+        )
+        pred_cls = (
+            MODEL_CLASS_NAMES[pred_idx_full] if pred_idx_full is not None else None
+        )
         if pred_cls is None:
             n_unmapped += 1
         rows.append({
