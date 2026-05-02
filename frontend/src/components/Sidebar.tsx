@@ -314,7 +314,7 @@ export function Sidebar({
 
   return (
     <aside
-      className={`relative bg-gradient-sidebar text-geo-text flex flex-col border-r border-geo-border h-full transition-[width] duration-200 ease-out overflow-visible ${
+      className={`relative bg-gradient-sidebar text-geo-text flex flex-col border-r border-geo-border h-full overflow-visible ${
         sidebarCollapsed ? "w-[16px]" : "w-[480px]"
       }`}
     >
@@ -441,7 +441,7 @@ export function Sidebar({
                         }`}
                       >
                         {sv === "sample"
-                          ? "Sample Label"
+                          ? "Sample Data"
                           : sv === "rasters"
                             ? "Sample Rasters"
                             : sv === "labeling"

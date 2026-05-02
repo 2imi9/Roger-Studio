@@ -7,7 +7,7 @@ import { Sidebar } from "./components/Sidebar";
 import { SplitMap } from "./components/SplitMap";
 import { InferenceLegendPanel } from "./components/InferenceLegendPanel";
 import { colorForTag, type LabelFeature, type LabelMode } from "./components/LabelPanel";
-import { analyze, getEnvData, getOlmoEarthCacheStatus, type OlmoEarthRepoStatus } from "./api/client";
+import { analyze, getEnvData, getOlmoEarthCacheStatus, listDatasets, type OlmoEarthRepoStatus } from "./api/client";
 import { DATASET_COVERAGE } from "./constants/olmoEarthCoverage";
 import { safeSetItem } from "./util/sessionStorage";
 
@@ -450,6 +450,28 @@ export function App() {
       cancelled = true;
       window.clearInterval(handle);
     };
+  }, []);
+
+  // Seed `datasets` from the backend on mount. Without this, panels that key
+  // off `datasets` (TIPSv2Panel, AutoLabel, OlmoEarthPanel raster picker)
+  // show "no data" until the user uploads — even when the server already has
+  // GeoTIFFs from prior sessions persisted on disk.
+  //
+  // The `prev.length === 0` guard is the race-condition fix: if the user
+  // uploads or deletes a dataset while this fetch is in flight, the local
+  // state already has the result of that mutation, and overwriting with the
+  // stale server response would clobber the change. Only seeding when
+  // local is still empty matches the intent (initial fill) without ever
+  // racing user actions.
+  useEffect(() => {
+    let cancelled = false;
+    listDatasets()
+      .then((ds) => {
+        if (cancelled) return;
+        setDatasets((prev) => (prev.length === 0 ? ds : prev));
+      })
+      .catch(() => { /* offline / cold backend — leave empty, upload still works */ });
+    return () => { cancelled = true; };
   }, []);
 
   // handleToggleDataLayer toggled OlmoEarth coverage polygons on the map.
